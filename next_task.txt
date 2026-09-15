@@ -1,0 +1,63 @@
+# TASK 1 — Environment & Repo Scaffolding
+
+## Context
+GOV-001 (docs/governance/GOV-001-project-charter-phase1-azure.md) is approved.
+Stack: Python 3.x/FastAPI backend, PostgreSQL, React+TypeScript+Tailwind frontend,
+APScheduler for jobs, Docker for deployment. This task stands up the skeleton only —
+no live Azure calls yet. The Azure Resource Graph connector is Task 2, queued after
+this one passes review.
+
+## Scope
+
+1. Backend skeleton (`backend/`)
+   - FastAPI app with a health-check endpoint (`GET /health`)
+   - Project structure: `app/api/`, `app/models/`, `app/services/`, `app/core/config.py`
+   - `requirements.txt` pinning FastAPI, SQLAlchemy, psycopg2/asyncpg, pydantic, pytest
+   - `.env.example` documenting expected env vars (DB connection string, Azure
+     service principal fields) — placeholders only, no real credentials
+
+2. Database (PostgreSQL)
+   - Provider-agnostic schema per GOV-001 Section 2 — this is the load-bearing
+     decision in the whole doc, don't skip or simplify it:
+     - `cloud_accounts` (id, provider [azure/aws/gcp], external_id, display_name, created_at)
+     - `resources` (id, cloud_account_id FK, provider, external_resource_id,
+       resource_type, region, resource_group, tags JSONB, sku, created_at,
+       raw_metadata JSONB)
+     - `cost_records` (id, resource_id FK nullable for account-level costs,
+       cloud_account_id FK, date, amortized_cost, currency, granularity)
+     - `utilization_metrics` (id, resource_id FK, metric_name, timestamp, value, unit)
+   - SQLAlchemy models + Alembic for migrations
+   - Seed migration only — no data yet
+
+3. Frontend skeleton (`frontend/`)
+   - React + TypeScript + Vite, Tailwind CSS configured
+   - One placeholder route rendering "FinOps Platform — Phase 1" plus a call to
+     the backend health-check endpoint, so end-to-end wiring is provably working
+   - `package.json` includes the agreed stack (Tailwind, shadcn/ui base config,
+     Recharts as a dependency even though unused yet)
+
+4. Docker
+   - `docker-compose.yml` with services: `backend`, `frontend`, `db` (postgres)
+   - Mirrors NISE's canonical pattern: `docker compose build` then
+     `docker compose run --rm backend pytest -q` as the test command
+   - Document the canonical test command at the top of `README.md`
+
+5. Tests
+   - At least one passing pytest for the backend (health-check endpoint)
+   - Confirm `docker compose run --rm backend pytest -q` passes cleanly from a
+     fresh clone
+
+## Explicitly out of scope for this task
+- No Azure SDK calls, no service principal auth wiring beyond the `.env.example` placeholder
+- No forecasting logic
+- No recommendation logic
+- No frontend styling polish beyond confirming Tailwind is wired up
+
+## Deliverable for review
+- Full diff
+- `docker compose run --rm backend pytest -q` output
+- Confirmation that `docker compose up` brings up backend + frontend + db cleanly
+
+Edson does an initial pass on this before it goes anywhere near the domain
+reviewer — flag anything in GOV-001 that felt ambiguous while building this,
+rather than guessing silently and moving on.
