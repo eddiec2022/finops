@@ -8,8 +8,18 @@ Separate project from CORNETiQ/NISE. Built in phases, one cloud provider at a ti
 Azure first, then AWS, then GCP. v1 is not complete until all three ship with a
 normalized data model and unified dashboard.
 
+## Canonical test command
+
+```
+docker compose build
+docker compose run --rm backend pytest -q
+```
+
+`docker compose up` brings up `backend` (FastAPI, :8000), `frontend` (Vite dev server, :5173),
+and `db` (PostgreSQL, :5432).
+
 ## Status
-Phase 1 (Azure) — architecture drafted, pending approval.
+Phase 1 (Azure) — Task 1 (environment & repo scaffolding) in progress.
 See `docs/governance/GOV-001-project-charter-phase1-azure.md` for full scope.
 
 ## Roles
