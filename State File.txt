@@ -1,1 +1,0 @@
-State File - when using terraform, file is used to validate what's in existence and should actually exist
