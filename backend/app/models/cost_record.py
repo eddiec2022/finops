@@ -22,3 +22,10 @@ class CostRecord(Base):
     amortized_cost: Mapped[float] = mapped_column(Numeric(18, 6), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     granularity: Mapped[str] = mapped_column(String, nullable=False)
+    # Azure Cost Management's dimension distinguishing Usage/Purchase/Refund/
+    # UnusedReservation/etc - needed alongside resource_id in the upsert key,
+    # since multiple non-resource-attributable charges (marketplace, support,
+    # reservation purchases) can land on the same cloud_account_id/date with
+    # resource_id both null. See the uq_cost_records_* migration for how NULL
+    # resource_id is handled at the DB constraint level.
+    charge_type: Mapped[str] = mapped_column(String, nullable=False)

@@ -13,6 +13,7 @@ class Settings(BaseSettings):
 
     idle_cpu_threshold_percent: float = 10.0
     idle_lookback_days: int = 14
+    cost_lookback_days: int = 90
 
 
 settings = Settings()
