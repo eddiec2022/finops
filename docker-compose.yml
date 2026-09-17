@@ -20,6 +20,10 @@ services:
     build: ./backend
     environment:
       DATABASE_URL: postgresql://finops:finops@db:5432/finops
+      AZURE_TENANT_ID: ${AZURE_TENANT_ID:-}
+      AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+      AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
+      AZURE_SUBSCRIPTION_ID: ${AZURE_SUBSCRIPTION_ID:-}
     ports:
       - "8000:8000"
     depends_on:
