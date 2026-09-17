@@ -60,8 +60,15 @@ def test_sync_cost_creates_records(db_session):
     assert summary.created == 3
     assert summary.updated == 0
 
+    # Scoped to this test's own resource_id (or null) - account.id is the same
+    # real cloud account Task 6's live run wrote 237 real rows into, which can
+    # include real charges on this same hardcoded fixture date, so a bare
+    # (cloud_account_id, date) filter isn't safe to assert an exact count on.
     records = (
-        db_session.query(CostRecord).filter_by(cloud_account_id=account.id, date=date(2026, 9, 15)).all()
+        db_session.query(CostRecord)
+        .filter(CostRecord.cloud_account_id == account.id, CostRecord.date == date(2026, 9, 15))
+        .filter((CostRecord.resource_id == vm.id) | (CostRecord.resource_id.is_(None)))
+        .all()
     )
     assert len(records) == 3
 
@@ -100,8 +107,12 @@ def test_sync_cost_upsert_does_not_duplicate_on_overlapping_window(db_session):
     assert summary.created == 0
     assert summary.updated == 3
 
+    # Scoped the same way as the test above - see that comment.
     records = (
-        db_session.query(CostRecord).filter_by(cloud_account_id=account.id, date=date(2026, 9, 15)).all()
+        db_session.query(CostRecord)
+        .filter(CostRecord.cloud_account_id == account.id, CostRecord.date == date(2026, 9, 15))
+        .filter((CostRecord.resource_id == vm.id) | (CostRecord.resource_id.is_(None)))
+        .all()
     )
     assert len(records) == 3  # still 3, not 6 - the overlapping run updated in place
 
