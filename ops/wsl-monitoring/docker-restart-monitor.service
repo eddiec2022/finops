@@ -1,0 +1,6 @@
+[Unit]
+Description=Check dockerd for unexpected restarts (recurrence monitor)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/check-docker-restart.sh

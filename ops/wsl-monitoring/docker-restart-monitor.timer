@@ -1,0 +1,11 @@
+[Unit]
+Description=Run docker-restart-monitor every 30s
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=30s
+AccuracySec=1s
+Unit=docker-restart-monitor.service
+
+[Install]
+WantedBy=timers.target
