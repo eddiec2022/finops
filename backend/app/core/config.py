@@ -11,5 +11,8 @@ class Settings(BaseSettings):
     azure_client_secret: str = ""
     azure_subscription_id: str = ""
 
+    idle_cpu_threshold_percent: float = 10.0
+    idle_lookback_days: int = 14
+
 
 settings = Settings()

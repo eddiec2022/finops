@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+from app.core.config import settings
 from app.models.cloud_account import CloudAccount
 from app.models.provider import Provider
 from app.models.resource import Resource
@@ -56,16 +57,32 @@ def _fake_fetch(rows):
 
 
 def test_sync_inventory_creates_resources(db_session):
+    # Scoped to rows this test creates, not an absolute count - the dev DB this
+    # test suite runs against also carries real resources from live-run
+    # verification (see README), so a global count() isn't a valid assertion here.
+    before = db_session.query(Resource).count()
+
     summary = sync_inventory(db_session, fetch=_fake_fetch([VM_ROW, STORAGE_ACCOUNT_ROW]))
 
     assert summary.found == 2
     assert summary.created == 2
     assert summary.updated == 0
-    assert db_session.query(Resource).count() == 2
-    assert db_session.query(CloudAccount).count() == 1
+    assert db_session.query(Resource).count() == before + 2
+    assert (
+        db_session.query(Resource)
+        .filter(Resource.external_resource_id.in_([VM_ROW["id"], STORAGE_ACCOUNT_ROW["id"]]))
+        .count()
+        == 2
+    )
+    # get_or_create_cloud_account keys off settings.azure_subscription_id, not
+    # anything in the fetched rows, so there's exactly one account for it
+    # regardless of how many resources are synced.
+    assert db_session.query(CloudAccount).filter_by(external_id=settings.azure_subscription_id).count() == 1
 
 
 def test_sync_inventory_upsert_does_not_duplicate(db_session):
+    before = db_session.query(Resource).count()
+
     sync_inventory(db_session, fetch=_fake_fetch([VM_ROW, STORAGE_ACCOUNT_ROW]))
 
     updated_vm_row = {**VM_ROW, "tags": {"env": "prod", "owner": "sre-team"}}
@@ -74,8 +91,7 @@ def test_sync_inventory_upsert_does_not_duplicate(db_session):
     assert summary.found == 2
     assert summary.created == 0
     assert summary.updated == 2
-    assert db_session.query(Resource).count() == 2
-    assert db_session.query(CloudAccount).count() == 1
+    assert db_session.query(Resource).count() == before + 2
 
     vm = (
         db_session.query(Resource)
