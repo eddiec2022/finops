@@ -1,137 +1,173 @@
-# TASK 11 RESULTS - Recommendations: Non-Peak Scheduling
+# TASK 12 RESULTS - Recommendations: RI/Savings Plan (Investigation + Build)
+
+## Note on next_task.txt before the task itself
+
+Before starting, next_task.txt contained the same class of anomaly flagged
+during Task 10's session - this time a leaked heredoc closing delimiter
+(`TASKEOF`) plus trailing `echo`/`wc`/`head` verification commands on lines
+70-71, rather than the opening `cat > ... << 'TASKEOF'` line from before.
+Given this was a recurrence, and this task specifically involves live Azure
+credentials, I stopped and asked before treating lines 1-69 as legitimate
+instructions rather than assuming benign-again. Edson confirmed: it's the
+same root cause both times (pasting task content into the file via an editor
+rather than running it as a shell command in WSL as originally intended),
+not tampering, and the delivery method is changing to stop it recurring.
+Stripped lines 70-71 and proceeded. Flagging this here per the "write actual
+findings, not just chat summary" instruction in CLAUDE.md - it's part of
+what actually happened in this task, not just preamble.
 
 ## Summary
 
-Added `GET /api/v1/recommendations/non-peak-scheduling`, compute-on-read,
-same philosophy as the other recommendation endpoints. Flags VMs and App
-Services as "likely non-production" candidates for a start/stop schedule
-using three independent signals per GOV-001 - a tag heuristic, a naming
-heuristic, and a peak-vs-off-peak CPU usage pattern - any one is sufficient,
-none are required to agree. Recommends a standard weeknight/weekend power-off
-template (not a per-resource-optimized schedule) and estimates monthly
-savings from the fraction of the week that template would have the resource
-off, using the same average-daily-cost-from-cost_records approach as Tasks 9
-and 10.
+**Phase 1 (investigation): the service principal's existing permissions
+(Reader + Cost Management Reader, from Task 2) are sufficient.** No
+permission or auth error of any kind. Confirmed with a live call to the
+Microsoft.Consumption reservationRecommendations API against the real
+subscription: HTTP 200, `{"value": []}` - a genuinely empty result, not a
+bug or a permissions gap. Full findings below.
 
-All 104 tests pass (29 new). Live check against the real subscription
-returns one recommendation - the real VM, flagged by the naming heuristic
-(its name contains "dev") since the real environment has no tags at all on
-any resource (checked first, per the task's explicit instruction to verify
-before hardcoding). The usage-pattern signal correctly excluded itself
-(insufficient history - only 3 days of CPU data against the 14-day window,
-consistent with what Tasks 9 and 10 already found about this VM). The
-estimated savings figure was hand-verified against the real cost_records
-rows and matches exactly - see "Live check" below.
+**Phase 2 (build): completed, since Phase 1 succeeded.** Added `GET
+/api/v1/recommendations/reserved-instances` - a live pass-through to Azure's
+own recommendation engine, not a DB read like the other three recommendation
+endpoints (the task explicitly said not to force this into the
+compute-on-read-from-DB pattern, and there's genuinely nothing to compute or
+store locally here - Azure runs this analysis itself). All 110 tests pass (6
+new), with the Consumption API call mocked via dependency injection for the
+automated suite, same "no live credentials needed for pytest" principle as
+every other connector. Live check against the real subscription: the
+endpoint works end-to-end and correctly returns an empty recommendations
+list, matching Phase 1's finding exactly.
 
-## Files changed/added
+## Phase 1: Investigation findings (a deliverable on its own)
 
-- `backend/app/core/config.py` - added `off_peak_usage_ratio_threshold: float
-  = 0.5`, following the established settings pattern rather than a hardcoded
-  magic number, per the task's explicit instruction.
-- `backend/app/services/cpu_metrics.py` (new) - `CPU_METRIC_BY_RESOURCE_TYPE`
-  extracted out of `rightsizing.py` so both `rightsizing.py` and the new
-  `non_peak_scheduling.py` share one mapping instead of two copies.
-  `rightsizing.py` now imports it from here (no behavior change - Task 9's
-  existing tests still pass unchanged).
-- `backend/app/services/peak_usage_evaluation.py` (new) - `is_business_hours()`
-  (weekday 8am-6pm UTC, the stated v1 fixed-window simplification) and
-  `evaluate_peak_off_peak_usage()`, a pure function that buckets CPU readings
-  into peak/off-peak, compares the two averages against a ratio threshold,
-  and returns `insufficient_data`/`is_flagged` - deliberately a different
-  function from `evaluate_cpu_utilization` (Task 9), not a forced extension
-  of it, since bucketing by time-of-day/day-of-week is a genuinely different
-  kind of analysis than a flat trailing average.
-- `backend/app/services/non_prod_heuristics.py` (new) - `detect_non_prod_by_tag()`
-  and `detect_non_prod_by_name()`, pure functions checking the exact
-  tag-key/value and naming-keyword lists the task specified, not an expanded
-  list.
-- `backend/app/services/non_peak_scheduling.py` (new) - orchestration:
-  `build_non_peak_scheduling_recommendations(db, cloud_account_id=None)`.
-  Runs all three signals per resource, flags if any one matches, attaches the
-  standard schedule template and a cost estimate scaled to the schedule's
-  off-hours fraction of the week.
+Wrote a small throwaway script (not committed - removed once its findings
+were folded into the real connector code) that acquired an ARM token via the
+existing `ClientSecretCredential` (same tenant/client/secret already in
+`.env`) and called:
+
+    GET https://management.azure.com/subscriptions/{subscription_id}
+        /providers/Microsoft.Consumption/reservationRecommendations
+        ?api-version={version}
+
+against three API versions, to see what actually happens - not assumed from
+documentation:
+
+    api-version=2024-08-01  ->  first attempt: ReadTimeout at 30s
+                                 retried with a 60s timeout: HTTP 200, {"value":[]}
+    api-version=2023-05-01  ->  HTTP 200, {"value":[]}
+    api-version=2021-10-01  ->  HTTP 200, {"value":[]}
+
+**No permission/auth error at any point, on any version.** The 2024-08-01
+timeout on the first attempt looked like one-off connection/cold-start
+latency (first HTTPS handshake to management.azure.com), not a real problem
+with that specific API version - confirmed by retrying with a longer timeout
+and getting an immediate 200. Not something that needed CLAUDE.md's
+"security-relevant change, Edson's call" hard stop - there was no permission
+gap to work around, so that branch of the task never applied.
+
+**Why the empty result is very likely genuine, not a bug:** this matches
+exactly what Tasks 9-11 already found about this subscription's usage
+history. The one real VM (NISE-DEV) was created 2026-06-14 but has real,
+substantial cost gaps (Task 8 found only 6 of a 30-day window had actual VM
+cost records; Task 11 found only 3 days of CPU history against a 14-day
+window) - i.e. it's been powered off for large stretches, not run
+continuously long enough to look like "steady-state on-demand usage" to
+Azure's own reservation-recommendation engine, which needs a sustained usage
+pattern (typically a rolling lookback window of consistent hours) before it
+will suggest a commitment. An empty result from an engine designed to avoid
+recommending a 1-3 year commitment against spotty, short-lived usage is the
+expected behavior here, not a failure - same conclusion this task's own text
+predicted ("plausible given this dev subscription's usage patterns").
+
+## Phase 2: Build
+
+### Files changed/added
+
+- `backend/app/services/reserved_instances.py` (new):
+  - `fetch_reservation_recommendations(subscription_id)` - the live call,
+    using raw REST via `httpx` + `azure-identity`'s `ClientSecretCredential`
+    (both already dependencies), not the `azure-mgmt-consumption` SDK - see
+    design decision #1 below.
+  - `map_recommendation(item)` - normalizes one raw API item into a shape
+    roughly consistent with the other recommendation endpoints (resource
+    type, scope, an estimated savings figure) without forcing fields Azure's
+    response doesn't naturally have into that shape, and preserves the full
+    raw item under `raw` on every mapped result - see design decision #2.
+  - `build_reservation_recommendations(fetch=fetch_reservation_recommendations)` -
+    the same fetch-injection pattern `sync_inventory`/`sync_utilization`/
+    `sync_cost` already use, specifically so the automated test suite never
+    needs live credentials.
 - `backend/app/api/recommendations.py` - added `GET
-  /api/v1/recommendations/non-peak-scheduling`.
-- `backend/tests/test_peak_usage_evaluation.py` (new, 10 tests) - business-hours
-  boundary tests (weekday-inside, weekday-outside, weekend-never), a
-  business-hours-shaped pattern that flags, an always-busy pattern that
-  doesn't, ratio-boundary inclusivity, a zero-peak edge case, insufficient
-  history, no data at all, and a window missing one whole bucket.
-- `backend/tests/test_non_prod_heuristics.py` (new, 11 tests) - tag matching
-  (case-insensitive key, each documented value, non-matching/unrelated
-  tags, empty/None), naming matching (substring, case-insensitive, each
-  documented keyword, non-matching, missing name).
-- `backend/tests/test_non_peak_scheduling.py` (new, 8 tests) - flagged by tag
-  alone, flagged by name alone, flagged by usage pattern alone on an
-  otherwise production-tagged/production-named resource, not flagged when
-  busy around the clock, savings math hand-checked against the off-hours
-  fraction, a flagged resource with no cost data (null savings, not a
-  fabricated number), settings/business-hours-definition echoed in the
-  response, and an HTTP-level endpoint test.
+  /api/v1/recommendations/reserved-instances`. Deliberately has no `db`
+  dependency, unlike the other three recommendation routes - there's nothing
+  in this app's own database this endpoint reads or writes.
+- `backend/tests/test_reserved_instances.py` (new, 6 tests) - field
+  extraction from a realistic fixture item, raw-item preservation, a missing-
+  properties case that doesn't crash, mapping multiple items, the actual
+  real-world empty-result shape treated as a success case (not an error
+  path), and confirming the configured subscription ID is what actually gets
+  passed to fetch.
 
-## Design decisions (flagged explicitly, not silently assumed)
+### Design decisions (flagged explicitly, not silently assumed)
 
-1. **Real synced resources have no tags at all - checked first, not assumed.**
-   Queried every resource's `tags` column in the real dev DB before writing
-   the tag heuristic; all nine rows are `{}`. This doesn't change what the
-   tag check does (it's still built exactly as specified, and will work the
-   moment any resource actually gets an `environment`/`env` tag), but it does
-   mean the live check's positive result comes entirely from the naming
-   heuristic today, not the tag one - worth knowing rather than assuming both
-   heuristics are equally exercised by the current environment.
+1. **Raw REST + `httpx`, not the `azure-mgmt-consumption` SDK.** The task
+   explicitly allowed either. Phase 1's investigation script already proved
+   the raw REST call works end-to-end with the existing credentials, and
+   it's a single GET with no request body or complex parameters - adding a
+   new SDK dependency (and its own auth/client wiring) for that one call
+   wasn't justified when `httpx` and `azure-identity` (for the token) are
+   already dependencies used elsewhere in the codebase.
 
-2. **`evaluate_peak_off_peak_usage()` is a new function, not a variant of
-   Task 9's `evaluate_cpu_utilization()`.** The task explicitly asked for
-   this ("don't try to force-fit the existing one") and the real reason
-   holds up: `evaluate_cpu_utilization` computes one flat average over a
-   trailing window; this needs two averages split by a per-timestamp
-   day-of-week/hour-of-day predicate first. Trying to parameterize the
-   existing function to do both would have made it harder to read for either
-   use, not simpler.
+2. **Field names in `map_recommendation()` are NOT verified against real
+   populated data, and this is stated plainly in three places: a code
+   comment, a module-level `FIELD_MAPPING_NOTE` constant, and the `
+   field_mapping_note` key in the actual API response.** This is a real
+   departure from Tasks 9/10's practice of checking field names against a
+   real synced/returned item before building on them - here that's
+   structurally impossible, because Phase 1's live call returned zero items
+   to check field names against. The mapping is based on Microsoft's
+   documented schema for this API, which could be wrong or could drift. The
+   mitigation: every mapped recommendation carries the complete, unmodified
+   raw API item under `raw`, so nothing is lost if a mapped field name turns
+   out to be wrong once this subscription (or another one) actually produces
+   a populated response - the fix at that point would be a mapping
+   correction, not a re-fetch.
 
-3. **Peak avg of ~0% is not flagged via the usage-pattern signal, even
-   though the ratio would trivially be low/undefined.** A resource that's
-   idle around the clock has nothing to compute a meaningful peak/off-peak
-   *ratio* from - that's rightsizing's job (Task 9), not this check's. Rather
-   than dividing by a near-zero number or defining an arbitrary "peak is 0 so
-   treat ratio as flagged" rule, this case explicitly returns
-   `is_flagged: False` with a note saying why. Covered by
-   `test_evaluate_peak_off_peak_usage_zero_peak_is_not_flagged`.
+3. **No `db` dependency on the endpoint, and no persistence.** The task was
+   explicit about this ("don't force this into the compute-on-read-from-DB
+   pattern") and the underlying reason holds: this app has no local copy of
+   whatever internal usage history Azure's recommendation engine actually
+   uses, and doesn't need one - recomputing or caching Azure's own analysis
+   locally would just be a staleness risk with no benefit over calling
+   Azure's engine directly each time.
 
-4. **A window missing readings in either bucket entirely is
-   `insufficient_data`, not a one-sided comparison.** If every reading in the
-   trailing window happens to fall in only the peak or only the off-peak
-   bucket (possible with sparse utilization data even when the calendar span
-   itself covers the full lookback window), there's nothing to compare
-   against - excluded rather than guessed, same principle as every other
-   check in this codebase.
+4. **Request timeout set to 60s, informed directly by what actually
+   happened in Phase 1** (a 30s timeout failed once, a 60s timeout succeeded
+   immediately on the same call) rather than picking an arbitrary number -
+   this is ordinary cold-connection variance to a management API, not
+   something to silently retry-loop around or ignore.
 
-5. **Savings estimate scales by the schedule template's off-hours fraction of
-   a week (118/168 ~= 70%), derived from the same business-hours constants the
-   usage-pattern check uses** (`BUSINESS_HOURS_START_UTC`/`_END_UTC` and
-   `BUSINESS_DAYS` from `peak_usage_evaluation.py`), not a separately
-   hardcoded number - so the "when the resource would be off" definition used
-   for the dollar estimate can't drift out of sync with the "when is
-   business hours" definition used for the usage-pattern flag itself. This
-   assumes cost is roughly uniform per hour while running, which is stated
-   explicitly in the response's `savings_note`, same "approximate, not a
-   billing quote" caveat as Tasks 9 and 10.
-
-6. **The business-hours-is-fixed-UTC simplification is surfaced in the
-   response itself** (`business_hours_definition` field), not just in
-   `results.txt` or a code comment - per the task's explicit "state this
-   assumption plainly in the response, don't bury it" instruction.
+5. **No HTTP-level `TestClient` test for this endpoint**, unlike the other
+   three recommendation endpoints. Those are DB-only, so a `TestClient` call
+   never leaves the test process. This endpoint's default `fetch` parameter
+   is a live external call - routing an HTTP-level test through the actual
+   FastAPI route would either need live credentials in the test suite
+   (violates the "no live credentials needed for pytest" principle the task
+   itself invoked) or patching a function reference bound as a default
+   argument at import time (fragile, low signal). The route itself is a
+   one-line pass-through to `build_reservation_recommendations()`, which is
+   thoroughly unit-tested with a mocked `fetch`; the actual live wiring is
+   verified by the live check below instead, same as Phase 1's own
+   investigation already did.
 
 ## Actual pytest output (ran via WSL2 docker compose, after rebuilding the
-backend image - same COPY-based-image caveat as Tasks 9/10, rebuilt before
-running)
+backend image - same COPY-based-image caveat as every prior task)
 
     ============================= test session starts ==============================
     platform linux -- Python 3.12.14, pytest-8.3.4, pluggy-1.6.0 -- /usr/local/bin/python3.12
     cachedir: .pytest_cache
     rootdir: /app
     plugins: anyio-4.15.1
-    collecting ... collected 104 items
+    collecting ... collected 110 items
 
     tests/test_azure_cost.py::test_map_cost_response_resource_attributable_and_non_attributable PASSED
     tests/test_azure_cost.py::test_sync_cost_creates_records PASSED
@@ -217,6 +253,12 @@ running)
     tests/test_peak_usage_evaluation.py::test_evaluate_peak_off_peak_usage_insufficient_history_excludes_not_flags PASSED
     tests/test_peak_usage_evaluation.py::test_evaluate_peak_off_peak_usage_no_readings_is_insufficient_data PASSED
     tests/test_peak_usage_evaluation.py::test_evaluate_peak_off_peak_usage_missing_one_bucket_is_insufficient_data PASSED
+    tests/test_reserved_instances.py::test_map_recommendation_extracts_documented_fields PASSED
+    tests/test_reserved_instances.py::test_map_recommendation_preserves_full_raw_item PASSED
+    tests/test_reserved_instances.py::test_map_recommendation_missing_properties_does_not_crash PASSED
+    tests/test_reserved_instances.py::test_build_reservation_recommendations_maps_every_item PASSED
+    tests/test_reserved_instances.py::test_build_reservation_recommendations_empty_result_is_not_an_error PASSED
+    tests/test_reserved_instances.py::test_build_reservation_recommendations_passes_configured_subscription_id PASSED
     tests/test_rightsizing.py::test_flags_idle_vm_with_suggested_sku_and_estimated_savings PASSED
     tests/test_rightsizing.py::test_does_not_flag_busy_vm PASSED
     tests/test_rightsizing.py::test_excludes_vm_with_insufficient_utilization_history PASSED
@@ -244,858 +286,287 @@ running)
       anyio.from_thread.BlockingPortal instead.
 
     -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-    ======================== 104 passed, 1 warning in 0.60s =========================
-
-All 104 passed clean on the first run - the test-data bug I caught myself
-before running (see below) was fixed in the source, not discovered via a
-failing run.
-
-## One test-authoring bug caught and fixed before running (not a code bug)
-
-While writing test_peak_usage_evaluation.py, the first draft built "peak"
-readings across all 14 calendar days (including weekends) at a business-hour
-clock time. Since is_business_hours() requires weekday AND time-of-day, the
-weekend entries at that same clock time fall into the *off-peak* bucket, not
-peak - contaminating the expected off-peak average in three tests with a
-mix of my "peak" value and my "off-peak" value, not the clean numbers I'd
-calculated by hand. Caught this by working through the exact math before
-trusting the assertions (10 weekday peak entries vs 4 contaminated weekend
-entries + 14 off-peak entries), not by running and seeing a failure - added
-a `_weekday_readings()` helper that skips weekends entirely for the "peak"
-stream in the affected tests, which matches how a real business-hours-only
-workload actually behaves anyway.
+    ======================== 110 passed, 1 warning in 0.58s =========================
 
 ## Live check against the real subscription (the actual deliverable)
 
-    GET /api/v1/recommendations/non-peak-scheduling
+    GET /api/v1/recommendations/reserved-instances
     {
-        "idle_lookback_days": 14,
-        "off_peak_usage_ratio_threshold": 0.5,
-        "business_hours_definition": "Fixed weekday 08:00-18:00 UTC window - a v1 simplification, not per-resource timezone detection...",
-        "recommendations": [
-            {
-                "external_resource_id": ".../virtualMachines/NISE-DEV",
-                "resource_type": "microsoft.compute/virtualmachines",
-                "signals": {
-                    "tag": {"matched": false, "detail": "no environment-indicating tag found"},
-                    "naming": {"matched": true, "detail": "resource name contains 'dev'"},
-                    "usage_pattern": {
-                        "matched": false,
-                        "detail": "Only 3 day(s) of history against a 14-day window.",
-                        "peak_avg_cpu_percent": null,
-                        "off_peak_avg_cpu_percent": null
-                    }
-                },
-                "estimated_monthly_savings": 6.93,
-                ...
-            }
-        ]
+        "source": "Azure Microsoft.Consumption reservationRecommendations API (live call, not computed locally)",
+        "field_mapping_note": "Field names are mapped per Microsoft's documented schema for this API, not verified against a real populated response - this subscription's usage history hasn't produced any recommendations yet to check field names against (see Task 12 investigation notes). Each recommendation's full raw API response is included under `raw` so nothing is lost if a mapped field name is wrong.",
+        "recommendations": []
     }
 
-**Non-empty this time, and every part of it checks out against the real
-data:**
-
-- **Tag signal: not matched.** Confirmed all 9 real resources have `tags =
-  {}` - consistent with design decision #1 above.
-- **Naming signal: matched.** The VM's synced name is "nise-dev" -
-  contains "dev".
-- **Usage-pattern signal: correctly excluded, not guessed.** This VM only
-  has 3 days of CPU utilization history (2026-09-15 through 2026-09-17, per
-  Tasks 9 and 10's own investigation into this same VM) against the 14-day
-  lookback window - `evaluate_peak_off_peak_usage` correctly reports
-  insufficient_data rather than comparing a 3-day sliver.
-- **Savings estimate: hand-verified against the real cost_records rows, not
-  just trusted.** Queried the VM's most recent cost rows directly:
-
-      2026-09-17 | 0.583703
-      2026-09-16 | 1.810992
-      2026-09-15 | 2.207597
-      (2026-09-04 through 2026-09-14: no rows - zero-filled gap, 11 days)
-
-  The 14-day trailing window ending 2026-09-17 is 2026-09-04 through
-  2026-09-17. Sum of actual cost in that window = 2.207597 + 1.810992 +
-  0.583703 = 4.602292. avg_daily_cost = 4.602292 / 14 = 0.3287351...
-  Estimated savings = 0.3287351... x 30 x (118/168) = 6.928... -> rounds to
-  6.93, which is exactly what the API returned.
-
-Confirmed no leakage into the real dev DB from the live check itself:
-resources=9, utilization_metrics=80, cost_records=237 - unchanged, same as
-Tasks 9 and 10 left them.
+Matches Phase 1's investigation exactly - the endpoint's live call to Azure
+returns the same `{"value": []}` the investigation script already found,
+now flowing through the real route end-to-end. No DB involvement at all in
+this endpoint, so no "counts unchanged" check applies the way it did for
+Tasks 9-11 - confirmed anyway that resources/utilization_metrics/cost_records
+counts are unchanged (9/80/237) since this endpoint touches none of them.
 
 ## WSL2/dockerd restart monitor - status during this task
 
 No new restarts. Still 14 total RESTART_DETECTED entries (same count as
-Tasks 9 and 10), and every check since the last one - 2026-09-18 10:04:34
-EDT, pid=284 - has been check_ok, through this task's completion at 16:59:28
-EDT:
+Tasks 9-11), and every check since the last one - 2026-09-18 10:04:34 EDT,
+pid=284 - has been check_ok, through this task's completion at 17:35:38 EDT:
 
-    2026-09-18 16:59:28 EDT check_ok start="Fri 2026-09-18 10:04:34 EDT" pid=284
+    2026-09-18 17:35:38 EDT check_ok start="Fri 2026-09-18 10:04:34 EDT" pid=284
 
-That's roughly 6 hours 55 minutes of continuous stability on the same pid,
-spanning Tasks 10 and 11 both. Same as before - noting it for the log, not
-drawing a stronger conclusion than the evidence supports.
+That's roughly 7 hours 31 minutes of continuous stability on the same pid,
+spanning Tasks 10, 11, and 12. Noting it for the log, same as every prior
+task's results - not drawing a stronger conclusion than the evidence itself
+supports.
 
 ## Ambiguity flagged, not guessed on
 
-- **Whether a ~0% peak average should flag via the usage-pattern signal**
-  (design decision #3 above) - resolved by treating it as out of this
-  check's scope (rightsizing's territory) rather than inventing a rule for
-  an undefined ratio.
-- **Where the off-hours fraction for the savings estimate comes from**
-  (design decision #5) - resolved by deriving it from the same constants the
-  usage-pattern check already uses, so the two can't silently disagree about
-  what "business hours" means.
+- **The next_task.txt anomaly** (see top of this file) - stopped and
+  confirmed before proceeding, per the standing instinct Edson has now
+  confirmed twice he wants kept, especially given this task's live
+  credentials.
+- **Whether the empty Phase 1 result was a bug or genuine** - resolved by
+  cross-referencing Tasks 8/11's own prior findings about this specific VM's
+  gappy usage history, not assumed from the task text's own hint alone.
+- **SDK vs raw REST** (design decision #1) - resolved in favor of what Phase
+  1 had already proven working, rather than adding a new dependency to do
+  the same thing a different way.
 
 ## Full diff
 
 ```diff
 diff --git a/backend/app/api/recommendations.py b/backend/app/api/recommendations.py
-index 3bad44d..5a09626 100644
+index 5a09626..40aaa5e 100644
 --- a/backend/app/api/recommendations.py
 +++ b/backend/app/api/recommendations.py
-@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
- 
+@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
  from app.db.session import get_db
  from app.services.idle_resources import build_idle_resource_recommendations
-+from app.services.non_peak_scheduling import build_non_peak_scheduling_recommendations
+ from app.services.non_peak_scheduling import build_non_peak_scheduling_recommendations
++from app.services.reserved_instances import build_reservation_recommendations
  from app.services.rightsizing import build_rightsizing_recommendations
  
  router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
-@@ -18,3 +19,8 @@ def get_rightsizing_recommendations(db: Session = Depends(get_db)) -> dict[str,
- @router.get("/idle-resources")
- def get_idle_resource_recommendations(db: Session = Depends(get_db)) -> dict[str, Any]:
-     return build_idle_resource_recommendations(db)
+@@ -24,3 +25,11 @@ def get_idle_resource_recommendations(db: Session = Depends(get_db)) -> dict[str
+ @router.get("/non-peak-scheduling")
+ def get_non_peak_scheduling_recommendations(db: Session = Depends(get_db)) -> dict[str, Any]:
+     return build_non_peak_scheduling_recommendations(db)
 +
 +
-+@router.get("/non-peak-scheduling")
-+def get_non_peak_scheduling_recommendations(db: Session = Depends(get_db)) -> dict[str, Any]:
-+    return build_non_peak_scheduling_recommendations(db)
-diff --git a/backend/app/core/config.py b/backend/app/core/config.py
-index 25f07b7..690aa42 100644
---- a/backend/app/core/config.py
-+++ b/backend/app/core/config.py
-@@ -15,6 +15,10 @@ class Settings(BaseSettings):
-     idle_lookback_days: int = 14
-     cost_lookback_days: int = 90
-     forecast_trailing_window_days: int = 30
-+    # Non-peak-scheduling candidate: flag when off-peak average CPU is at most
-+    # this fraction of peak average CPU (e.g. 0.5 = off-peak usage is half of
-+    # peak or less).
-+    off_peak_usage_ratio_threshold: float = 0.5
- 
- 
- settings = Settings()
-diff --git a/backend/app/services/cpu_metrics.py b/backend/app/services/cpu_metrics.py
++@router.get("/reserved-instances")
++def get_reservation_recommendations() -> dict[str, Any]:
++    # Live call to Azure's own recommendation engine, not a DB read - see
++    # reserved_instances.py for why this endpoint doesn't take a db dependency
++    # the way the other three recommendation endpoints do.
++    return build_reservation_recommendations()
+diff --git a/backend/app/services/reserved_instances.py b/backend/app/services/reserved_instances.py
 new file mode 100644
-index 0000000..14d5532
+index 0000000..76f4253
 --- /dev/null
-+++ b/backend/app/services/cpu_metrics.py
-@@ -0,0 +1,8 @@
-+# The CPU metric azure_utilization.py stores for each resource type it
-+# supports - must match RESOURCE_TYPE_METRICS in that module (kept as a
-+# separate explicit mapping rather than reaching into that list's ordering,
-+# since "first metric in the sync list" isn't a documented contract).
-+CPU_METRIC_BY_RESOURCE_TYPE: dict[str, str] = {
-+    "microsoft.compute/virtualmachines": "Percentage CPU",
-+    "microsoft.web/sites": "CpuPercentage",
-+}
-diff --git a/backend/app/services/non_peak_scheduling.py b/backend/app/services/non_peak_scheduling.py
-new file mode 100644
-index 0000000..7d26e80
---- /dev/null
-+++ b/backend/app/services/non_peak_scheduling.py
-@@ -0,0 +1,137 @@
-+import uuid
-+from typing import Any
++++ b/backend/app/services/reserved_instances.py
+@@ -0,0 +1,109 @@
++from typing import Any, Callable
 +
-+from sqlalchemy.orm import Session
++import httpx
++from azure.identity import ClientSecretCredential
 +
 +from app.core.config import settings
-+from app.models.resource import Resource
-+from app.models.utilization_metric import UtilizationMetric
-+from app.services.azure_inventory import get_or_create_cloud_account
-+from app.services.cost_lookup import get_resource_daily_costs
-+from app.services.cpu_metrics import CPU_METRIC_BY_RESOURCE_TYPE
-+from app.services.forecasting.linear_burn_rate import LinearBurnRateModel
-+from app.services.non_prod_heuristics import detect_non_prod_by_name, detect_non_prod_by_tag
-+from app.services.peak_usage_evaluation import (
-+    BUSINESS_DAYS,
-+    BUSINESS_HOURS_END_UTC,
-+    BUSINESS_HOURS_START_UTC,
-+    evaluate_peak_off_peak_usage,
-+)
 +
-+BUSINESS_HOURS_DEFINITION = (
-+    f"Fixed weekday {BUSINESS_HOURS_START_UTC:02d}:00-{BUSINESS_HOURS_END_UTC:02d}:00 UTC window - "
-+    "a v1 simplification, not per-resource timezone detection. There's no reliable timezone signal "
-+    "in what's synced, so every resource is compared against this same fixed window regardless of "
-+    "its actual region."
-+)
++# The most recent API version confirmed working against the real subscription
++# during Task 12's Phase 1 investigation (200 OK, empty result set - this
++# dev subscription's usage history is too short/gappy for Azure's own engine
++# to have produced a recommendation yet, matching everything Tasks 9-11 found
++# about this environment). 2023-05-01 and 2021-10-01 were also confirmed
++# working; 2024-08-01 is used as the current one.
++API_VERSION = "2024-08-01"
 +
-+RECOMMENDED_SCHEDULE = (
-+    "Standard template, not a per-resource optimization: power off outside business hours on "
-+    "weeknights, and power off entirely on weekends. A reasonable starting point to review, not a "
-+    "precise schedule derived from this specific resource's pattern."
-+)
-+
-+_ON_HOURS_PER_WEEK = len(BUSINESS_DAYS) * (BUSINESS_HOURS_END_UTC - BUSINESS_HOURS_START_UTC)
-+OFF_HOURS_FRACTION_OF_WEEK = (24 * 7 - _ON_HOURS_PER_WEEK) / (24 * 7)
++# A cold first call to management.azure.com timed out at 30s during Phase 1
++# investigation but succeeded immediately on retry with a longer timeout -
++# looked like one-off connection setup latency, not something specific to
++# this endpoint, but the timeout here is set generously to absorb that rather
++# than fail a request over normal network variance.
++REQUEST_TIMEOUT_SECONDS = 60.0
 +
 +
-+def estimate_monthly_schedule_savings(avg_daily_cost: float | None) -> tuple[float | None, str]:
-+    if avg_daily_cost is None:
-+        return None, "No cost data found for this resource in the lookback window; savings can't be estimated."
++def fetch_reservation_recommendations(subscription_id: str) -> list[dict[str, Any]]:
++    """Call Azure's own Microsoft.Consumption reservationRecommendations API live.
 +
-+    savings = avg_daily_cost * 30 * OFF_HOURS_FRACTION_OF_WEEK
-+    note = (
-+        "Approximate: current average daily cost over the lookback window x 30, scaled to the "
-+        f"~{OFF_HOURS_FRACTION_OF_WEEK:.0%} of the week the standard schedule would power the "
-+        "resource off, assuming cost is roughly uniform per hour while running. Not a billing quote."
-+    )
-+    return round(savings, 2), note
++    Unlike the other three recommendation endpoints (rightsizing, idle
++    resources, non-peak scheduling), which are compute-on-read against data
++    already synced into this app's own DB, there is nothing to sync or
++    compute locally here - Azure runs this analysis itself from its own
++    internal usage history, which this app doesn't have (or need) a local
++    copy of. This is a thin, on-demand pass-through to Azure's engine, called
++    live on every request to this endpoint, not a DB read.
 +
-+
-+def _resource_name(resource: Resource) -> str | None:
-+    raw_metadata = resource.raw_metadata or {}
-+    return raw_metadata.get("name")
-+
-+
-+def build_non_peak_scheduling_recommendations(
-+    db: Session, cloud_account_id: uuid.UUID | None = None
-+) -> dict[str, Any]:
-+    if cloud_account_id is None:
-+        # Phase 1 is single-subscription, same convention as the other recommendation endpoints.
-+        cloud_account_id = get_or_create_cloud_account(db, settings.azure_subscription_id).id
-+
-+    cost_model = LinearBurnRateModel(trailing_window_days=settings.idle_lookback_days)
-+
-+    # Same resource types as rightsizing - VMs and App Services are the two
-+    # types a start/stop schedule actually applies to.
-+    resources = (
-+        db.query(Resource)
-+        .filter(Resource.cloud_account_id == cloud_account_id)
-+        .filter(Resource.resource_type.in_(CPU_METRIC_BY_RESOURCE_TYPE.keys()))
-+        .all()
-+    )
-+
-+    recommendations = []
-+    for resource in resources:
-+        tag_result = detect_non_prod_by_tag(resource.tags)
-+        name_result = detect_non_prod_by_name(_resource_name(resource))
-+
-+        metric_name = CPU_METRIC_BY_RESOURCE_TYPE[resource.resource_type]
-+        readings = (
-+            db.query(UtilizationMetric.timestamp, UtilizationMetric.value)
-+            .filter_by(resource_id=resource.id, metric_name=metric_name)
-+            .all()
-+        )
-+        usage_result = evaluate_peak_off_peak_usage(
-+            [(ts, value) for ts, value in readings],
-+            lookback_days=settings.idle_lookback_days,
-+            off_peak_ratio_threshold=settings.off_peak_usage_ratio_threshold,
-+        )
-+
-+        # Per GOV-001: tag OR name OR usage pattern - any one signal is
-+        # sufficient, not all required to agree.
-+        if not (tag_result.matched or name_result.matched or usage_result.is_flagged):
-+            continue
-+
-+        daily_costs = get_resource_daily_costs(db, resource.id)
-+        cost_result = cost_model.forecast(daily_costs, horizon_days=1)
-+        avg_daily_cost = None if cost_result.insufficient_data else cost_result.daily_rate
-+        estimated_monthly_savings, savings_note = estimate_monthly_schedule_savings(avg_daily_cost)
-+
-+        recommendations.append(
-+            {
-+                "resource_id": str(resource.id),
-+                "external_resource_id": resource.external_resource_id,
-+                "resource_type": resource.resource_type,
-+                "resource_group": resource.resource_group,
-+                "region": resource.region,
-+                "signals": {
-+                    "tag": {"matched": tag_result.matched, "detail": tag_result.detail},
-+                    "naming": {"matched": name_result.matched, "detail": name_result.detail},
-+                    "usage_pattern": {
-+                        "matched": usage_result.is_flagged,
-+                        "detail": usage_result.detail,
-+                        "peak_avg_cpu_percent": (
-+                            round(usage_result.peak_avg_cpu_percent, 2)
-+                            if usage_result.peak_avg_cpu_percent is not None
-+                            else None
-+                        ),
-+                        "off_peak_avg_cpu_percent": (
-+                            round(usage_result.off_peak_avg_cpu_percent, 2)
-+                            if usage_result.off_peak_avg_cpu_percent is not None
-+                            else None
-+                        ),
-+                    },
-+                },
-+                "recommended_schedule": RECOMMENDED_SCHEDULE,
-+                "estimated_monthly_savings": estimated_monthly_savings,
-+                "savings_note": savings_note,
-+            }
-+        )
-+
-+    return {
-+        "idle_lookback_days": settings.idle_lookback_days,
-+        "off_peak_usage_ratio_threshold": settings.off_peak_usage_ratio_threshold,
-+        "business_hours_definition": BUSINESS_HOURS_DEFINITION,
-+        "recommendations": recommendations,
-+    }
-diff --git a/backend/app/services/non_prod_heuristics.py b/backend/app/services/non_prod_heuristics.py
-new file mode 100644
-index 0000000..aec564f
---- /dev/null
-+++ b/backend/app/services/non_prod_heuristics.py
-@@ -0,0 +1,34 @@
-+from dataclasses import dataclass
-+
-+# Per GOV-001: tags, naming convention, OR usage pattern - any one signal is
-+# sufficient, none are certainties. These lists are exactly what the task
-+# specified, not expanded - checked against the real synced resources' tags
-+# first (all empty in the real dev subscription, so the tag heuristic has
-+# nothing to match there today; that's a fact about the current data, not a
-+# reason to skip building the check).
-+ENV_TAG_KEYS = ("environment", "env")
-+NON_PROD_ENV_TAG_VALUES = frozenset({"dev", "test", "staging", "sandbox"})
-+NON_PROD_NAME_KEYWORDS = ("dev", "test", "staging", "sandbox", "demo")
-+
-+
-+@dataclass
-+class NonProdSignalResult:
-+    matched: bool
-+    detail: str
-+
-+
-+def detect_non_prod_by_tag(tags: dict) -> NonProdSignalResult:
-+    for key, value in (tags or {}).items():
-+        if not isinstance(key, str) or not isinstance(value, str):
-+            continue
-+        if key.lower() in ENV_TAG_KEYS and value.lower() in NON_PROD_ENV_TAG_VALUES:
-+            return NonProdSignalResult(True, f"tag '{key}'='{value}' indicates a non-production environment")
-+    return NonProdSignalResult(False, "no environment-indicating tag found")
-+
-+
-+def detect_non_prod_by_name(name: str | None) -> NonProdSignalResult:
-+    lowered = (name or "").lower()
-+    for keyword in NON_PROD_NAME_KEYWORDS:
-+        if keyword in lowered:
-+            return NonProdSignalResult(True, f"resource name contains '{keyword}'")
-+    return NonProdSignalResult(False, "resource name doesn't match a non-production naming pattern")
-diff --git a/backend/app/services/peak_usage_evaluation.py b/backend/app/services/peak_usage_evaluation.py
-new file mode 100644
-index 0000000..5aa3b4a
---- /dev/null
-+++ b/backend/app/services/peak_usage_evaluation.py
-@@ -0,0 +1,91 @@
-+from dataclasses import dataclass
-+from datetime import datetime, timedelta
-+from statistics import mean
-+
-+# v1 simplification, stated explicitly rather than buried: a fixed weekday
-+# business-hours window in UTC, not per-resource timezone detection - there's
-+# no reliable timezone signal in what Task 2 syncs (no resource-level
-+# timezone field), so a single fixed window is used for every resource
-+# regardless of its actual region/timezone.
-+BUSINESS_HOURS_START_UTC = 8
-+BUSINESS_HOURS_END_UTC = 18  # exclusive
-+BUSINESS_DAYS = frozenset(range(5))  # Monday=0 .. Friday=4
-+
-+
-+def is_business_hours(timestamp: datetime) -> bool:
-+    return timestamp.weekday() in BUSINESS_DAYS and BUSINESS_HOURS_START_UTC <= timestamp.hour < BUSINESS_HOURS_END_UTC
-+
-+
-+@dataclass
-+class PeakOffPeakUsageResult:
-+    peak_avg_cpu_percent: float | None
-+    off_peak_avg_cpu_percent: float | None
-+    insufficient_data: bool
-+    is_flagged: bool
-+    detail: str
-+
-+
-+def evaluate_peak_off_peak_usage(
-+    readings: list[tuple[datetime, float]],
-+    lookback_days: int,
-+    off_peak_ratio_threshold: float,
-+) -> PeakOffPeakUsageResult:
-+    """Compare average CPU during business hours (weekday 8am-6pm UTC) against
-+    nights/weekends, over the trailing `lookback_days` window ending on the
-+    most recent reading.
-+
-+    A genuinely different kind of analysis than `evaluate_cpu_utilization`'s
-+    flat average - this buckets by time-of-day/day-of-week first. Flags a
-+    resource when off-peak usage is at most `off_peak_ratio_threshold` of
-+    peak usage (e.g. 0.5 = off-peak is half of peak or less).
-+
-+    Same "insufficient data -> exclude, don't guess" principle as every other
-+    recommendation check: too little history, or a window that happens to
-+    have no readings in one of the two buckets, both return
-+    insufficient_data=True rather than a partial/misleading comparison. A
-+    peak average of ~0% is also not flagged via this check (division by a
-+    near-zero peak isn't a meaningful ratio) - that's an idle-resource
-+    situation for the rightsizing check to catch, not a peak/off-peak pattern.
++    Raw REST via httpx + azure-identity (both already dependencies), not the
++    azure-mgmt-consumption SDK - Phase 1 investigation validated this exact
++    call shape against the real subscription and it's a single GET with no
++    complex request body, so adding a new SDK dependency for it wasn't
++    justified.
 +    """
-+    if not readings:
-+        return PeakOffPeakUsageResult(None, None, True, False, "No utilization data available.")
-+
-+    timestamps = [ts for ts, _ in readings]
-+    most_recent = max(timestamps)
-+    earliest = min(timestamps)
-+    span_days = (most_recent.date() - earliest.date()).days + 1
-+    if span_days < lookback_days:
-+        return PeakOffPeakUsageResult(
-+            None, None, True, False, f"Only {span_days} day(s) of history against a {lookback_days}-day window."
-+        )
-+
-+    window_start_date = most_recent.date() - timedelta(days=lookback_days - 1)
-+    windowed = [(ts, value) for ts, value in readings if ts.date() >= window_start_date]
-+
-+    peak_values = [value for ts, value in windowed if is_business_hours(ts)]
-+    off_peak_values = [value for ts, value in windowed if not is_business_hours(ts)]
-+    if not peak_values or not off_peak_values:
-+        return PeakOffPeakUsageResult(
-+            None, None, True, False, "Window doesn't contain readings in both the peak and off-peak buckets."
-+        )
-+
-+    peak_avg = mean(peak_values)
-+    off_peak_avg = mean(off_peak_values)
-+
-+    if peak_avg <= 0:
-+        return PeakOffPeakUsageResult(
-+            peak_avg,
-+            off_peak_avg,
-+            False,
-+            False,
-+            "Peak-hours average CPU is ~0%; the peak/off-peak ratio isn't meaningful here.",
-+        )
-+
-+    ratio = off_peak_avg / peak_avg
-+    is_flagged = ratio <= off_peak_ratio_threshold
-+    comparison = "<=" if is_flagged else ">"
-+    detail = (
-+        f"peak avg {peak_avg:.2f}%, off-peak avg {off_peak_avg:.2f}% "
-+        f"(ratio {ratio:.2f} {comparison} threshold {off_peak_ratio_threshold})"
++    credential = ClientSecretCredential(
++        tenant_id=settings.azure_tenant_id,
++        client_id=settings.azure_client_id,
++        client_secret=settings.azure_client_secret,
 +    )
-+    return PeakOffPeakUsageResult(peak_avg, off_peak_avg, False, is_flagged, detail)
-diff --git a/backend/app/services/rightsizing.py b/backend/app/services/rightsizing.py
-index a61eaa4..72d58a6 100644
---- a/backend/app/services/rightsizing.py
-+++ b/backend/app/services/rightsizing.py
-@@ -8,19 +8,11 @@ from app.models.resource import Resource
- from app.models.utilization_metric import UtilizationMetric
- from app.services.azure_inventory import get_or_create_cloud_account
- from app.services.cost_lookup import get_resource_daily_costs
-+from app.services.cpu_metrics import CPU_METRIC_BY_RESOURCE_TYPE
- from app.services.forecasting.linear_burn_rate import LinearBurnRateModel
- from app.services.sku_heuristics import SkuSuggestion, suggest_app_service_tier, suggest_vm_sku
- from app.services.utilization_evaluation import evaluate_cpu_utilization
- 
--# The CPU metric azure_utilization.py stores for each resource type it
--# supports - must match RESOURCE_TYPE_METRICS in that module (kept as a
--# separate explicit mapping rather than reaching into that list's ordering,
--# since "first metric in the sync list" isn't a documented contract).
--CPU_METRIC_BY_RESOURCE_TYPE: dict[str, str] = {
--    "microsoft.compute/virtualmachines": "Percentage CPU",
--    "microsoft.web/sites": "CpuPercentage",
--}
--
- 
- def estimate_monthly_savings(
-     avg_daily_cost: float | None, cores_reduction_fraction: float | None
-diff --git a/backend/tests/test_non_peak_scheduling.py b/backend/tests/test_non_peak_scheduling.py
++    token = credential.get_token("https://management.azure.com/.default").token
++    url = (
++        f"https://management.azure.com/subscriptions/{subscription_id}"
++        f"/providers/Microsoft.Consumption/reservationRecommendations"
++        f"?api-version={API_VERSION}"
++    )
++    response = httpx.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=REQUEST_TIMEOUT_SECONDS)
++    response.raise_for_status()
++    return response.json().get("value", [])
++
++
++# Field-mapping note, surfaced both here and in the endpoint's response:
++# these names are taken from Microsoft's documented schema for this API, NOT
++# verified against a real populated response the way Tasks 9/10 verified
++# their field-name assumptions against real synced data - Phase 1's live call
++# returned an empty result set (this subscription genuinely has no
++# recommendations to give yet), so there was nothing populated to check
++# field names against. The full raw API item is preserved under `raw` on
++# every mapped recommendation specifically so nothing is lost if a mapped
++# field name here turns out to be wrong once real data exists.
++FIELD_MAPPING_NOTE = (
++    "Field names are mapped per Microsoft's documented schema for this API, not verified against a "
++    "real populated response - this subscription's usage history hasn't produced any recommendations "
++    "yet to check field names against (see Task 12 investigation notes). Each recommendation's full "
++    "raw API response is included under `raw` so nothing is lost if a mapped field name is wrong."
++)
++
++
++def map_recommendation(item: dict[str, Any]) -> dict[str, Any]:
++    """Normalize one Azure reservationRecommendations item into a shape
++    roughly consistent with the other recommendation endpoints (resource/
++    scope identified, a basis, an estimated savings figure) - without forcing
++    fields Azure's response doesn't naturally have into that shape. The
++    `raw` field is the actual source of truth; everything else here is a
++    best-effort, unverified convenience mapping (see FIELD_MAPPING_NOTE).
++    """
++    properties = item.get("properties") or {}
++    return {
++        "id": item.get("id"),
++        "sku": item.get("sku"),
++        "location": item.get("location"),
++        "resource_type": properties.get("resourceType"),
++        "scope": properties.get("scope"),
++        "term": properties.get("term"),
++        "look_back_period": properties.get("lookBackPeriod"),
++        "recommended_quantity": properties.get("recommendedQuantity"),
++        "cost_with_no_reserved_instances": properties.get("costWithNoReservedInstances"),
++        "total_cost_with_reserved_instances": properties.get("totalCostWithReservedInstances"),
++        "estimated_monthly_savings": properties.get("netSavings"),
++        "currency": properties.get("currency"),
++        "raw": item,
++    }
++
++
++def build_reservation_recommendations(
++    fetch: Callable[[str], list[dict[str, Any]]] = fetch_reservation_recommendations,
++) -> dict[str, Any]:
++    subscription_id = settings.azure_subscription_id
++    raw_items = fetch(subscription_id)
++    return {
++        "source": "Azure Microsoft.Consumption reservationRecommendations API (live call, not computed locally)",
++        "field_mapping_note": FIELD_MAPPING_NOTE,
++        "recommendations": [map_recommendation(item) for item in raw_items],
++    }
+diff --git a/backend/tests/test_reserved_instances.py b/backend/tests/test_reserved_instances.py
 new file mode 100644
-index 0000000..f9fc505
+index 0000000..8a0869a
 --- /dev/null
-+++ b/backend/tests/test_non_peak_scheduling.py
-@@ -0,0 +1,183 @@
-+from datetime import date, datetime, timedelta, timezone
++++ b/backend/tests/test_reserved_instances.py
+@@ -0,0 +1,91 @@
++from app.services.reserved_instances import build_reservation_recommendations, map_recommendation
 +
-+from app.core.config import settings
-+from app.models.cloud_account import CloudAccount
-+from app.models.cost_record import CostRecord
-+from app.models.provider import Provider
-+from app.models.resource import Resource
-+from app.models.utilization_metric import UtilizationMetric
-+from app.services.azure_inventory import get_or_create_cloud_account
-+from app.services.non_peak_scheduling import build_non_peak_scheduling_recommendations
-+
-+LOOKBACK_DAYS = 14  # matches settings.idle_lookback_days default
-+# 2026-09-14 is a Monday - starting here gives a clean 2-full-week window.
-+MONDAY = datetime(2026, 9, 14, tzinfo=timezone.utc)
-+
-+
-+def _seed_account(db_session, external_id: str) -> CloudAccount:
-+    account = CloudAccount(provider=Provider.AZURE, external_id=external_id, display_name="Non-Peak Test Sub")
-+    db_session.add(account)
-+    db_session.flush()
-+    return account
++RAW_ITEM = {
++    "id": "/subscriptions/.../providers/Microsoft.Consumption/reservationRecommendations/abc123",
++    "sku": "Standard_D2s_v3",
++    "location": "eastus",
++    "properties": {
++        "resourceType": "VirtualMachines",
++        "scope": "Single",
++        "term": "P1Y",
++        "lookBackPeriod": "Last30Days",
++        "recommendedQuantity": 2,
++        "costWithNoReservedInstances": 500.0,
++        "totalCostWithReservedInstances": 320.0,
++        "netSavings": 180.0,
++        "currency": "USD",
++    },
++}
 +
 +
-+def _add_vm(db_session, account, external_id, name, tags=None, resource_group="rg-a") -> Resource:
-+    vm = Resource(
-+        cloud_account_id=account.id,
-+        provider=Provider.AZURE,
-+        external_resource_id=external_id,
-+        resource_type="microsoft.compute/virtualmachines",
-+        resource_group=resource_group,
-+        region="eastus",
-+        tags=tags or {},
-+        raw_metadata={"name": name},
-+    )
-+    db_session.add(vm)
-+    db_session.flush()
-+    return vm
++def test_map_recommendation_extracts_documented_fields():
++    mapped = map_recommendation(RAW_ITEM)
++
++    assert mapped["sku"] == "Standard_D2s_v3"
++    assert mapped["location"] == "eastus"
++    assert mapped["resource_type"] == "VirtualMachines"
++    assert mapped["scope"] == "Single"
++    assert mapped["term"] == "P1Y"
++    assert mapped["look_back_period"] == "Last30Days"
++    assert mapped["recommended_quantity"] == 2
++    assert mapped["cost_with_no_reserved_instances"] == 500.0
++    assert mapped["total_cost_with_reserved_instances"] == 320.0
++    assert mapped["estimated_monthly_savings"] == 180.0
++    assert mapped["currency"] == "USD"
 +
 +
-+def _add_readings(db_session, resource, entries, metric_name="Percentage CPU"):
-+    for ts, value in entries:
-+        db_session.add(
-+            UtilizationMetric(resource_id=resource.id, metric_name=metric_name, timestamp=ts, value=value, unit="Percent")
-+        )
++def test_map_recommendation_preserves_full_raw_item():
++    # The raw item is kept verbatim specifically because the field mapping
++    # itself is unverified against real populated data (see
++    # FIELD_MAPPING_NOTE) - nothing should be lost if a mapped name is wrong.
++    mapped = map_recommendation(RAW_ITEM)
++
++    assert mapped["raw"] == RAW_ITEM
 +
 +
-+def _weekday_readings(start, days, hour, value):
-+    return [
-+        (start.replace(hour=hour) + timedelta(days=d), value)
-+        for d in range(days)
-+        if (start + timedelta(days=d)).weekday() < 5
-+    ]
++def test_map_recommendation_missing_properties_does_not_crash():
++    mapped = map_recommendation({"id": "x", "sku": "Standard_D2s_v3"})
++
++    assert mapped["resource_type"] is None
++    assert mapped["estimated_monthly_savings"] is None
++    assert mapped["raw"] == {"id": "x", "sku": "Standard_D2s_v3"}
 +
 +
-+def _daily_readings(start, days, hour, value):
-+    return [(start.replace(hour=hour) + timedelta(days=d), value) for d in range(days)]
++def test_build_reservation_recommendations_maps_every_item():
++    def fake_fetch(subscription_id):
++        return [RAW_ITEM, {**RAW_ITEM, "sku": "Standard_D4s_v3"}]
++
++    result = build_reservation_recommendations(fetch=fake_fetch)
++
++    assert len(result["recommendations"]) == 2
++    assert result["recommendations"][0]["sku"] == "Standard_D2s_v3"
++    assert result["recommendations"][1]["sku"] == "Standard_D4s_v3"
++    assert "not computed locally" in result["source"].lower()
++    assert "not verified" in result["field_mapping_note"].lower()
 +
 +
-+def _add_cost(db_session, account, resource, day, amount):
-+    db_session.add(
-+        CostRecord(
-+            cloud_account_id=account.id,
-+            resource_id=resource.id,
-+            date=day,
-+            amortized_cost=amount,
-+            currency="USD",
-+            granularity="Daily",
-+            charge_type="Usage",
-+        )
-+    )
++def test_build_reservation_recommendations_empty_result_is_not_an_error():
++    # This is the actual shape of the real subscription's live response
++    # (Task 12 Phase 1 investigation): a successful call, zero items, because
++    # the subscription's usage history hasn't produced a recommendation yet -
++    # not a failure case.
++    def fake_fetch(subscription_id):
++        return []
 +
-+
-+def test_flags_resource_by_tag_alone(db_session):
-+    account = _seed_account(db_session, "test-sub-nonpeak-tag")
-+    vm = _add_vm(db_session, account, "vm-tag-dev", "app-prod-lookalike-01", tags={"environment": "dev"})
-+    for offset in range(LOOKBACK_DAYS):
-+        _add_cost(db_session, account, vm, date(2026, 9, 1) + timedelta(days=offset), 4.0)
-+    db_session.commit()
-+
-+    result = build_non_peak_scheduling_recommendations(db_session, cloud_account_id=account.id)
-+
-+    assert len(result["recommendations"]) == 1
-+    rec = result["recommendations"][0]
-+    assert rec["external_resource_id"] == "vm-tag-dev"
-+    assert rec["signals"]["tag"]["matched"] is True
-+    assert rec["signals"]["naming"]["matched"] is False
-+    assert rec["estimated_monthly_savings"] is not None
-+
-+
-+def test_flags_resource_by_name_alone(db_session):
-+    account = _seed_account(db_session, "test-sub-nonpeak-name")
-+    _add_vm(db_session, account, "vm-name-test", "app-test-01", tags={"environment": "production"})
-+    db_session.commit()
-+
-+    result = build_non_peak_scheduling_recommendations(db_session, cloud_account_id=account.id)
-+
-+    assert len(result["recommendations"]) == 1
-+    rec = result["recommendations"][0]
-+    assert rec["signals"]["tag"]["matched"] is False
-+    assert rec["signals"]["naming"]["matched"] is True
-+
-+
-+def test_flags_production_tagged_resource_on_usage_pattern_alone(db_session):
-+    account = _seed_account(db_session, "test-sub-nonpeak-usage")
-+    vm = _add_vm(db_session, account, "vm-prod-but-dips", "app-prod-01", tags={"environment": "production"})
-+    peak = _weekday_readings(MONDAY, LOOKBACK_DAYS, hour=13, value=80.0)
-+    off_peak = _daily_readings(MONDAY, LOOKBACK_DAYS, hour=2, value=5.0)
-+    _add_readings(db_session, vm, peak + off_peak)
-+    db_session.commit()
-+
-+    result = build_non_peak_scheduling_recommendations(db_session, cloud_account_id=account.id)
-+
-+    assert len(result["recommendations"]) == 1
-+    rec = result["recommendations"][0]
-+    assert rec["signals"]["tag"]["matched"] is False
-+    assert rec["signals"]["naming"]["matched"] is False
-+    assert rec["signals"]["usage_pattern"]["matched"] is True
-+    assert rec["signals"]["usage_pattern"]["peak_avg_cpu_percent"] == 80.0
-+    assert rec["signals"]["usage_pattern"]["off_peak_avg_cpu_percent"] == 5.0
-+
-+
-+def test_does_not_flag_always_busy_production_resource(db_session):
-+    account = _seed_account(db_session, "test-sub-nonpeak-busy")
-+    vm = _add_vm(db_session, account, "vm-prod-busy", "app-prod-02", tags={"environment": "production"})
-+    peak = _weekday_readings(MONDAY, LOOKBACK_DAYS, hour=13, value=75.0)
-+    off_peak = _daily_readings(MONDAY, LOOKBACK_DAYS, hour=2, value=70.0)
-+    _add_readings(db_session, vm, peak + off_peak)
-+    db_session.commit()
-+
-+    result = build_non_peak_scheduling_recommendations(db_session, cloud_account_id=account.id)
++    result = build_reservation_recommendations(fetch=fake_fetch)
 +
 +    assert result["recommendations"] == []
 +
 +
-+def test_savings_estimate_uses_off_peak_fraction_of_week(db_session):
-+    account = _seed_account(db_session, "test-sub-nonpeak-savings")
-+    vm = _add_vm(db_session, account, "vm-savings-check", "app-test-savings", tags={})
-+    for offset in range(LOOKBACK_DAYS):
-+        _add_cost(db_session, account, vm, date(2026, 9, 1) + timedelta(days=offset), 10.0)
-+    db_session.commit()
++def test_build_reservation_recommendations_passes_configured_subscription_id():
++    from app.core.config import settings
 +
-+    result = build_non_peak_scheduling_recommendations(db_session, cloud_account_id=account.id)
++    seen_subscription_ids = []
 +
-+    rec = result["recommendations"][0]
-+    # 10.0/day * 30 * (118/168 off-hours fraction of the week)
-+    expected = round(10.0 * 30 * (118 / 168), 2)
-+    assert rec["estimated_monthly_savings"] == expected
++    def fake_fetch(subscription_id):
++        seen_subscription_ids.append(subscription_id)
++        return []
 +
++    build_reservation_recommendations(fetch=fake_fetch)
 +
-+def test_flagged_resource_with_no_cost_data_has_null_savings(db_session):
-+    account = _seed_account(db_session, "test-sub-nonpeak-no-cost")
-+    _add_vm(db_session, account, "vm-no-cost-history", "app-dev-nocosthist", tags={})
-+    db_session.commit()
-+
-+    result = build_non_peak_scheduling_recommendations(db_session, cloud_account_id=account.id)
-+
-+    rec = result["recommendations"][0]
-+    assert rec["estimated_monthly_savings"] is None
-+    assert "no cost data" in rec["savings_note"].lower()
-+
-+
-+def test_response_includes_settings_and_business_hours_definition(db_session):
-+    account = _seed_account(db_session, "test-sub-nonpeak-settings")
-+    db_session.commit()
-+
-+    result = build_non_peak_scheduling_recommendations(db_session, cloud_account_id=account.id)
-+
-+    assert result["idle_lookback_days"] == settings.idle_lookback_days
-+    assert result["off_peak_usage_ratio_threshold"] == settings.off_peak_usage_ratio_threshold
-+    assert "UTC" in result["business_hours_definition"]
-+
-+
-+def test_endpoint_returns_200_against_seeded_data(client, db_session):
-+    account = get_or_create_cloud_account(db_session, settings.azure_subscription_id)
-+    _add_vm(db_session, account, "vm-endpoint-dev", "app-dev-endpoint", tags={"environment": "dev"})
-+    db_session.commit()
-+
-+    response = client.get("/api/v1/recommendations/non-peak-scheduling")
-+
-+    assert response.status_code == 200
-+    body = response.json()
-+    external_ids = {rec["external_resource_id"] for rec in body["recommendations"]}
-+    assert "vm-endpoint-dev" in external_ids
-diff --git a/backend/tests/test_non_prod_heuristics.py b/backend/tests/test_non_prod_heuristics.py
-new file mode 100644
-index 0000000..84f86d1
---- /dev/null
-+++ b/backend/tests/test_non_prod_heuristics.py
-@@ -0,0 +1,70 @@
-+from app.services.non_prod_heuristics import detect_non_prod_by_name, detect_non_prod_by_tag
-+
-+# --- tag heuristic -----------------------------------------------------------
-+
-+
-+def test_detect_non_prod_by_tag_matches_environment_key():
-+    result = detect_non_prod_by_tag({"environment": "dev"})
-+
-+    assert result.matched is True
-+    assert "environment" in result.detail
-+
-+
-+def test_detect_non_prod_by_tag_matches_env_key_case_insensitively():
-+    result = detect_non_prod_by_tag({"Env": "STAGING"})
-+
-+    assert result.matched is True
-+
-+
-+def test_detect_non_prod_by_tag_does_not_match_production_value():
-+    result = detect_non_prod_by_tag({"environment": "production"})
-+
-+    assert result.matched is False
-+
-+
-+def test_detect_non_prod_by_tag_does_not_match_unrelated_tags():
-+    result = detect_non_prod_by_tag({"owner": "platform-team", "costCenter": "1234"})
-+
-+    assert result.matched is False
-+
-+
-+def test_detect_non_prod_by_tag_empty_tags_does_not_match():
-+    assert detect_non_prod_by_tag({}).matched is False
-+    assert detect_non_prod_by_tag(None).matched is False
-+
-+
-+def test_detect_non_prod_by_tag_matches_each_documented_value():
-+    for value in ("dev", "test", "staging", "sandbox"):
-+        assert detect_non_prod_by_tag({"environment": value}).matched is True
-+
-+
-+# --- naming heuristic ----------------------------------------------------------
-+
-+
-+def test_detect_non_prod_by_name_matches_dev_substring():
-+    result = detect_non_prod_by_name("nise-dev")
-+
-+    assert result.matched is True
-+    assert "dev" in result.detail
-+
-+
-+def test_detect_non_prod_by_name_case_insensitive():
-+    result = detect_non_prod_by_name("APP-STAGING-01")
-+
-+    assert result.matched is True
-+
-+
-+def test_detect_non_prod_by_name_does_not_match_production_name():
-+    result = detect_non_prod_by_name("prod-api-01")
-+
-+    assert result.matched is False
-+
-+
-+def test_detect_non_prod_by_name_matches_each_documented_keyword():
-+    for keyword in ("dev", "test", "staging", "sandbox", "demo"):
-+        assert detect_non_prod_by_name(f"app-{keyword}-01").matched is True
-+
-+
-+def test_detect_non_prod_by_name_missing_name_does_not_match():
-+    assert detect_non_prod_by_name(None).matched is False
-+    assert detect_non_prod_by_name("").matched is False
-diff --git a/backend/tests/test_peak_usage_evaluation.py b/backend/tests/test_peak_usage_evaluation.py
-new file mode 100644
-index 0000000..0d36cd2
---- /dev/null
-+++ b/backend/tests/test_peak_usage_evaluation.py
-@@ -0,0 +1,123 @@
-+from datetime import datetime, timedelta, timezone
-+
-+from app.services.peak_usage_evaluation import evaluate_peak_off_peak_usage, is_business_hours
-+
-+# 2026-09-14 is a Monday.
-+MONDAY = datetime(2026, 9, 14, tzinfo=timezone.utc)
-+
-+
-+def test_is_business_hours_weekday_inside_window():
-+    assert is_business_hours(MONDAY.replace(hour=8)) is True  # window start, inclusive
-+    assert is_business_hours(MONDAY.replace(hour=13)) is True
-+    assert is_business_hours(MONDAY.replace(hour=17)) is True  # last hour inside
-+
-+
-+def test_is_business_hours_weekday_outside_window():
-+    assert is_business_hours(MONDAY.replace(hour=7)) is False  # just before
-+    assert is_business_hours(MONDAY.replace(hour=18)) is False  # window end, exclusive
-+    assert is_business_hours(MONDAY.replace(hour=23)) is False
-+
-+
-+def test_is_business_hours_weekend_is_never_business_hours():
-+    saturday = MONDAY + timedelta(days=5)
-+    sunday = MONDAY + timedelta(days=6)
-+    assert is_business_hours(saturday.replace(hour=12)) is False
-+    assert is_business_hours(sunday.replace(hour=12)) is False
-+
-+
-+def _daily_readings(start: datetime, days: int, hour: int, value: float) -> list[tuple[datetime, float]]:
-+    return [(start.replace(hour=hour) + timedelta(days=d), value) for d in range(days)]
-+
-+
-+def _weekday_readings(start: datetime, days: int, hour: int, value: float) -> list[tuple[datetime, float]]:
-+    """Like _daily_readings, but skips weekends - for building "peak" streams
-+    without leaking a weekend reading at a business-hours clock time into the
-+    off-peak bucket (weekends are off-peak regardless of hour)."""
-+    return [
-+        (start.replace(hour=hour) + timedelta(days=d), value)
-+        for d in range(days)
-+        if (start + timedelta(days=d)).weekday() < 5
-+    ]
-+
-+
-+def test_evaluate_peak_off_peak_usage_flags_business_app_pattern():
-+    # Busy during business hours, quiet at night, over a full 14-day window
-+    # (2 weeks) so both weekday and weekend off-peak readings exist.
-+    start = MONDAY
-+    peak_readings = _weekday_readings(start, days=14, hour=13, value=80.0)
-+    off_peak_readings = _daily_readings(start, days=14, hour=2, value=5.0)
-+
-+    result = evaluate_peak_off_peak_usage(peak_readings + off_peak_readings, lookback_days=14, off_peak_ratio_threshold=0.5)
-+
-+    assert result.insufficient_data is False
-+    assert result.peak_avg_cpu_percent == 80.0
-+    assert result.off_peak_avg_cpu_percent == 5.0
-+    assert result.is_flagged is True
-+
-+
-+def test_evaluate_peak_off_peak_usage_does_not_flag_always_busy_resource():
-+    start = MONDAY
-+    readings = _weekday_readings(start, days=14, hour=13, value=70.0) + _daily_readings(start, days=14, hour=2, value=65.0)
-+
-+    result = evaluate_peak_off_peak_usage(readings, lookback_days=14, off_peak_ratio_threshold=0.5)
-+
-+    assert result.insufficient_data is False
-+    assert result.is_flagged is False
-+
-+
-+def test_evaluate_peak_off_peak_usage_ratio_boundary_is_inclusive():
-+    start = MONDAY
-+    readings = _weekday_readings(start, days=14, hour=13, value=10.0) + _daily_readings(start, days=14, hour=2, value=5.0)
-+
-+    # off-peak/peak == 0.5 exactly, threshold 0.5 - flags (<=, not strictly <).
-+    result = evaluate_peak_off_peak_usage(readings, lookback_days=14, off_peak_ratio_threshold=0.5)
-+
-+    assert result.is_flagged is True
-+
-+
-+def test_evaluate_peak_off_peak_usage_zero_peak_is_not_flagged():
-+    # Idle around the clock - peak avg is 0, so the ratio isn't meaningful;
-+    # this is rightsizing's territory, not a peak/off-peak pattern.
-+    start = MONDAY
-+    readings = _daily_readings(start, days=14, hour=13, value=0.0) + _daily_readings(start, days=14, hour=2, value=0.0)
-+
-+    result = evaluate_peak_off_peak_usage(readings, lookback_days=14, off_peak_ratio_threshold=0.5)
-+
-+    assert result.insufficient_data is False
-+    assert result.is_flagged is False
-+
-+
-+def test_evaluate_peak_off_peak_usage_insufficient_history_excludes_not_flags():
-+    start = MONDAY
-+    # Only 3 days against a 14-day window, even though the pattern is a
-+    # textbook business-hours dip.
-+    readings = _daily_readings(start, days=3, hour=13, value=90.0) + _daily_readings(start, days=3, hour=2, value=1.0)
-+
-+    result = evaluate_peak_off_peak_usage(readings, lookback_days=14, off_peak_ratio_threshold=0.5)
-+
-+    assert result.insufficient_data is True
-+    assert result.is_flagged is False
-+    assert result.peak_avg_cpu_percent is None
-+
-+
-+def test_evaluate_peak_off_peak_usage_no_readings_is_insufficient_data():
-+    result = evaluate_peak_off_peak_usage([], lookback_days=14, off_peak_ratio_threshold=0.5)
-+
-+    assert result.insufficient_data is True
-+    assert result.is_flagged is False
-+
-+
-+def test_evaluate_peak_off_peak_usage_missing_one_bucket_is_insufficient_data():
-+    # 14 calendar days of history, but every reading is a weekday business-hour
-+    # timestamp - no night or weekend readings at all, so the off-peak bucket
-+    # is empty and the comparison can't be made.
-+    start = MONDAY
-+    readings = [
-+        (start.replace(hour=13) + timedelta(days=d), 50.0)
-+        for d in range(14)
-+        if (start + timedelta(days=d)).weekday() < 5
-+    ]
-+
-+    result = evaluate_peak_off_peak_usage(readings, lookback_days=14, off_peak_ratio_threshold=0.5)
-+
-+    assert result.insufficient_data is True
++    assert seen_subscription_ids == [settings.azure_subscription_id]
 ```

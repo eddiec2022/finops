@@ -1,94 +1,69 @@
-# TASK 11 - Recommendations: Non-Peak Scheduling
+
+# TASK 12 - Recommendations: RI/Savings Plan (Investigation + Build)
 
 ## Context
-Tasks 9 and 10 covered rightsizing and idle/orphaned detection. This task adds the
-third recommendation category per GOV-001 Section 3.5: identify likely non-production
-resources with low overnight/weekend usage, and recommend a start/stop schedule as a
-suggestion (not an automated action - v1 is advisory only). RI/Savings Plan
-recommendations remain the last category, a separate task after this one.
+Tasks 9-11 covered the first three recommendation categories using custom heuristics
+against data already ingested. This is the fourth and last category per GOV-001
+Section 3.5: Reserved Instance / Savings Plan recommendations for steady-state
+on-demand usage. Unlike the first three, Azure has a native API for this
+(Microsoft.Consumption reservation recommendations) that could produce more accurate
+savings numbers than another custom heuristic - but it's genuinely unknown whether
+the current service principal's permissions (Reader + Cost Management Reader at
+subscription scope, from Task 2) are sufficient to use it. Investigate before
+committing to a design.
 
-## Scope
+## Scope - Phase 1: Investigation (do this first, don't skip to building)
 
-1. Endpoint - GET /api/v1/recommendations/non-peak-scheduling
-   - Compute-on-read, same philosophy as the other recommendation endpoints
+1. Attempt to call the Microsoft.Consumption reservation recommendations API
+   (GET .../providers/Microsoft.Consumption/reservationRecommendations, or the
+   current SDK equivalent in azure-mgmt-consumption if that's cleaner than raw
+   REST) against the real subscription, using the existing service principal
+   credentials already in .env
+2. Record exactly what happens - a successful response (even if empty, which is
+   plausible given this dev subscription's usage patterns), a permission/auth
+   error (capture the exact error), or something else entirely
+3. If it requires a role/permission the service principal doesn't currently have:
+   STOP HERE. Don't request expanded permissions or add roles yourself - per
+   CLAUDE.md, this is a security-relevant change and Edson's call to make
+   explicitly, not something to work around. Report exactly what's missing
+   (the specific role or permission name from the error) so a real decision can
+   be made
+4. If it works (even with an empty result): note whether the empty result is
+   because the dev subscription genuinely has no steady-state usage pattern
+   yet to recommend against (matches everything Tasks 9-11 already found about
+   this environment's short history), not a bug
 
-2. "Likely non-production" signal
-   - GOV-001 says this can come from tags, naming convention, OR usage pattern -
-     not all three required. Build at least: a tag-based check (common
-     environment-indicating tag keys like "environment"/"env" with values like
-     "dev"/"test"/"staging"/"sandbox" - check what's actually in the real
-     synced resources' tags before hardcoding an exact tag key/value list) and
-     a naming-convention check (resource name containing dev/test/staging/
-     sandbox/demo, case-insensitive). Both are heuristics, not certainties -
-     label results accordingly, same spirit as the SKU suggestion heuristic
-     in Task 9
-   - A resource can also qualify purely on usage pattern (see below) without
-     matching either tag or naming heuristic - don't require all signals to
-     agree, any one is sufficient per GOV-001's wording
+## Scope - Phase 2: Build (only if Phase 1 confirms API access works)
 
-3. Usage pattern analysis
-   - For VMs and App Services, using the existing CPU utilization data:
-     compute average CPU during "peak" hours (weekday, business hours) versus
-     "off-peak" hours (nights and weekends), over the trailing
-     idle_lookback_days window
-   - This needs actual time-of-day/day-of-week bucketing of
-     utilization_metrics.timestamp - a genuinely different kind of analysis
-     than the flat-average approach evaluate_cpu_utilization uses for
-     rightsizing. Build it as its own function, don't try to force-fit the
-     existing one
-   - Business hours definition is a real v1 simplification worth being
-     explicit about: use a fixed weekday 8am-6pm UTC window rather than
-     per-resource timezone detection (there's no reliable timezone signal in
-     what's synced) - state this assumption plainly in the response, don't
-     bury it
-   - Flag a resource when off-peak usage is meaningfully lower than peak
-     usage - pick a reasonable threshold (e.g. a ratio) and make it a
-     configurable setting following the established pattern, not a hardcoded
-     magic number
-   - Resources with insufficient history for this analysis follow the same
-     "exclude, don't guess" principle as every other recommendation endpoint
-     so far
+If and only if Phase 1 succeeds:
 
-4. Recommended schedule
-   - v1 doesn't need a fully custom per-resource schedule derived from the
-     exact observed pattern - a standard template (e.g. "power off weeknights
-     outside business hours, power off entirely on weekends") is a reasonable
-     v1 scope. State it as a suggested starting point, not a precise
-     optimization
-   - Estimate monthly savings from the hours that would be powered off,
-     using the same average-daily-cost-from-cost_records approach as the
-     other two recommendation categories, scaled to the fraction of a
-     week/month the schedule would have the resource off
-
-5. Tests
-   - Unit test the peak/off-peak bucketing logic against fixture timestamps
-     spanning weekdays, weekends, and both sides of the business-hours
-     boundary
-   - Unit test the tag and naming heuristics
-   - Integration test the endpoint against seeded data covering: a clear
-     non-prod-by-tag candidate, a clear non-prod-by-name candidate, a
-     production-tagged resource with an off-peak usage dip anyway (still
-     qualifies, since usage pattern alone is sufficient), and a resource
-     that's busy around the clock (should not be flagged)
+1. Endpoint - GET /api/v1/recommendations/reserved-instances
+   - A live call to the Consumption API is a different pattern than the other
+     three recommendation endpoints (which are pure DB reads) - that's fine
+     and expected here, since this is Azure's own recommendation engine, not
+     something to reimplement. Don't force this into the compute-on-read-
+     from-DB pattern just for consistency with the others
+2. Map the API's response into a consistent shape with the other three
+   recommendation endpoints where it makes sense (resource/scope identified,
+   a reason/basis, an estimated savings figure) - but don't force Azure's own
+   fields to fit a shape they don't naturally have. If the response shape is
+   meaningfully different, that's fine - explain the difference rather than
+   mangling it to look uniform
+3. Tests - mock the Consumption API client for the automated suite, same
+   "no live credentials needed for pytest" principle as every other connector
+   (Tasks 2/5/6). A live check against the real subscription is still the
+   deliverable, same as always, on top of the mocked tests
 
 ## Explicitly out of scope for this task
-- RI/Savings Plan recommendations - the last recommendation category, separate task
-- Empty resource group detection - still deferred from Task 10, will be its own
-  small task
-- Any actual scheduling/automation - v1 is advisory only, this only ever returns
-  a suggestion
-- Per-resource custom schedule optimization beyond the standard template
+- Empty resource group detection - still deferred, separate small task
+- Any UI/dashboard changes
+- Expanding service principal permissions - if Phase 1 needs this, stop and
+  report, don't do it
 
 ## Deliverable for review (write to results.txt per CLAUDE.md)
-- Full diff
-- Actual pytest output - run it yourself
-- A live check against the real subscription: call the endpoint, and if it
-  returns empty, explain why using the real data the same way Task 9 and 10
-  did - don't just report the number
+- Phase 1 findings clearly, even if Phase 2 never happens because of them -
+  this is a real deliverable on its own, not just a preamble to the build
+- If Phase 2 happened: full diff, actual pytest output, live check results
 - Status of the WSL2/dockerd restart monitor log during this task's work
 
 Same rule as before: if anything here is ambiguous, flag it rather than guessing.
-Same rule as Task 10 too: if something here turns out to not match what's actually
-in the synced data, verify against the real data and say so rather than building on
-an assumption that doesn't hold - that's exactly what caught the managedBy issue
-last time.
