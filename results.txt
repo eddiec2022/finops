@@ -1,132 +1,149 @@
-# TASK 9 RESULTS - Recommendations: Rightsizing
+# TASK 10 RESULTS - Recommendations: Idle/Orphaned Resource Detection
 
 ## Summary
 
-Added `GET /api/v1/recommendations/rightsizing`, compute-on-read against
-`utilization_metrics`, `resources`, and `cost_records` already in the DB - no
-new external calls, no persistence. For each VM and App Service, it computes
-average CPU over the trailing `idle_lookback_days` window (Task 5's setting,
-not a new one), flags anything below `idle_cpu_threshold_percent` (also Task
-5's), suggests a smaller VM SKU via a core-count-halving heuristic (explicitly
-labeled as a naming-pattern guess, not a live Azure availability check), and
-estimates monthly savings from `cost_records` (explicitly labeled
-approximate). Resources with less utilization history than the lookback
-window are excluded outright, not flagged on partial data - same principle as
-the forecasting model's "insufficient data" handling from Task 7/8.
+Added `GET /api/v1/recommendations/idle-resources`, compute-on-read, same
+philosophy as forecasting/rightsizing - no new external calls, no
+persistence. Flags three things: unattached managed disks, unassociated
+public IPs, and VMs that are stopped-but-not-deallocated (still billing).
+Estimated monthly waste reuses the same `LinearBurnRateModel`-based average-
+daily-cost approach as Task 9's savings estimate.
 
-All 50 tests pass (20 new). Live check against the real subscription returns
-an empty recommendation list, and that's the *correct* answer given the real
-data currently in the DB - see "Live check" below for why, which is itself a
-demonstration that the insufficient-history exclusion rule is working as
-specified rather than a null result I'm asking you to take on faith.
+**The power-state investigation (task step 4) resolved cleanly: no live
+per-VM API call is needed.** Checked the real synced VM's `raw_metadata`
+directly and confirmed `properties.extended.instanceView.powerState.code`
+is already present from the existing Task 2 Resource Graph connector's query
+- no connector change was needed at all. This keeps the endpoint fully
+compute-on-read, same as the other two checks - not the "live external
+dependency" tradeoff the task asked me to flag if the alternative turned out
+to be necessary. Full detail under "Power-state investigation" below.
+
+**One of the task's own field-name assumptions turned out to be wrong, and I
+did not build on it uncritically.** The task said unattached-disk detection
+should use Resource Graph's `managedBy` field. I checked the real synced
+disk's `raw_metadata` first, per the task's own instruction to verify rather
+than guess - `managedBy` isn't projected by the existing connector's query
+and isn't in the stored data at all. Used `properties.diskState` instead
+(Azure's own explicit attachment-state field, which *is* present and is
+arguably a cleaner signal than `managedBy` would have been). See "Design
+decisions" below.
+
+All 75 tests pass (25 new). Live check against the real subscription returns
+an empty recommendation list - correctly, since the one real disk is
+Attached, the one real public IP is associated, and the one real VM is
+Running, none of which are the flagged states.
 
 ## Files changed/added
 
-- `backend/app/services/utilization_evaluation.py` (new) - pure function
-  `evaluate_cpu_utilization()`: takes a list of (timestamp, value) readings,
-  windows to the trailing `lookback_days` ending on the most recent reading,
-  returns avg CPU%, an `insufficient_data` flag, and an `is_idle` flag. No DB
-  access - unit-testable in isolation, same shape as `LinearBurnRateModel`.
-- `backend/app/services/sku_heuristics.py` (new) - `suggest_vm_sku()` parses
-  the `<family><cores><suffix>` component of a VM SKU name (e.g. "D4s" in
-  "Standard_D4s_v3") and halves the core count, staying in the same
-  family/suffix/version. `suggest_app_service_tier()` always declines to
-  suggest a specific tier (see "App Service tier decision" below). Both
-  return an `SkuSuggestion(suggested_sku, note, cores_reduction_fraction)` -
-  `note` is always populated, even on a "no suggestion" result, so the
-  caller/response never has to guess why.
-- `backend/app/services/rightsizing.py` (new) - orchestration:
-  `build_rightsizing_recommendations(db, cloud_account_id=None)`. Queries
-  VMs/App Services for the account, runs each through
-  `evaluate_cpu_utilization`, skips non-idle and insufficient-history
-  resources, calls the SKU heuristic, and estimates savings by reusing
-  `LinearBurnRateModel` (Task 8's tested calendar-window/zero-fill logic) to
-  get the resource's average daily cost over the same lookback window, scaled
-  by the SKU suggestion's core-reduction fraction.
-- `backend/app/api/recommendations.py` (new) - the FastAPI route.
-- `backend/app/main.py` - registered the new router (1-line diff x2).
-- `backend/tests/test_utilization_evaluation.py` (new, 6 tests) - clearly
-  idle, clearly busy, insufficient-history (only 3 of 14 days), no data at
-  all, trailing-window-only (old spike outside window doesn't pollute the
-  average), and threshold strictness (avg == threshold is NOT idle).
-- `backend/tests/test_sku_heuristics.py` (new, 8 tests) - halving with a
-  version suffix, halving without one, odd core count (rounds down), already
-  at the smallest size, a constrained-core SKU with an embedded dash
-  ("E8-4s") that must decline rather than mangle, no SKU, an unparseable
-  name, and the App Service "never guesses a tier" behavior.
-- `backend/tests/test_rightsizing.py` (new, 6 tests) - idle VM flagged with
-  suggested SKU and savings math checked by hand, busy VM not flagged,
-  insufficient-history VM excluded, idle App Service flagged without a
-  suggested tier, response echoes the settings used, and an HTTP-level test
-  against the endpoint.
+- `backend/app/services/cost_lookup.py` (new) - `get_resource_daily_costs()`
+  extracted out of `rightsizing.py` so both `rightsizing.py` and the new
+  `idle_resources.py` share one implementation instead of two copies.
+  `rightsizing.py` now imports it from here (small refactor, no behavior
+  change - covered by Task 9's existing tests still passing unchanged).
+- `backend/app/services/idle_resource_detection.py` (new) - three pure,
+  DB-agnostic detection functions: `detect_unattached_disk()`,
+  `detect_unused_public_ip()`, `detect_stopped_not_deallocated_vm()`. Each
+  takes a resource's `raw_metadata` dict and returns an `IdleCheckResult
+  (is_flagged, detail)` - same "pure function, unit-testable in isolation"
+  shape as `evaluate_cpu_utilization()` from Task 9.
+- `backend/app/services/idle_resources.py` (new) - orchestration:
+  `build_idle_resource_recommendations(db, cloud_account_id=None)`. Queries
+  disks/public IPs/VMs, runs each through its detector, and for flagged
+  resources estimates monthly waste via `LinearBurnRateModel` on the
+  resource's own cost history (same reuse pattern as Task 9).
+- `backend/app/api/recommendations.py` - added `GET
+  /api/v1/recommendations/idle-resources` alongside the existing rightsizing
+  route.
+- `backend/tests/test_idle_resource_detection.py` (new, 15 tests) - each
+  detector against attached/unattached, associated/unassociated,
+  running/stopped/deallocated/transitional states, plus missing-field
+  fallback behavior for all three.
+- `backend/tests/test_idle_resources.py` (new, 10 tests) - each check flagged
+  with a waste estimate, each check's negative case not flagged, a
+  flagged-but-no-cost-data case (null estimate, not a crash or a fabricated
+  number), settings echoed in the response, and an HTTP-level endpoint test.
+
+## Power-state investigation (task step 4 - the one place compute-on-read
+might not have held)
+
+The task asked me to investigate whether Resource Graph can return VM power
+state "cheaply" as part of the existing inventory query, since power state
+changes far more often than the rest of inventory data. Rather than reasoning
+from documentation alone, I queried the actual synced VM row in the real dev
+DB:
+
+    properties.extended.instanceView.powerState.code = "PowerState/running"
+
+This is already there, from the *existing* `RESOURCE_GRAPH_QUERY` in
+`azure_inventory.py` (`Resources | project id, name, type, location,
+resourceGroup, tags, sku, properties`) - Azure Resource Graph populates
+`properties.extended.instanceView` for VMs as part of the standard
+`properties` bag, without any special query syntax or a separate live
+per-VM API call. **No change to the Task 2 connector was needed.**
+
+This resolves the task's explicit branch cleanly: this endpoint stays fully
+compute-on-read, reading whatever power state was captured at the last
+inventory sync - same freshness model as SKU, tags, and every other inventory
+field, not a new live-API code path. The tradeoff worth naming (not a design
+decision I made, just a fact to be aware of): the power state reflects the
+last inventory sync, not the instant of the request - if a VM is stopped
+right now but hasn't been re-synced since, this endpoint won't see it yet.
+That's an operational/scheduling question (how often `sync_inventory` runs),
+not something this task's scope changes.
 
 ## Design decisions (flagged explicitly, not silently assumed)
 
-1. **App Service tier suggestion: declined entirely, not attempted.** App
-   Service Plan tiers ("S1", "P2v3", "B1") encode a pricing/feature tier, not
-   a linear compute unit - there's no core-count-style number to halve that
-   reliably lands on a valid smaller tier (P2v3 -> "half of 2"? S1 has no
-   smaller S-tier; B/S/P families aren't ordered the same way). The task text
-   explicitly sanctions this ("it is fine to flag App Services... without a
-   specific suggested tier... explain whichever way you go"), so I took that
-   path rather than inventing an ordinal "one size down" heuristic that would
-   have added complexity and a second, differently-shaped guess to justify.
-   App Services are still flagged as candidates when idle - just with
-   `suggested_sku: null` and a note explaining why.
+1. **Unattached-disk detection uses `properties.diskState`, not `managedBy`
+   as the task suggested.** Checked the real disk's `raw_metadata` first
+   (per the task's own "confirm this field is actually present... before
+   building on it" instruction) and `managedBy` isn't there - the existing
+   connector's Resource Graph query doesn't project it, at any level. Rather
+   than extending the connector's query just to add a field the task assumed
+   would already exist, I used `properties.diskState`, which *is* present
+   and is Azure's own first-class attachment-state field (documented values:
+   "Attached", "Unattached", "Reserved", "ActiveSAS", "ActiveUpload", etc) -
+   arguably a more direct and more granular signal than `managedBy` (a
+   resource-ID-or-null field) would have been. Flags only the exact value
+   `"Unattached"`, not "anything that isn't Attached" - `"Reserved"` (about
+   to be attached) and `"ActiveSAS"` (an export/snapshot in progress) are
+   real, temporary, non-wasteful states that shouldn't be flagged as orphaned
+   capacity, and the unit tests cover both explicitly.
 
-2. **Savings estimate reuses `LinearBurnRateModel` rather than reimplementing
-   windowing.** The estimate needs "average daily cost over the lookback
-   window" for a resource - exactly what Task 8's calendar-day, zero-fill,
-   gap-aware windowing already computes for forecasting. Instead of writing a
-   second version of that logic, `rightsizing.py` calls
-   `LinearBurnRateModel(trailing_window_days=idle_lookback_days).forecast(...)`
-   on the resource's own daily costs and takes `daily_rate` as the average.
-   This also means a VM with a cost gap (powered off partway through the
-   window) gets the same correct zero-filled average here as it would in a
-   forecast for that VM - one tested implementation, not two.
+2. **Missing state fields exclude a resource from being flagged, never
+   default to "flagged."** For all three checks, if the relevant field is
+   entirely absent from `raw_metadata` (not just present-and-different), the
+   detector returns `is_flagged: False` with a detail explaining why, rather
+   than treating "we don't know" as "assume the worst" or "assume the best."
+   This is the same "insufficient data -> exclude, don't guess" principle
+   Tasks 7-9 established for forecasting/rightsizing, applied here to
+   missing metadata instead of missing utilization history. (The one
+   exception: `ipConfiguration` missing is the *documented* meaning of
+   "unassociated" per the task and per Resource Graph's own semantics for
+   that specific field, so that one's absence correctly means "flag it," not
+   "exclude it" - the general principle only applies where absence is
+   ambiguous, not where absence is itself the confirmed signal.)
 
-3. **Savings math: `avg_daily_cost * cores_reduction_fraction * 30`.** This
-   assumes cost scales linearly with core count within the same VM series,
-   which is not exactly true (Azure pricing isn't perfectly linear per core
-   across a series) but is a defensible v1 approximation - and the response's
-   `savings_note` says so explicitly on every recommendation that has a
-   number, rather than presenting it as precise. When there's no specific
-   suggested SKU (App Service, or a VM SKU the heuristic couldn't parse),
-   `estimated_monthly_savings` is `null` with a note explaining there's
-   nothing to scale against - I did not fall back to "resource is idle, so
-   assume 100% savings" or any other made-up fraction.
-
-4. **"Insufficient history" is judged from the data itself, not wall-clock
-   `now()`.** Same reasoning as Task 8's forecasting fix: bases the window on
-   the most recent *reading* for that resource+metric, not on
-   `datetime.now()`, so a resource whose last sync happened a few hours ago
-   isn't penalized by clock skew between sync runs and the request. A
-   resource's span (earliest reading's date to most recent reading's date,
-   inclusive) must be `>= idle_lookback_days`, or it's excluded outright.
-
-5. **VM SKU regex deliberately fails closed on irregular patterns** (e.g.
-   constrained-core SKUs like "Standard_E8-4s_v5", which have a dash embedded
-   in the size code). Rather than special-casing that pattern to produce a
-   plausible-looking but unverified suggestion, the regex simply doesn't
-   match it, and the resource is flagged as a candidate with `suggested_sku:
-   null` and a note naming the exact SKU that didn't parse. Same "don't force
-   a bad guess" principle the task calls out for App Service tiers, applied
-   consistently to the VM side too even though the task only spelled it out
-   for App Service.
+3. **Waste estimate is the full average daily cost x 30, not scaled by a
+   fraction.** Task 9's rightsizing savings estimate scaled by a
+   core-reduction fraction, because resizing only saves part of the cost. All
+   three checks here are different: an unattached disk, an unassociated IP,
+   and a stopped-not-deallocated VM's compute charge are each situations
+   where the *entire* current cost is avoidable once the underlying issue is
+   fixed (attach/associate/deallocate), so the full average daily cost is
+   the right number to scale to a month - still labeled "approximate," same
+   as rightsizing, since it's still an average over a lookback window, not a
+   billing quote.
 
 ## Actual pytest output (ran via WSL2 docker compose, after rebuilding the
-backend image so the container picks up the new files - the running
-container is built from a COPY in the Dockerfile, not a live volume mount, so
-`docker compose build backend && docker compose up -d backend` was required
-before the new tests were even visible to pytest; first run silently showed
-the old 30-test count until I caught this)
+backend image - same COPY-based-image caveat as Task 9, rebuilt before
+running so the new files were actually visible to pytest)
 
     ============================= test session starts ==============================
     platform linux -- Python 3.12.14, pytest-8.3.4, pluggy-1.6.0 -- /usr/local/bin/python3.12
     cachedir: .pytest_cache
     rootdir: /app
     plugins: anyio-4.15.1
-    collecting ... collected 50 items
+    collecting ... collected 75 items
 
     tests/test_azure_cost.py::test_map_cost_response_resource_attributable_and_non_attributable PASSED
     tests/test_azure_cost.py::test_sync_cost_creates_records PASSED
@@ -152,6 +169,31 @@ the old 30-test count until I caught this)
     tests/test_forecast.py::test_forecast_endpoint_aggregate PASSED
     tests/test_forecast.py::test_forecast_endpoint_resource_type_filter PASSED
     tests/test_health.py::test_health_check PASSED
+    tests/test_idle_resource_detection.py::test_detect_unattached_disk_flags_unattached_state PASSED
+    tests/test_idle_resource_detection.py::test_detect_unattached_disk_does_not_flag_attached_state PASSED
+    tests/test_idle_resource_detection.py::test_detect_unattached_disk_does_not_flag_other_non_attached_states PASSED
+    tests/test_idle_resource_detection.py::test_detect_unattached_disk_missing_diskstate_is_not_flagged PASSED
+    tests/test_idle_resource_detection.py::test_detect_unattached_disk_missing_properties_is_not_flagged PASSED
+    tests/test_idle_resource_detection.py::test_detect_unused_public_ip_flags_missing_ip_configuration PASSED
+    tests/test_idle_resource_detection.py::test_detect_unused_public_ip_does_not_flag_when_associated PASSED
+    tests/test_idle_resource_detection.py::test_detect_unused_public_ip_flags_null_ip_configuration PASSED
+    tests/test_idle_resource_detection.py::test_detect_unused_public_ip_missing_properties_is_flagged PASSED
+    tests/test_idle_resource_detection.py::test_detect_stopped_not_deallocated_vm_flags_stopped PASSED
+    tests/test_idle_resource_detection.py::test_detect_stopped_not_deallocated_vm_does_not_flag_running PASSED
+    tests/test_idle_resource_detection.py::test_detect_stopped_not_deallocated_vm_does_not_flag_properly_deallocated PASSED
+    tests/test_idle_resource_detection.py::test_detect_stopped_not_deallocated_vm_does_not_flag_transitional_states PASSED
+    tests/test_idle_resource_detection.py::test_detect_stopped_not_deallocated_vm_missing_power_state_is_excluded_not_flagged PASSED
+    tests/test_idle_resource_detection.py::test_detect_stopped_not_deallocated_vm_missing_properties_is_excluded_not_flagged PASSED
+    tests/test_idle_resources.py::test_flags_unattached_disk_with_estimated_waste PASSED
+    tests/test_idle_resources.py::test_does_not_flag_attached_disk PASSED
+    tests/test_idle_resources.py::test_flags_unused_public_ip PASSED
+    tests/test_idle_resources.py::test_does_not_flag_associated_public_ip PASSED
+    tests/test_idle_resources.py::test_flags_stopped_not_deallocated_vm PASSED
+    tests/test_idle_resources.py::test_does_not_flag_deallocated_vm PASSED
+    tests/test_idle_resources.py::test_does_not_flag_running_vm PASSED
+    tests/test_idle_resources.py::test_flagged_resource_with_no_cost_data_has_null_waste_estimate PASSED
+    tests/test_idle_resources.py::test_response_includes_lookback_days_setting PASSED
+    tests/test_idle_resources.py::test_endpoint_returns_200_against_seeded_data PASSED
     tests/test_linear_burn_rate.py::test_forecast_computes_average_over_trailing_window PASSED
     tests/test_linear_burn_rate.py::test_forecast_uses_all_available_history_when_shorter_than_window PASSED
     tests/test_linear_burn_rate.py::test_forecast_sorts_unsorted_input_before_windowing PASSED
@@ -184,165 +226,105 @@ the old 30-test count until I caught this)
       DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use
       anyio.from_thread.BlockingPortal instead.
 
-    -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-    ======================== 50 passed, 1 warning in 0.34s =========================
+    -- Docs: https://docs.pytest.org/how-to/capture-warnings.html
+    ======================== 75 passed, 1 warning in 0.50s =========================
 
-(One test failed on the first run before the fix below - included for
-honesty about what actually happened, not just the clean final run:
-`test_suggest_vm_sku_odd_core_count_rounds_down` asserted
-`cores_reduction_fraction == 2 / 3` and got
-`0.6666666666666667 == 0.6666666666666667` failing on exact float equality -
-a test bug, not a code bug. Fixed by switching that one assertion to
-`pytest.approx(2 / 3)`. Rebuilt and reran; all 50 passed clean.)
+All 75 passed clean on the first run this time - no test bugs like Task 9's
+float-equality slip.
 
 ## Live check against the real subscription (the actual deliverable)
 
-    GET /api/v1/recommendations/rightsizing
+    GET /api/v1/recommendations/idle-resources
     {
-        "idle_cpu_threshold_percent": 10.0,
         "idle_lookback_days": 14,
         "recommendations": []
     }
 
-**Empty is the correct answer here, not a bug** - and it's a real
-demonstration of the insufficient-history exclusion rule, not an untested
-null result. Checked the real data directly:
+**Empty is correct here too, for a different reason than Task 9's empty
+result.** Checked the real state of each of the three covered resources
+directly against the DB before calling the endpoint:
 
-    sku              | metric_name    | count | avg_val | min                     | max
-    Standard_D4s_v7  | Percentage CPU |    16 |    5.37 | 2026-09-15 00:42:00+00 | 2026-09-17 19:42:00+00
+    resource_type                        | raw_metadata field checked                       | value
+    microsoft.compute/disks              | properties.diskState                             | "Attached"
+    microsoft.network/publicipaddresses  | properties.ipConfiguration                       | present (has an .id)
+    microsoft.compute/virtualmachines    | properties.extended.instanceView.powerState.code | "PowerState/running"
 
-The one real VM (NISE-DEV, `Standard_D4s_v7`) has CPU history spanning only
-2026-09-15 through 2026-09-17 - 3 calendar days - against the configured
-14-day `idle_lookback_days`. Its average (5.37%) is well under the 10%
-threshold and it would clearly be flagged if it had 14 days of history, but
-per the task's explicit requirement it's excluded outright rather than
-flagged on 3 days of partial data. This matches exactly what
-`test_excludes_vm_with_insufficient_utilization_history` asserts in
-isolation, now confirmed against the real resource too.
+None of the three real resources are actually in a flagged state right now -
+the disk is attached, the IP is associated, and the VM is running. This
+isn't an "insufficient data, excluded" empty result like Task 9's - it's "all
+three checks ran, found real evidence, and correctly found nothing wrong."
+Confirmed the detection logic can produce a non-empty, correct result via the
+isolated integration tests instead (all three positive cases in
+test_idle_resources.py, each with hand-checked waste math, e.g.
+2.0 * 30 == 60.0 for the unattached-disk case).
 
-Confirmed no leakage into the real dev DB from the live check itself
-(compute-on-read, no writes expected): resources=9, utilization_metrics=80,
-cost_records=237 - all unchanged, same counts as Task 8 left them.
-
-I did not seed synthetic 14-day utilization data into the real dev DB to
-force a non-empty live result, since that would mean writing fake data into
-a database Edson is also looking at directly - the isolated integration
-tests (`test_flags_idle_vm_with_suggested_sku_and_estimated_savings`,
-`test_flags_idle_app_service_without_a_specific_suggested_tier`) already
-exercise the full flagged-with-suggestion-and-savings path end-to-end against
-seeded fixtures, including hand-checked savings math
-(`10.0 * 0.5 * 30 == 150.0`). If a live non-empty result is wanted, the real
-fix is letting `azure_utilization` sync accumulate a few more days for
-NISE-DEV, or lowering `idle_lookback_days` for this narrow check - flagging
-that as a choice for Edson rather than making it silently.
+Confirmed no leakage into the real dev DB from the live check itself:
+resources=9, utilization_metrics=80, cost_records=237 - unchanged from
+before this task, same as Task 9 left them.
 
 ## WSL2/dockerd restart monitor - status during this task
 
-One restart event since Task 8's completion (20:22 EDT on 2026-09-17), at
-2026-09-18 10:04:34 EDT:
+No new restarts. Still 14 total RESTART_DETECTED entries in the log (same
+count as reported during the previous investigation), and every check since
+the last one - 2026-09-18 10:04:34 EDT, pid=284 - has been check_ok, through
+this task's completion at 14:51:20 EDT:
 
-    2026-09-17 22:29:04 EDT check_ok start="Thu 2026-09-17 16:50:05 EDT" pid=250
-    2026-09-18 10:04:38 EDT RESTART_DETECTED prev_start="Thu 2026-09-17 16:50:05 EDT" new_start="Fri 2026-09-18 10:04:34 EDT" new_pid=284
+    2026-09-18 14:51:20 EDT check_ok start="Fri 2026-09-18 10:04:34 EDT" pid=284
 
-There's an ~11.5 hour gap in `check_ok` entries between 22:29:04 and
-10:04:38 with no entries in between - the monitor itself wasn't logging
-during that span, consistent with the machine being asleep/powered off
-overnight rather than the restart-cycling bug pattern happening while the
-machine was actively in use (the original symptom was irregular restarts
-from 1 second to 5+ minutes apart *during active use*, not a single
-transition after an overnight gap). I'm flagging this distinction plainly
-rather than either dismissing it as "obviously fine" or counting it against
-the Defender-exclusion fix's track record - it doesn't cleanly match the
-pattern either investigation was chasing.
-
-Since that 10:04:34 restart, every check has been `check_ok` on the same
-pid=284, through this task's completion (checked most recently at 10:41 EDT,
-~37 minutes of continuous stability). Not a long enough stretch on its own to
-add much evidence either way - noting it for the log, not drawing a
-conclusion from it.
+That's roughly 4 hours 47 minutes of continuous stability on the same pid,
+spanning all of this task. Consistent with what was already noted last
+time - not drawing a stronger conclusion from it than that.
 
 ## Ambiguity flagged, not guessed on
 
-- **App Service tier suggestion** (design decision #1 above) - resolved by
-  taking the path the task text explicitly sanctions rather than the more
-  complex "one size down" ordinal heuristic, to avoid adding a second
-  differently-shaped guess with its own justification burden for a v1
-  advisory feature.
-- **Whether to seed synthetic data into the real dev DB to force a non-empty
-  live result** - resolved by not doing that (see "Live check" above) and
-  explaining why, rather than quietly polluting the DB Edson looks at
-  directly or silently changing `idle_lookback_days` for the check.
+- managedBy vs properties.diskState for unattached-disk detection (design
+  decision #1 above) - resolved by checking the real data first, per the
+  task's own instruction, rather than either trusting the task's field-name
+  guess or silently picking a different field without saying so.
+- Whether missing-field cases should flag or exclude (design decision #2
+  above) - resolved consistently with the "exclude on insufficient
+  information" principle already established in this codebase, with the one
+  documented exception (ipConfiguration absence) where the task's and
+  Resource Graph's own semantics make absence itself the positive signal,
+  not a gap in data.
 
 ## Full diff
 
 ```diff
 diff --git a/backend/app/api/recommendations.py b/backend/app/api/recommendations.py
-new file mode 100644
-index 0000000..7c2d9f6
---- /dev/null
+index 7c2d9f6..3bad44d 100644
+--- a/backend/app/api/recommendations.py
 +++ b/backend/app/api/recommendations.py
-@@ -0,0 +1,14 @@
-+from typing import Any
-+
-+from fastapi import APIRouter, Depends
-+from sqlalchemy.orm import Session
-+
-+from app.db.session import get_db
-+from app.services.rightsizing import build_rightsizing_recommendations
-+
-+router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
-+
-+
-+@router.get("/rightsizing")
-+def get_rightsizing_recommendations(db: Session = Depends(get_db)) -> dict[str, Any]:
-+    return build_rightsizing_recommendations(db)
-diff --git a/backend/app/main.py b/backend/app/main.py
-index 56cacca..3f813ec 100644
---- a/backend/app/main.py
-+++ b/backend/app/main.py
-@@ -4,6 +4,7 @@ from app.api.cost import router as cost_router
- from app.api.forecast import router as forecast_router
- from app.api.health import router as health_router
- from app.api.inventory import router as inventory_router
-+from app.api.recommendations import router as recommendations_router
- from app.api.utilization import router as utilization_router
+@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends
+ from sqlalchemy.orm import Session
  
- app = FastAPI(title="FinOps Platform API")
-@@ -13,3 +14,4 @@ app.include_router(inventory_router)
- app.include_router(utilization_router)
- app.include_router(cost_router)
- app.include_router(forecast_router)
-+app.include_router(recommendations_router)
-diff --git a/backend/app/services/rightsizing.py b/backend/app/services/rightsizing.py
+ from app.db.session import get_db
++from app.services.idle_resources import build_idle_resource_recommendations
+ from app.services.rightsizing import build_rightsizing_recommendations
+ 
+ router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
+@@ -12,3 +13,8 @@ router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
+ @router.get("/rightsizing")
+ def get_rightsizing_recommendations(db: Session = Depends(get_db)) -> dict[str, Any]:
+     return build_rightsizing_recommendations(db)
++
++
++@router.get("/idle-resources")
++def get_idle_resource_recommendations(db: Session = Depends(get_db)) -> dict[str, Any]:
++    return build_idle_resource_recommendations(db)
+diff --git a/backend/app/services/cost_lookup.py b/backend/app/services/cost_lookup.py
 new file mode 100644
-index 0000000..7812488
+index 0000000..9ede601
 --- /dev/null
-+++ b/backend/app/services/rightsizing.py
-@@ -0,0 +1,125 @@
++++ b/backend/app/services/cost_lookup.py
+@@ -0,0 +1,17 @@
 +import uuid
 +from datetime import date
-+from typing import Any
 +
 +from sqlalchemy import func
 +from sqlalchemy.orm import Session
 +
-+from app.core.config import settings
 +from app.models.cost_record import CostRecord
-+from app.models.resource import Resource
-+from app.models.utilization_metric import UtilizationMetric
-+from app.services.azure_inventory import get_or_create_cloud_account
-+from app.services.forecasting.linear_burn_rate import LinearBurnRateModel
-+from app.services.sku_heuristics import SkuSuggestion, suggest_app_service_tier, suggest_vm_sku
-+from app.services.utilization_evaluation import evaluate_cpu_utilization
-+
-+# The CPU metric azure_utilization.py stores for each resource type it
-+# supports - must match RESOURCE_TYPE_METRICS in that module (kept as a
-+# separate explicit mapping rather than reaching into that list's ordering,
-+# since "first metric in the sync list" isn't a documented contract).
-+CPU_METRIC_BY_RESOURCE_TYPE: dict[str, str] = {
-+    "microsoft.compute/virtualmachines": "Percentage CPU",
-+    "microsoft.web/sites": "CpuPercentage",
-+}
 +
 +
 +def get_resource_daily_costs(db: Session, resource_id: uuid.UUID) -> list[tuple[date, float]]:
@@ -353,36 +335,154 @@ index 0000000..7812488
 +        .order_by(CostRecord.date)
 +    )
 +    return [(row_date, float(total)) for row_date, total in query.all()]
+diff --git a/backend/app/services/idle_resource_detection.py b/backend/app/services/idle_resource_detection.py
+new file mode 100644
+index 0000000..9ad9a63
+--- /dev/null
++++ b/backend/app/services/idle_resource_detection.py
+@@ -0,0 +1,91 @@
++from dataclasses import dataclass
++
++# Azure Resource Graph's power state code for a VM that has been stopped from
++# within the guest OS (or via API "stop") but NOT deallocated - Azure keeps
++# the compute allocation reserved and keeps billing for it. Only
++# "PowerState/deallocated" actually stops the meter. Deliberately matched
++# exactly, not "any non-running state" - "PowerState/deallocating",
++# "PowerState/starting" etc are transitional and not the billing-waste state
++# this check is after.
++STOPPED_NOT_DEALLOCATED_POWER_STATE_CODE = "PowerState/stopped"
 +
 +
-+def estimate_monthly_savings(
-+    avg_daily_cost: float | None, cores_reduction_fraction: float | None
-+) -> tuple[float | None, str]:
++@dataclass
++class IdleCheckResult:
++    is_flagged: bool
++    detail: str
++
++
++def detect_unattached_disk(raw_metadata: dict) -> IdleCheckResult:
++    """Flag a managed disk with diskState == "Unattached".
++
++    The task's original assumption was that Resource Graph's `managedBy`
++    field (null/absent = unattached) would drive this check, but the
++    existing Task 2 connector's query doesn't project `managedBy` at all, and
++    a real synced disk's raw_metadata was checked directly and confirmed it
++    isn't there. `properties.diskState` is present instead, and is Azure's
++    own explicit attachment-state field (values include "Attached",
++    "Unattached", "Reserved", "ActiveSAS", etc) - a cleaner, more direct
++    signal than `managedBy` would have been anyway, so this check uses that
++    instead of guessing at a field name that isn't actually synced.
++    """
++    properties = raw_metadata.get("properties") or {}
++    disk_state = properties.get("diskState")
++    if disk_state is None:
++        return IdleCheckResult(
++            False, "diskState is not present in the synced metadata; attachment state can't be determined."
++        )
++    if disk_state == "Unattached":
++        return IdleCheckResult(True, "diskState is 'Unattached'.")
++    return IdleCheckResult(False, f"diskState is '{disk_state}', not 'Unattached'.")
++
++
++def detect_unused_public_ip(raw_metadata: dict) -> IdleCheckResult:
++    """Flag a public IP with no `properties.ipConfiguration` - confirmed
++    against a real synced public IP's raw_metadata to match exactly as the
++    task described (present with an `id` when associated to a NIC, and this
++    check's fixtures exercise the absent case)."""
++    properties = raw_metadata.get("properties") or {}
++    ip_configuration = properties.get("ipConfiguration")
++    if ip_configuration:
++        return IdleCheckResult(False, "ipConfiguration is present; the IP is associated with a resource.")
++    return IdleCheckResult(True, "ipConfiguration is null/absent; the IP is not associated with any resource.")
++
++
++def _get_power_state_code(properties: dict) -> str | None:
++    extended = properties.get("extended")
++    if not isinstance(extended, dict):
++        return None
++    instance_view = extended.get("instanceView")
++    if not isinstance(instance_view, dict):
++        return None
++    power_state = instance_view.get("powerState")
++    if not isinstance(power_state, dict):
++        return None
++    return power_state.get("code")
++
++
++def detect_stopped_not_deallocated_vm(raw_metadata: dict) -> IdleCheckResult:
++    """Flag a VM whose power state is 'stopped' but not 'deallocated'.
++
++    `properties.extended.instanceView.powerState.code` is already present in
++    what the existing Task 2 Resource Graph connector syncs - confirmed
++    against a real synced VM's raw_metadata (it showed "PowerState/running")
++    - so no connector change or live per-VM API call is needed; see
++    results.txt for the fuller investigation. A VM with no power state
++    recorded is excluded rather than flagged/cleared on a guess, same
++    "insufficient data -> exclude" principle as forecasting/rightsizing.
++    """
++    properties = raw_metadata.get("properties") or {}
++    code = _get_power_state_code(properties)
++    if code is None:
++        return IdleCheckResult(
++            False,
++            "No power state found in synced metadata "
++            "(properties.extended.instanceView.powerState.code missing); excluded rather than guessed.",
++        )
++    if code == STOPPED_NOT_DEALLOCATED_POWER_STATE_CODE:
++        return IdleCheckResult(
++            True, f"powerState.code is '{code}' - stopped but not deallocated, still billing for compute."
++        )
++    return IdleCheckResult(False, f"powerState.code is '{code}', not the stopped-but-not-deallocated state.")
+diff --git a/backend/app/services/idle_resources.py b/backend/app/services/idle_resources.py
+new file mode 100644
+index 0000000..501d2de
+--- /dev/null
++++ b/backend/app/services/idle_resources.py
+@@ -0,0 +1,86 @@
++import uuid
++from typing import Any, Callable
++
++from sqlalchemy.orm import Session
++
++from app.core.config import settings
++from app.models.resource import Resource
++from app.services.azure_inventory import get_or_create_cloud_account
++from app.services.cost_lookup import get_resource_daily_costs
++from app.services.forecasting.linear_burn_rate import LinearBurnRateModel
++from app.services.idle_resource_detection import (
++    IdleCheckResult,
++    detect_stopped_not_deallocated_vm,
++    detect_unattached_disk,
++    detect_unused_public_ip,
++)
++
++# Maps each covered resource_type to its (reason slug, detector function).
++# The reason slug is the machine-readable value in each recommendation's
++# `reason` field; `detect_fn`'s human-readable `detail` carries the specific
++# evidence (e.g. the exact diskState/powerState value observed).
++IDLE_CHECKS: dict[str, tuple[str, Callable[[dict], IdleCheckResult]]] = {
++    "microsoft.compute/disks": ("unattached_disk", detect_unattached_disk),
++    "microsoft.network/publicipaddresses": ("unused_public_ip", detect_unused_public_ip),
++    "microsoft.compute/virtualmachines": ("stopped_not_deallocated_vm", detect_stopped_not_deallocated_vm),
++}
++
++
++def estimate_monthly_waste(avg_daily_cost: float | None) -> tuple[float | None, str]:
 +    if avg_daily_cost is None:
-+        return None, "No cost data found for this resource in the lookback window; savings can't be estimated."
-+    if cores_reduction_fraction is None:
-+        return None, "No specific suggested size to compare against; savings can't be estimated."
++        return None, "No cost data found for this resource in the lookback window; waste can't be estimated."
 +
-+    savings = avg_daily_cost * cores_reduction_fraction * 30
 +    note = (
-+        "Approximate: current average daily cost over the lookback window x 30, scaled by the "
-+        "suggested SKU's core reduction, assuming cost scales linearly with core count within "
-+        "the same series. Not a billing quote."
++        "Approximate: current average daily cost over the lookback window x 30, assuming the full "
++        "cost is avoidable once the underlying issue (attach the disk, associate or release the IP, "
++        "deallocate the VM) is resolved. Not a billing quote."
 +    )
-+    return round(savings, 2), note
++    return round(avg_daily_cost * 30, 2), note
 +
 +
-+def _suggest_sku(resource: Resource) -> SkuSuggestion:
-+    if resource.resource_type == "microsoft.compute/virtualmachines":
-+        return suggest_vm_sku(resource.sku)
-+    return suggest_app_service_tier(resource.sku)
-+
-+
-+def build_rightsizing_recommendations(
++def build_idle_resource_recommendations(
 +    db: Session, cloud_account_id: uuid.UUID | None = None
 +) -> dict[str, Any]:
 +    if cloud_account_id is None:
-+        # Phase 1 is single-subscription, same convention as forecast.py.
++        # Phase 1 is single-subscription, same convention as forecast.py/rightsizing.py.
 +        cloud_account_id = get_or_create_cloud_account(db, settings.azure_subscription_id).id
 +
 +    cost_model = LinearBurnRateModel(trailing_window_days=settings.idle_lookback_days)
@@ -390,37 +490,21 @@ index 0000000..7812488
 +    resources = (
 +        db.query(Resource)
 +        .filter(Resource.cloud_account_id == cloud_account_id)
-+        .filter(Resource.resource_type.in_(CPU_METRIC_BY_RESOURCE_TYPE.keys()))
++        .filter(Resource.resource_type.in_(IDLE_CHECKS.keys()))
 +        .all()
 +    )
 +
 +    recommendations = []
 +    for resource in resources:
-+        metric_name = CPU_METRIC_BY_RESOURCE_TYPE[resource.resource_type]
-+        readings = (
-+            db.query(UtilizationMetric.timestamp, UtilizationMetric.value)
-+            .filter_by(resource_id=resource.id, metric_name=metric_name)
-+            .all()
-+        )
-+        cpu_result = evaluate_cpu_utilization(
-+            [(ts, value) for ts, value in readings],
-+            lookback_days=settings.idle_lookback_days,
-+            idle_threshold_percent=settings.idle_cpu_threshold_percent,
-+        )
-+
-+        # Insufficient history: excluded outright, not flagged on a partial
-+        # average. Not idle: not a rightsizing candidate, so also excluded.
-+        if cpu_result.insufficient_data or not cpu_result.is_idle:
++        reason, detect_fn = IDLE_CHECKS[resource.resource_type]
++        result = detect_fn(resource.raw_metadata or {})
++        if not result.is_flagged:
 +            continue
-+
-+        sku_suggestion = _suggest_sku(resource)
 +
 +        daily_costs = get_resource_daily_costs(db, resource.id)
 +        cost_result = cost_model.forecast(daily_costs, horizon_days=1)
 +        avg_daily_cost = None if cost_result.insufficient_data else cost_result.daily_rate
-+        estimated_monthly_savings, savings_note = estimate_monthly_savings(
-+            avg_daily_cost, sku_suggestion.cores_reduction_fraction
-+        )
++        estimated_monthly_waste, waste_note = estimate_monthly_waste(avg_daily_cost)
 +
 +        recommendations.append(
 +            {
@@ -429,217 +513,220 @@ index 0000000..7812488
 +                "resource_type": resource.resource_type,
 +                "resource_group": resource.resource_group,
 +                "region": resource.region,
-+                "current_sku": resource.sku,
-+                "suggested_sku": sku_suggestion.suggested_sku,
-+                "suggestion_note": sku_suggestion.note,
-+                "avg_cpu_percent": round(cpu_result.avg_cpu_percent, 2),
-+                "lookback_days": settings.idle_lookback_days,
-+                "estimated_monthly_savings": estimated_monthly_savings,
-+                "savings_note": savings_note,
++                "reason": reason,
++                "detail": result.detail,
++                "estimated_monthly_waste": estimated_monthly_waste,
++                "waste_note": waste_note,
 +            }
 +        )
 +
 +    return {
-+        "idle_cpu_threshold_percent": settings.idle_cpu_threshold_percent,
 +        "idle_lookback_days": settings.idle_lookback_days,
 +        "recommendations": recommendations,
 +    }
-diff --git a/backend/app/services/sku_heuristics.py b/backend/app/services/sku_heuristics.py
+diff --git a/backend/app/services/rightsizing.py b/backend/app/services/rightsizing.py
+index 7812488..a61eaa4 100644
+--- a/backend/app/services/rightsizing.py
++++ b/backend/app/services/rightsizing.py
+@@ -1,15 +1,13 @@
+ import uuid
+-from datetime import date
+ from typing import Any
+ 
+-from sqlalchemy import func
+ from sqlalchemy.orm import Session
+ 
+ from app.core.config import settings
+-from app.models.cost_record import CostRecord
+ from app.models.resource import Resource
+ from app.models.utilization_metric import UtilizationMetric
+ from app.services.azure_inventory import get_or_create_cloud_account
++from app.services.cost_lookup import get_resource_daily_costs
+ from app.services.forecasting.linear_burn_rate import LinearBurnRateModel
+ from app.services.sku_heuristics import SkuSuggestion, suggest_app_service_tier, suggest_vm_sku
+ from app.services.utilization_evaluation import evaluate_cpu_utilization
+@@ -24,16 +22,6 @@ CPU_METRIC_BY_RESOURCE_TYPE: dict[str, str] = {
+ }
+ 
+ 
+-def get_resource_daily_costs(db: Session, resource_id: uuid.UUID) -> list[tuple[date, float]]:
+-    query = (
+-        db.query(CostRecord.date, func.sum(CostRecord.amortized_cost))
+-        .filter(CostRecord.resource_id == resource_id)
+-        .group_by(CostRecord.date)
+-        .order_by(CostRecord.date)
+-    )
+-    return [(row_date, float(total)) for row_date, total in query.all()]
+-
+-
+ def estimate_monthly_savings(
+     avg_daily_cost: float | None, cores_reduction_fraction: float | None
+ ) -> tuple[float | None, str]:
+diff --git a/backend/tests/test_idle_resource_detection.py b/backend/tests/test_idle_resource_detection.py
 new file mode 100644
-index 0000000..1708701
+index 0000000..5e2aab1
 --- /dev/null
-+++ b/backend/app/services/sku_heuristics.py
-@@ -0,0 +1,85 @@
-+import re
-+from dataclasses import dataclass
-+
-+# Matches the size-code segment of an Azure VM SKU (e.g. "D4s" in
-+# "Standard_D4s_v3", "B2ms" in "Standard_B2ms"): letters (family), a digit run
-+# (core count), then more letters (feature suffix - "s" = premium storage,
-+# "ms"/"as" etc). Deliberately does NOT match constrained-core / specialty
-+# patterns with an embedded dash (e.g. "E8-4s") - those fail to match and fall
-+# through to "no suggestion" rather than being mangled by a naive halving.
-+_VM_SIZE_RE = re.compile(r"^(?P<family>[A-Za-z]+)(?P<cores>\d+)(?P<suffix>[A-Za-z]*)$")
++++ b/backend/tests/test_idle_resource_detection.py
+@@ -0,0 +1,119 @@
++from app.services.idle_resource_detection import (
++    detect_stopped_not_deallocated_vm,
++    detect_unattached_disk,
++    detect_unused_public_ip,
++)
 +
 +
-+@dataclass
-+class SkuSuggestion:
-+    suggested_sku: str | None
-+    note: str
-+    cores_reduction_fraction: float | None
++# --- unattached disk --------------------------------------------------------
 +
 +
-+def suggest_vm_sku(sku: str | None) -> SkuSuggestion:
-+    """Suggest a smaller VM SKU by parsing the core-count component and
-+    roughly halving it, staying within the same family/suffix/version.
++def test_detect_unattached_disk_flags_unattached_state():
++    result = detect_unattached_disk({"properties": {"diskState": "Unattached"}})
 +
-+    This is a naming-pattern heuristic only, not a live Azure SKU availability
-+    or quota check - see the note on the returned SkuSuggestion, which is
-+    always populated (even when no specific SKU is suggested) so the caller
-+    never has to guess why.
-+    """
-+    if not sku:
-+        return SkuSuggestion(None, "No SKU recorded for this resource; cannot suggest a smaller size.", None)
++    assert result.is_flagged is True
++    assert "unattached" in result.detail.lower()
 +
-+    parts = sku.split("_")
-+    if len(parts) < 2:
-+        return SkuSuggestion(
-+            None,
-+            f"SKU '{sku}' does not match the expected <Tier>_<Size> naming pattern; cannot parse a core count.",
-+            None,
-+        )
 +
-+    size_code = parts[1]
-+    match = _VM_SIZE_RE.match(size_code)
-+    if not match:
-+        return SkuSuggestion(
-+            None,
-+            f"SKU '{sku}' has a size component ('{size_code}') that doesn't match the simple "
-+            "<family><cores><suffix> pattern this heuristic parses (e.g. a constrained-core or "
-+            "specialty SKU) - flagging as a rightsizing candidate without a specific suggestion "
-+            "rather than force a bad guess.",
-+            None,
-+        )
++def test_detect_unattached_disk_does_not_flag_attached_state():
++    result = detect_unattached_disk({"properties": {"diskState": "Attached"}})
 +
-+    cores = int(match.group("cores"))
-+    if cores <= 1:
-+        return SkuSuggestion(
-+            None, f"SKU '{sku}' is already at the smallest core count this heuristic recognizes.", None
-+        )
++    assert result.is_flagged is False
 +
-+    suggested_cores = max(1, cores // 2)
-+    new_size_code = f"{match.group('family')}{suggested_cores}{match.group('suffix')}"
-+    parts[1] = new_size_code
-+    suggested_sku = "_".join(parts)
-+    note = (
-+        f"Heuristic suggestion only: parsed the core-count component of '{sku}' and halved it "
-+        f"within the same series/family/version. This is not a live Azure SKU availability or "
-+        f"quota check - '{suggested_sku}' may not actually be available in this region. Verify "
-+        "before resizing."
++
++def test_detect_unattached_disk_does_not_flag_other_non_attached_states():
++    # "Reserved" (about to be attached) and "ActiveSAS" (export/snapshot in
++    # progress) are not "Attached" but also aren't wasted capacity the same
++    # way "Unattached" is - only the exact "Unattached" value flags.
++    assert detect_unattached_disk({"properties": {"diskState": "Reserved"}}).is_flagged is False
++    assert detect_unattached_disk({"properties": {"diskState": "ActiveSAS"}}).is_flagged is False
++
++
++def test_detect_unattached_disk_missing_diskstate_is_not_flagged():
++    # Missing entirely is different from a confirmed "Unattached" value -
++    # must not be flagged on a guess.
++    result = detect_unattached_disk({"properties": {}})
++
++    assert result.is_flagged is False
++    assert "not present" in result.detail.lower()
++
++
++def test_detect_unattached_disk_missing_properties_is_not_flagged():
++    result = detect_unattached_disk({})
++
++    assert result.is_flagged is False
++
++
++# --- unused public IP --------------------------------------------------------
++
++
++def test_detect_unused_public_ip_flags_missing_ip_configuration():
++    result = detect_unused_public_ip({"properties": {}})
++
++    assert result.is_flagged is True
++    assert "not associated" in result.detail.lower()
++
++
++def test_detect_unused_public_ip_does_not_flag_when_associated():
++    result = detect_unused_public_ip(
++        {"properties": {"ipConfiguration": {"id": "/subscriptions/.../ipConfigurations/ipconfig1"}}}
 +    )
-+    return SkuSuggestion(suggested_sku, note, 1 - (suggested_cores / cores))
++
++    assert result.is_flagged is False
 +
 +
-+def suggest_app_service_tier(sku: str | None) -> SkuSuggestion:
-+    """App Service Plan tier names (e.g. 'S1', 'P2v3', 'B1') encode a
-+    pricing/feature tier rather than a linear compute unit the way VM series
-+    sizes do, so there's no clean equivalent of "parse the number, halve it"
-+    that reliably lands on a valid smaller tier. Per the task's own guidance,
-+    flag as a rightsizing candidate without a specific suggested tier rather
-+    than force a bad guess.
-+    """
-+    return SkuSuggestion(
-+        None,
-+        "App Service tier naming (pricing/feature tier, not a linear compute unit) doesn't map "
-+        "cleanly to a 'suggest a smaller one' heuristic the way VM SKUs do - flagged as a "
-+        "rightsizing candidate without a specific suggested tier.",
-+        None,
-+    )
-diff --git a/backend/app/services/utilization_evaluation.py b/backend/app/services/utilization_evaluation.py
++def test_detect_unused_public_ip_flags_null_ip_configuration():
++    result = detect_unused_public_ip({"properties": {"ipConfiguration": None}})
++
++    assert result.is_flagged is True
++
++
++def test_detect_unused_public_ip_missing_properties_is_flagged():
++    result = detect_unused_public_ip({})
++
++    assert result.is_flagged is True
++
++
++# --- stopped-but-not-deallocated VM ------------------------------------------
++
++
++def _power_state_metadata(code: str) -> dict:
++    return {"properties": {"extended": {"instanceView": {"powerState": {"code": code}}}}}
++
++
++def test_detect_stopped_not_deallocated_vm_flags_stopped():
++    result = detect_stopped_not_deallocated_vm(_power_state_metadata("PowerState/stopped"))
++
++    assert result.is_flagged is True
++    assert "stopped but not deallocated" in result.detail.lower()
++
++
++def test_detect_stopped_not_deallocated_vm_does_not_flag_running():
++    result = detect_stopped_not_deallocated_vm(_power_state_metadata("PowerState/running"))
++
++    assert result.is_flagged is False
++
++
++def test_detect_stopped_not_deallocated_vm_does_not_flag_properly_deallocated():
++    # This is the state that DOES stop billing - must not be flagged.
++    result = detect_stopped_not_deallocated_vm(_power_state_metadata("PowerState/deallocated"))
++
++    assert result.is_flagged is False
++
++
++def test_detect_stopped_not_deallocated_vm_does_not_flag_transitional_states():
++    assert detect_stopped_not_deallocated_vm(_power_state_metadata("PowerState/deallocating")).is_flagged is False
++    assert detect_stopped_not_deallocated_vm(_power_state_metadata("PowerState/starting")).is_flagged is False
++
++
++def test_detect_stopped_not_deallocated_vm_missing_power_state_is_excluded_not_flagged():
++    result = detect_stopped_not_deallocated_vm({"properties": {}})
++
++    assert result.is_flagged is False
++    assert "no power state found" in result.detail.lower()
++
++
++def test_detect_stopped_not_deallocated_vm_missing_properties_is_excluded_not_flagged():
++    result = detect_stopped_not_deallocated_vm({})
++
++    assert result.is_flagged is False
+diff --git a/backend/tests/test_idle_resources.py b/backend/tests/test_idle_resources.py
 new file mode 100644
-index 0000000..3aea1e4
+index 0000000..9ff50b5
 --- /dev/null
-+++ b/backend/app/services/utilization_evaluation.py
-@@ -0,0 +1,43 @@
-+from dataclasses import dataclass
-+from datetime import datetime, timedelta
-+
-+
-+@dataclass
-+class CpuUtilizationResult:
-+    avg_cpu_percent: float | None
-+    insufficient_data: bool
-+    is_idle: bool
-+
-+
-+def evaluate_cpu_utilization(
-+    readings: list[tuple[datetime, float]],
-+    lookback_days: int,
-+    idle_threshold_percent: float,
-+) -> CpuUtilizationResult:
-+    """Average CPU% over the trailing `lookback_days` window ending on the most
-+    recent reading, and flag idleness against `idle_threshold_percent`.
-+
-+    `readings` need not be sorted. A resource whose earliest reading doesn't
-+    reach back far enough to cover the full lookback window has
-+    insufficient_data=True - it must be excluded from results entirely rather
-+    than flagged (or cleared) on a partial average, mirroring the forecasting
-+    model's "insufficient data" handling (Task 7/8).
-+    """
-+    if not readings:
-+        return CpuUtilizationResult(avg_cpu_percent=None, insufficient_data=True, is_idle=False)
-+
-+    timestamps = [ts for ts, _ in readings]
-+    most_recent = max(timestamps)
-+    earliest = min(timestamps)
-+    span_days = (most_recent.date() - earliest.date()).days + 1
-+    if span_days < lookback_days:
-+        return CpuUtilizationResult(avg_cpu_percent=None, insufficient_data=True, is_idle=False)
-+
-+    window_start_date = most_recent.date() - timedelta(days=lookback_days - 1)
-+    window_values = [value for ts, value in readings if ts.date() >= window_start_date]
-+    avg_cpu_percent = sum(window_values) / len(window_values)
-+    return CpuUtilizationResult(
-+        avg_cpu_percent=avg_cpu_percent,
-+        insufficient_data=False,
-+        is_idle=avg_cpu_percent < idle_threshold_percent,
-+    )
-diff --git a/backend/tests/test_rightsizing.py b/backend/tests/test_rightsizing.py
-new file mode 100644
-index 0000000..95e931f
---- /dev/null
-+++ b/backend/tests/test_rightsizing.py
-@@ -0,0 +1,162 @@
-+from datetime import date, datetime, timedelta, timezone
++++ b/backend/tests/test_idle_resources.py
+@@ -0,0 +1,224 @@
++from datetime import date, timedelta
 +
 +from app.core.config import settings
 +from app.models.cloud_account import CloudAccount
 +from app.models.cost_record import CostRecord
 +from app.models.provider import Provider
 +from app.models.resource import Resource
-+from app.models.utilization_metric import UtilizationMetric
 +from app.services.azure_inventory import get_or_create_cloud_account
-+from app.services.rightsizing import build_rightsizing_recommendations
++from app.services.idle_resources import build_idle_resource_recommendations
 +
 +LOOKBACK_DAYS = 14  # matches settings.idle_lookback_days default
 +
 +
 +def _seed_account(db_session, external_id: str) -> CloudAccount:
-+    account = CloudAccount(provider=Provider.AZURE, external_id=external_id, display_name="Rightsizing Test Sub")
++    account = CloudAccount(provider=Provider.AZURE, external_id=external_id, display_name="Idle Resources Test Sub")
 +    db_session.add(account)
 +    db_session.flush()
 +    return account
 +
 +
-+def _add_vm(db_session, account, external_id, sku="Standard_D4s_v3", resource_group="rg-a") -> Resource:
-+    vm = Resource(
++def _add_resource(db_session, account, resource_type, external_id, raw_metadata, resource_group="rg-a") -> Resource:
++    resource = Resource(
 +        cloud_account_id=account.id,
 +        provider=Provider.AZURE,
 +        external_resource_id=external_id,
-+        resource_type="microsoft.compute/virtualmachines",
++        resource_type=resource_type,
 +        resource_group=resource_group,
 +        region="eastus",
 +        tags={},
-+        sku=sku,
-+        raw_metadata={},
++        raw_metadata=raw_metadata,
 +    )
-+    db_session.add(vm)
++    db_session.add(resource)
 +    db_session.flush()
-+    return vm
-+
-+
-+def _add_cpu_readings(db_session, resource, days, value, metric_name="Percentage CPU"):
-+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
-+    for day in range(days):
-+        db_session.add(
-+            UtilizationMetric(
-+                resource_id=resource.id,
-+                metric_name=metric_name,
-+                timestamp=start + timedelta(days=day),
-+                value=value,
-+                unit="Percent",
-+            )
-+        )
++    return resource
 +
 +
 +def _add_cost(db_session, account, resource, day, amount):
@@ -656,252 +743,178 @@ index 0000000..95e931f
 +    )
 +
 +
-+def test_flags_idle_vm_with_suggested_sku_and_estimated_savings(db_session):
-+    account = _seed_account(db_session, "test-sub-rightsizing-idle")
-+    vm = _add_vm(db_session, account, "vm-idle", sku="Standard_D4s_v3")
-+    _add_cpu_readings(db_session, vm, days=LOOKBACK_DAYS, value=2.0)
-+    for offset in range(LOOKBACK_DAYS):
-+        _add_cost(db_session, account, vm, date(2026, 9, 1) + timedelta(days=offset), 10.0)
-+    db_session.commit()
-+
-+    result = build_rightsizing_recommendations(db_session, cloud_account_id=account.id)
-+
-+    assert len(result["recommendations"]) == 1
-+    rec = result["recommendations"][0]
-+    assert rec["external_resource_id"] == "vm-idle"
-+    assert rec["current_sku"] == "Standard_D4s_v3"
-+    assert rec["suggested_sku"] == "Standard_D2s_v3"
-+    assert rec["avg_cpu_percent"] == 2.0
-+    assert rec["estimated_monthly_savings"] == 10.0 * 0.5 * 30
-+
-+
-+def test_does_not_flag_busy_vm(db_session):
-+    account = _seed_account(db_session, "test-sub-rightsizing-busy")
-+    vm = _add_vm(db_session, account, "vm-busy")
-+    _add_cpu_readings(db_session, vm, days=LOOKBACK_DAYS, value=80.0)
-+    db_session.commit()
-+
-+    result = build_rightsizing_recommendations(db_session, cloud_account_id=account.id)
-+
-+    assert result["recommendations"] == []
-+
-+
-+def test_excludes_vm_with_insufficient_utilization_history(db_session):
-+    account = _seed_account(db_session, "test-sub-rightsizing-insufficient")
-+    vm = _add_vm(db_session, account, "vm-new")
-+    # Only 3 days of history against a 14-day lookback window, even though
-+    # clearly idle - must be excluded, not flagged on partial data.
-+    _add_cpu_readings(db_session, vm, days=3, value=1.0)
-+    db_session.commit()
-+
-+    result = build_rightsizing_recommendations(db_session, cloud_account_id=account.id)
-+
-+    assert result["recommendations"] == []
-+
-+
-+def test_flags_idle_app_service_without_a_specific_suggested_tier(db_session):
-+    account = _seed_account(db_session, "test-sub-rightsizing-appservice")
-+    app_service = Resource(
-+        cloud_account_id=account.id,
-+        provider=Provider.AZURE,
-+        external_resource_id="app-idle",
-+        resource_type="microsoft.web/sites",
-+        resource_group="rg-a",
-+        region="eastus",
-+        tags={},
-+        sku="S2",
-+        raw_metadata={},
++def test_flags_unattached_disk_with_estimated_waste(db_session):
++    account = _seed_account(db_session, "test-sub-idle-disk")
++    disk = _add_resource(
++        db_session,
++        account,
++        "microsoft.compute/disks",
++        "disk-unattached",
++        {"properties": {"diskState": "Unattached"}},
 +    )
-+    db_session.add(app_service)
-+    db_session.flush()
-+    _add_cpu_readings(db_session, app_service, days=LOOKBACK_DAYS, value=1.5, metric_name="CpuPercentage")
++    for offset in range(LOOKBACK_DAYS):
++        _add_cost(db_session, account, disk, date(2026, 9, 1) + timedelta(days=offset), 2.0)
 +    db_session.commit()
 +
-+    result = build_rightsizing_recommendations(db_session, cloud_account_id=account.id)
++    result = build_idle_resource_recommendations(db_session, cloud_account_id=account.id)
 +
 +    assert len(result["recommendations"]) == 1
 +    rec = result["recommendations"][0]
-+    assert rec["current_sku"] == "S2"
-+    assert rec["suggested_sku"] is None
-+    assert "tier" in rec["suggestion_note"].lower()
-+    assert rec["estimated_monthly_savings"] is None
++    assert rec["external_resource_id"] == "disk-unattached"
++    assert rec["reason"] == "unattached_disk"
++    assert rec["estimated_monthly_waste"] == 2.0 * 30
 +
 +
-+def test_response_includes_the_settings_used(db_session):
-+    account = _seed_account(db_session, "test-sub-rightsizing-settings")
++def test_does_not_flag_attached_disk(db_session):
++    account = _seed_account(db_session, "test-sub-idle-disk-attached")
++    _add_resource(
++        db_session,
++        account,
++        "microsoft.compute/disks",
++        "disk-attached",
++        {"properties": {"diskState": "Attached"}},
++    )
 +    db_session.commit()
 +
-+    result = build_rightsizing_recommendations(db_session, cloud_account_id=account.id)
++    result = build_idle_resource_recommendations(db_session, cloud_account_id=account.id)
 +
-+    assert result["idle_cpu_threshold_percent"] == settings.idle_cpu_threshold_percent
++    assert result["recommendations"] == []
++
++
++def test_flags_unused_public_ip(db_session):
++    account = _seed_account(db_session, "test-sub-idle-ip")
++    ip = _add_resource(
++        db_session,
++        account,
++        "microsoft.network/publicipaddresses",
++        "ip-unused",
++        {"properties": {}},
++    )
++    for offset in range(LOOKBACK_DAYS):
++        _add_cost(db_session, account, ip, date(2026, 9, 1) + timedelta(days=offset), 0.1)
++    db_session.commit()
++
++    result = build_idle_resource_recommendations(db_session, cloud_account_id=account.id)
++
++    assert len(result["recommendations"]) == 1
++    rec = result["recommendations"][0]
++    assert rec["reason"] == "unused_public_ip"
++    assert rec["estimated_monthly_waste"] == round(0.1 * 30, 2)
++
++
++def test_does_not_flag_associated_public_ip(db_session):
++    account = _seed_account(db_session, "test-sub-idle-ip-associated")
++    _add_resource(
++        db_session,
++        account,
++        "microsoft.network/publicipaddresses",
++        "ip-associated",
++        {"properties": {"ipConfiguration": {"id": "/some/nic/ipconfig1"}}},
++    )
++    db_session.commit()
++
++    result = build_idle_resource_recommendations(db_session, cloud_account_id=account.id)
++
++    assert result["recommendations"] == []
++
++
++def test_flags_stopped_not_deallocated_vm(db_session):
++    account = _seed_account(db_session, "test-sub-idle-vm-stopped")
++    vm = _add_resource(
++        db_session,
++        account,
++        "microsoft.compute/virtualmachines",
++        "vm-stopped",
++        {"properties": {"extended": {"instanceView": {"powerState": {"code": "PowerState/stopped"}}}}},
++    )
++    for offset in range(LOOKBACK_DAYS):
++        _add_cost(db_session, account, vm, date(2026, 9, 1) + timedelta(days=offset), 5.0)
++    db_session.commit()
++
++    result = build_idle_resource_recommendations(db_session, cloud_account_id=account.id)
++
++    assert len(result["recommendations"]) == 1
++    rec = result["recommendations"][0]
++    assert rec["reason"] == "stopped_not_deallocated_vm"
++    assert rec["estimated_monthly_waste"] == 5.0 * 30
++
++
++def test_does_not_flag_deallocated_vm(db_session):
++    account = _seed_account(db_session, "test-sub-idle-vm-deallocated")
++    _add_resource(
++        db_session,
++        account,
++        "microsoft.compute/virtualmachines",
++        "vm-deallocated",
++        {"properties": {"extended": {"instanceView": {"powerState": {"code": "PowerState/deallocated"}}}}},
++    )
++    db_session.commit()
++
++    result = build_idle_resource_recommendations(db_session, cloud_account_id=account.id)
++
++    assert result["recommendations"] == []
++
++
++def test_does_not_flag_running_vm(db_session):
++    account = _seed_account(db_session, "test-sub-idle-vm-running")
++    _add_resource(
++        db_session,
++        account,
++        "microsoft.compute/virtualmachines",
++        "vm-running",
++        {"properties": {"extended": {"instanceView": {"powerState": {"code": "PowerState/running"}}}}},
++    )
++    db_session.commit()
++
++    result = build_idle_resource_recommendations(db_session, cloud_account_id=account.id)
++
++    assert result["recommendations"] == []
++
++
++def test_flagged_resource_with_no_cost_data_has_null_waste_estimate(db_session):
++    account = _seed_account(db_session, "test-sub-idle-no-cost")
++    _add_resource(
++        db_session,
++        account,
++        "microsoft.compute/disks",
++        "disk-no-cost-history",
++        {"properties": {"diskState": "Unattached"}},
++    )
++    db_session.commit()
++
++    result = build_idle_resource_recommendations(db_session, cloud_account_id=account.id)
++
++    assert len(result["recommendations"]) == 1
++    rec = result["recommendations"][0]
++    assert rec["estimated_monthly_waste"] is None
++    assert "no cost data" in rec["waste_note"].lower()
++
++
++def test_response_includes_lookback_days_setting(db_session):
++    account = _seed_account(db_session, "test-sub-idle-settings")
++    db_session.commit()
++
++    result = build_idle_resource_recommendations(db_session, cloud_account_id=account.id)
++
 +    assert result["idle_lookback_days"] == settings.idle_lookback_days
 +
 +
 +def test_endpoint_returns_200_against_seeded_data(client, db_session):
 +    account = get_or_create_cloud_account(db_session, settings.azure_subscription_id)
-+    vm = _add_vm(db_session, account, "vm-endpoint-idle")
-+    _add_cpu_readings(db_session, vm, days=settings.idle_lookback_days, value=1.0)
-+    for offset in range(settings.idle_lookback_days):
-+        _add_cost(db_session, account, vm, date(2026, 9, 1) + timedelta(days=offset), 5.0)
++    _add_resource(
++        db_session,
++        account,
++        "microsoft.compute/disks",
++        "disk-endpoint-unattached",
++        {"properties": {"diskState": "Unattached"}},
++    )
 +    db_session.commit()
 +
-+    response = client.get("/api/v1/recommendations/rightsizing")
++    response = client.get("/api/v1/recommendations/idle-resources")
 +
 +    assert response.status_code == 200
 +    body = response.json()
 +    assert body["idle_lookback_days"] == settings.idle_lookback_days
 +    external_ids = {rec["external_resource_id"] for rec in body["recommendations"]}
-+    assert "vm-endpoint-idle" in external_ids
-diff --git a/backend/tests/test_sku_heuristics.py b/backend/tests/test_sku_heuristics.py
-new file mode 100644
-index 0000000..52794df
---- /dev/null
-+++ b/backend/tests/test_sku_heuristics.py
-@@ -0,0 +1,65 @@
-+import pytest
-+
-+from app.services.sku_heuristics import suggest_app_service_tier, suggest_vm_sku
-+
-+
-+def test_suggest_vm_sku_halves_core_count_within_same_family():
-+    result = suggest_vm_sku("Standard_D4s_v7")
-+
-+    assert result.suggested_sku == "Standard_D2s_v7"
-+    assert result.cores_reduction_fraction == 0.5
-+    assert "heuristic" in result.note.lower()
-+
-+
-+def test_suggest_vm_sku_no_version_suffix():
-+    result = suggest_vm_sku("Standard_B2ms")
-+
-+    assert result.suggested_sku == "Standard_B1ms"
-+    assert result.cores_reduction_fraction == 0.5
-+
-+
-+def test_suggest_vm_sku_odd_core_count_rounds_down():
-+    result = suggest_vm_sku("Standard_D3_v2")
-+
-+    assert result.suggested_sku == "Standard_D1_v2"
-+    assert result.cores_reduction_fraction == pytest.approx(2 / 3)
-+
-+
-+def test_suggest_vm_sku_already_smallest_size_gives_no_suggestion():
-+    result = suggest_vm_sku("Standard_D1s_v3")
-+
-+    assert result.suggested_sku is None
-+    assert result.cores_reduction_fraction is None
-+    assert "smallest" in result.note.lower()
-+
-+
-+def test_suggest_vm_sku_constrained_core_pattern_gives_no_suggestion_not_a_bad_guess():
-+    # "E8-4s" doesn't match the simple <family><cores><suffix> pattern (embedded
-+    # dash) - must decline to suggest rather than mangle it.
-+    result = suggest_vm_sku("Standard_E8-4s_v5")
-+
-+    assert result.suggested_sku is None
-+    assert result.cores_reduction_fraction is None
-+    assert "e8-4s" in result.note.lower()
-+
-+
-+def test_suggest_vm_sku_missing_sku_gives_no_suggestion():
-+    result = suggest_vm_sku(None)
-+
-+    assert result.suggested_sku is None
-+    assert result.cores_reduction_fraction is None
-+
-+
-+def test_suggest_vm_sku_unparseable_pattern_gives_no_suggestion():
-+    result = suggest_vm_sku("CustomWeirdName")
-+
-+    assert result.suggested_sku is None
-+    assert result.cores_reduction_fraction is None
-+
-+
-+def test_suggest_app_service_tier_never_guesses_a_specific_tier():
-+    result = suggest_app_service_tier("S2")
-+
-+    assert result.suggested_sku is None
-+    assert result.cores_reduction_fraction is None
-+    assert "tier" in result.note.lower()
-diff --git a/backend/tests/test_utilization_evaluation.py b/backend/tests/test_utilization_evaluation.py
-new file mode 100644
-index 0000000..061fef8
---- /dev/null
-+++ b/backend/tests/test_utilization_evaluation.py
-@@ -0,0 +1,75 @@
-+from datetime import datetime, timedelta, timezone
-+
-+from app.services.utilization_evaluation import evaluate_cpu_utilization
-+
-+
-+def _hourly_readings(start: datetime, days: int, value: float) -> list[tuple[datetime, float]]:
-+    return [(start + timedelta(hours=h), value) for h in range(days * 24)]
-+
-+
-+def test_evaluate_cpu_utilization_flags_clearly_idle_resource():
-+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
-+    readings = _hourly_readings(start, days=14, value=2.0)
-+
-+    result = evaluate_cpu_utilization(readings, lookback_days=14, idle_threshold_percent=10.0)
-+
-+    assert result.insufficient_data is False
-+    assert result.avg_cpu_percent == 2.0
-+    assert result.is_idle is True
-+
-+
-+def test_evaluate_cpu_utilization_does_not_flag_clearly_busy_resource():
-+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
-+    readings = _hourly_readings(start, days=14, value=75.0)
-+
-+    result = evaluate_cpu_utilization(readings, lookback_days=14, idle_threshold_percent=10.0)
-+
-+    assert result.insufficient_data is False
-+    assert result.avg_cpu_percent == 75.0
-+    assert result.is_idle is False
-+
-+
-+def test_evaluate_cpu_utilization_excludes_resource_with_insufficient_history():
-+    # Only 3 days of readings against a 14-day lookback window - must be
-+    # excluded (insufficient_data=True), not flagged on the partial average,
-+    # even though the 3 days available are clearly idle.
-+    start = datetime(2026, 9, 15, tzinfo=timezone.utc)
-+    readings = _hourly_readings(start, days=3, value=1.0)
-+
-+    result = evaluate_cpu_utilization(readings, lookback_days=14, idle_threshold_percent=10.0)
-+
-+    assert result.insufficient_data is True
-+    assert result.avg_cpu_percent is None
-+    assert result.is_idle is False
-+
-+
-+def test_evaluate_cpu_utilization_no_readings_at_all_is_insufficient_data():
-+    result = evaluate_cpu_utilization([], lookback_days=14, idle_threshold_percent=10.0)
-+
-+    assert result.insufficient_data is True
-+    assert result.avg_cpu_percent is None
-+    assert result.is_idle is False
-+
-+
-+def test_evaluate_cpu_utilization_windows_to_trailing_lookback_only():
-+    # An old spike outside the lookback window must not pull the average up -
-+    # only the trailing lookback_days count, mirroring the forecasting
-+    # model's calendar-window convention.
-+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
-+    old_spike = _hourly_readings(start, days=1, value=90.0)
-+    recent_idle = _hourly_readings(start + timedelta(days=13), days=14, value=1.0)
-+
-+    result = evaluate_cpu_utilization(old_spike + recent_idle, lookback_days=14, idle_threshold_percent=10.0)
-+
-+    assert result.insufficient_data is False
-+    assert result.avg_cpu_percent == 1.0
-+    assert result.is_idle is True
-+
-+
-+def test_evaluate_cpu_utilization_threshold_is_strict_less_than():
-+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
-+    readings = _hourly_readings(start, days=14, value=10.0)
-+
-+    result = evaluate_cpu_utilization(readings, lookback_days=14, idle_threshold_percent=10.0)
-+
-+    assert result.is_idle is False  # avg == threshold, not strictly below it
++    assert "disk-endpoint-unattached" in external_ids
 ```

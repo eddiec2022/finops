@@ -1,62 +1,94 @@
-# TASK 9 - Recommendations: Rightsizing
+# TASK 11 - Recommendations: Non-Peak Scheduling
 
 ## Context
-Tasks 2/5/6/8 built inventory, utilization, cost, and forecasting. This starts
-Section 3.5 (Recommendations) - the last major piece of Azure Phase 1. Rightsizing
-comes first since it builds directly on utilization data that's already solid.
-Idle/orphaned detection, non-peak scheduling, and RI/Savings Plan recommendations
-are each separate follow-up tasks, not bundled into this one.
+Tasks 9 and 10 covered rightsizing and idle/orphaned detection. This task adds the
+third recommendation category per GOV-001 Section 3.5: identify likely non-production
+resources with low overnight/weekend usage, and recommend a start/stop schedule as a
+suggestion (not an automated action - v1 is advisory only). RI/Savings Plan
+recommendations remain the last category, a separate task after this one.
 
 ## Scope
 
-1. Endpoint - GET /api/v1/recommendations/rightsizing
-   - Compute-on-read, same philosophy as forecasting - nothing external to fetch,
-     just deriving insight from utilization_metrics + resources already in the DB
-   - For each VM and App Service in `resources`, compute average CPU utilization
-     over the trailing `idle_lookback_days` window (reuse the existing setting
-     from Task 5 - do not add a new one)
-   - Flag resources where avg CPU < idle_cpu_threshold_percent (also from Task 5 -
-     these settings exist for exactly this purpose, use them, do not hardcode)
-   - For flagged VMs, suggest a smaller SKU using a simple heuristic (e.g. parse
-     the SKU name's core-count component and suggest roughly half, staying within
-     the same VM series/family). This is deliberately not a live Azure SKU
-     availability lookup - that is real added complexity for a v1 advisory
-     feature. State the heuristic's limitation plainly in the response (e.g. a
-     `note` field) rather than presenting the suggested SKU as guaranteed available
-   - For App Services, suggest a smaller tier using equivalent logic if a clean
-     one exists; if App Service tier naming does not map as cleanly as VM sizes,
-     it is fine to flag App Services as rightsizing candidates without a specific
-     suggested tier rather than force a bad guess - explain whichever way you go
-   - Resources with insufficient utilization history (less than the lookback
-     window) should be excluded from results, not flagged based on partial data -
-     same principle as the forecasting model's "insufficient data" handling in
-     Task 7/8
-   - Response: for each flagged resource - resource details, current SKU,
-     suggested SKU (or explicit note if none), average CPU%, and an estimated
-     monthly savings figure if calculable from the cost data already in
-     cost_records (this will be approximate - say so, do not present it as precise)
+1. Endpoint - GET /api/v1/recommendations/non-peak-scheduling
+   - Compute-on-read, same philosophy as the other recommendation endpoints
 
-2. Tests
-   - Unit test the CPU-threshold flagging logic against fixture utilization data
-     (clearly idle resource, clearly busy resource, insufficient-history resource)
-   - Unit test the SKU-suggestion heuristic against a few real-looking SKU name
-     patterns
-   - Integration test the endpoint against seeded data
+2. "Likely non-production" signal
+   - GOV-001 says this can come from tags, naming convention, OR usage pattern -
+     not all three required. Build at least: a tag-based check (common
+     environment-indicating tag keys like "environment"/"env" with values like
+     "dev"/"test"/"staging"/"sandbox" - check what's actually in the real
+     synced resources' tags before hardcoding an exact tag key/value list) and
+     a naming-convention check (resource name containing dev/test/staging/
+     sandbox/demo, case-insensitive). Both are heuristics, not certainties -
+     label results accordingly, same spirit as the SKU suggestion heuristic
+     in Task 9
+   - A resource can also qualify purely on usage pattern (see below) without
+     matching either tag or naming heuristic - don't require all signals to
+     agree, any one is sufficient per GOV-001's wording
+
+3. Usage pattern analysis
+   - For VMs and App Services, using the existing CPU utilization data:
+     compute average CPU during "peak" hours (weekday, business hours) versus
+     "off-peak" hours (nights and weekends), over the trailing
+     idle_lookback_days window
+   - This needs actual time-of-day/day-of-week bucketing of
+     utilization_metrics.timestamp - a genuinely different kind of analysis
+     than the flat-average approach evaluate_cpu_utilization uses for
+     rightsizing. Build it as its own function, don't try to force-fit the
+     existing one
+   - Business hours definition is a real v1 simplification worth being
+     explicit about: use a fixed weekday 8am-6pm UTC window rather than
+     per-resource timezone detection (there's no reliable timezone signal in
+     what's synced) - state this assumption plainly in the response, don't
+     bury it
+   - Flag a resource when off-peak usage is meaningfully lower than peak
+     usage - pick a reasonable threshold (e.g. a ratio) and make it a
+     configurable setting following the established pattern, not a hardcoded
+     magic number
+   - Resources with insufficient history for this analysis follow the same
+     "exclude, don't guess" principle as every other recommendation endpoint
+     so far
+
+4. Recommended schedule
+   - v1 doesn't need a fully custom per-resource schedule derived from the
+     exact observed pattern - a standard template (e.g. "power off weeknights
+     outside business hours, power off entirely on weekends") is a reasonable
+     v1 scope. State it as a suggested starting point, not a precise
+     optimization
+   - Estimate monthly savings from the hours that would be powered off,
+     using the same average-daily-cost-from-cost_records approach as the
+     other two recommendation categories, scaled to the fraction of a
+     week/month the schedule would have the resource off
+
+5. Tests
+   - Unit test the peak/off-peak bucketing logic against fixture timestamps
+     spanning weekdays, weekends, and both sides of the business-hours
+     boundary
+   - Unit test the tag and naming heuristics
+   - Integration test the endpoint against seeded data covering: a clear
+     non-prod-by-tag candidate, a clear non-prod-by-name candidate, a
+     production-tagged resource with an off-peak usage dip anyway (still
+     qualifies, since usage pattern alone is sufficient), and a resource
+     that's busy around the clock (should not be flagged)
 
 ## Explicitly out of scope for this task
-- Idle/orphaned resource detection (disks, IPs, stopped VMs, empty resource
-  groups) - separate task next
-- Non-peak scheduling, RI/Savings Plan recommendations - separate tasks
-- Any UI/dashboard changes
-- Persisting recommendations to a table - compute-on-read only for now, same as
-  forecasting
+- RI/Savings Plan recommendations - the last recommendation category, separate task
+- Empty resource group detection - still deferred from Task 10, will be its own
+  small task
+- Any actual scheduling/automation - v1 is advisory only, this only ever returns
+  a suggestion
+- Per-resource custom schedule optimization beyond the standard template
 
 ## Deliverable for review (write to results.txt per CLAUDE.md)
 - Full diff
 - Actual pytest output - run it yourself
-- A live check against the real subscription: call the endpoint, show what it
-  actually flags for your real VM, and whether the numbers look sane
-- Status of the WSL2/dockerd restart monitor log during this task's work (still
-  worth tracking, even though it is looking resolved)
+- A live check against the real subscription: call the endpoint, and if it
+  returns empty, explain why using the real data the same way Task 9 and 10
+  did - don't just report the number
+- Status of the WSL2/dockerd restart monitor log during this task's work
 
 Same rule as before: if anything here is ambiguous, flag it rather than guessing.
+Same rule as Task 10 too: if something here turns out to not match what's actually
+in the synced data, verify against the real data and say so rather than building on
+an assumption that doesn't hold - that's exactly what caught the managedBy issue
+last time.

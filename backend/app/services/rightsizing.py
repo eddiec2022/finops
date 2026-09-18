@@ -1,15 +1,13 @@
 import uuid
-from datetime import date
 from typing import Any
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.cost_record import CostRecord
 from app.models.resource import Resource
 from app.models.utilization_metric import UtilizationMetric
 from app.services.azure_inventory import get_or_create_cloud_account
+from app.services.cost_lookup import get_resource_daily_costs
 from app.services.forecasting.linear_burn_rate import LinearBurnRateModel
 from app.services.sku_heuristics import SkuSuggestion, suggest_app_service_tier, suggest_vm_sku
 from app.services.utilization_evaluation import evaluate_cpu_utilization
@@ -22,16 +20,6 @@ CPU_METRIC_BY_RESOURCE_TYPE: dict[str, str] = {
     "microsoft.compute/virtualmachines": "Percentage CPU",
     "microsoft.web/sites": "CpuPercentage",
 }
-
-
-def get_resource_daily_costs(db: Session, resource_id: uuid.UUID) -> list[tuple[date, float]]:
-    query = (
-        db.query(CostRecord.date, func.sum(CostRecord.amortized_cost))
-        .filter(CostRecord.resource_id == resource_id)
-        .group_by(CostRecord.date)
-        .order_by(CostRecord.date)
-    )
-    return [(row_date, float(total)) for row_date, total in query.all()]
 
 
 def estimate_monthly_savings(
