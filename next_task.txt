@@ -1,62 +1,62 @@
-﻿# TASK 4 - WSL2/Docker Restart: Root Cause Investigation (Round 3)
+# TASK 9 - Recommendations: Rightsizing
 
 ## Context
-Task 3 confirmed the WSL2-instance-level restart cycling is NOT resolved - it is
-active and ongoing, with irregular intervals from 1 second to 5+ minutes, still
-occurring as of Task 3. Monitoring is in place and verified working
-(ops/wsl-monitoring/), so recurrences are now logged, but root cause remains
-unknown after two investigation passes that ruled out: Windows reboot, Hyper-V
-VM-level restart, OOM-kill, Windows Update, Trusted Launch regression,
-SystemSettings log correlation, and LxssManager issues.
-
-Two new, specific leads to check this round, based on research matching this exact
-symptom pattern:
+Tasks 2/5/6/8 built inventory, utilization, cost, and forecasting. This starts
+Section 3.5 (Recommendations) - the last major piece of Azure Phase 1. Rightsizing
+comes first since it builds directly on utilization data that's already solid.
+Idle/orphaned detection, non-peak scheduling, and RI/Savings Plan recommendations
+are each separate follow-up tasks, not bundled into this one.
 
 ## Scope
 
-1. Check for a known Microsoft WSL networking bug
-   - This setup matches a documented, currently-open WSL issue pattern: native
-     Docker Engine inside a systemd-enabled Ubuntu WSL2 distro (no Docker Desktop)
-     experiencing periodic WSL restarts, correlated with Hyper-V VmSwitch logging
-     Event ID 285 (IOCTL_ENUM_NIC_COUNT_EX timeout) at the same moments.
-   - Check the Microsoft-Windows-Hyper-V-VmSwitch-Operational event log for Event
-     ID 285 entries, and check whether their timestamps line up with the restart
-     timestamps already captured in /var/log/docker-restart-monitor.log
-   - If it matches: this is a known upstream bug, not something fixable in this
-     repo - report what mitigation options exist upstream rather than trying to
-     patch around it blindly
+1. Endpoint - GET /api/v1/recommendations/rightsizing
+   - Compute-on-read, same philosophy as forecasting - nothing external to fetch,
+     just deriving insight from utilization_metrics + resources already in the DB
+   - For each VM and App Service in `resources`, compute average CPU utilization
+     over the trailing `idle_lookback_days` window (reuse the existing setting
+     from Task 5 - do not add a new one)
+   - Flag resources where avg CPU < idle_cpu_threshold_percent (also from Task 5 -
+     these settings exist for exactly this purpose, use them, do not hardcode)
+   - For flagged VMs, suggest a smaller SKU using a simple heuristic (e.g. parse
+     the SKU name's core-count component and suggest roughly half, staying within
+     the same VM series/family). This is deliberately not a live Azure SKU
+     availability lookup - that is real added complexity for a v1 advisory
+     feature. State the heuristic's limitation plainly in the response (e.g. a
+     `note` field) rather than presenting the suggested SKU as guaranteed available
+   - For App Services, suggest a smaller tier using equivalent logic if a clean
+     one exists; if App Service tier naming does not map as cleanly as VM sizes,
+     it is fine to flag App Services as rightsizing candidates without a specific
+     suggested tier rather than force a bad guess - explain whichever way you go
+   - Resources with insufficient utilization history (less than the lookback
+     window) should be excluded from results, not flagged based on partial data -
+     same principle as the forecasting model's "insufficient data" handling in
+     Task 7/8
+   - Response: for each flagged resource - resource details, current SKU,
+     suggested SKU (or explicit note if none), average CPU%, and an estimated
+     monthly savings figure if calculable from the cost data already in
+     cost_records (this will be approximate - say so, do not present it as precise)
 
-2. Check for antivirus/EDR interference with the WSL2 virtual disk
-   - Identify what endpoint protection is running on this VM (Windows Defender at
-     minimum; check for additional EDR agents given this is a VAR/security
-     environment)
-   - Check current Defender exclusions (Get-MpPreference) for whether WSL2/Docker
-     paths are already excluded
-   - If not excluded: this is a strong candidate, since real-time scanning of the
-     ext4 virtual disk while Docker has it mounted is a well-documented cause of
-     exactly this unmount/remount cycling pattern
-   - Do NOT apply any exclusions - this is read-only investigation. Report findings
-     and the exact exclusion paths that would need adding. Disabling AV scanning on
-     any path is a security posture decision Edson makes explicitly, not something
-     to change silently as part of a diagnostic task
-
-3. Cross-reference
-   - Compare timestamps from both checks above against the monitor's log to see if
-     either (or both) correlate consistently with actual restart events, rather
-     than just confirming the log entries exist somewhere
+2. Tests
+   - Unit test the CPU-threshold flagging logic against fixture utilization data
+     (clearly idle resource, clearly busy resource, insufficient-history resource)
+   - Unit test the SKU-suggestion heuristic against a few real-looking SKU name
+     patterns
+   - Integration test the endpoint against seeded data
 
 ## Explicitly out of scope for this task
-- No new Azure feature work - still paused pending this
-- No applying fixes automatically (AV exclusions, WSL version changes, etc.) - this
-  task is diagnosis only; report findings and proposed fixes for Edson to approve,
-  then a follow-up task applies whichever fix is confirmed
+- Idle/orphaned resource detection (disks, IPs, stopped VMs, empty resource
+  groups) - separate task next
+- Non-peak scheduling, RI/Savings Plan recommendations - separate tasks
+- Any UI/dashboard changes
+- Persisting recommendations to a table - compute-on-read only for now, same as
+  forecasting
 
-## Deliverable for review
-- Whether Event ID 285 correlates with the restart timestamps (yes/no, with evidence)
-- What AV/EDR is running, current exclusion status, and the exact paths that would
-  need excluding if that turns out to be the fix
-- A clear recommendation: which lead (if either) looks like the actual cause, based
-  on correlation strength against the monitor log - not just "both are documented
-  possibilities"
+## Deliverable for review (write to results.txt per CLAUDE.md)
+- Full diff
+- Actual pytest output - run it yourself
+- A live check against the real subscription: call the endpoint, show what it
+  actually flags for your real VM, and whether the numbers look sane
+- Status of the WSL2/dockerd restart monitor log during this task's work (still
+  worth tracking, even though it is looking resolved)
 
 Same rule as before: if anything here is ambiguous, flag it rather than guessing.
