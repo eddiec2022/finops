@@ -19,15 +19,36 @@ class LinearBurnRateModel(ForecastModel):
         if not daily_costs:
             return ForecastResult(points=[], daily_rate=None, insufficient_data=True)
 
-        sorted_costs = sorted(daily_costs, key=lambda item: item[0])
-        # Slicing with a window larger than the available history just returns
-        # everything - "use whatever exists" for a partial trailing window.
-        window = sorted_costs[-self.trailing_window_days :] if self.trailing_window_days > 0 else sorted_costs
-        daily_rate = sum(cost for _, cost in window) / len(window)
+        cost_by_date: dict[date, float] = {}
+        for day, cost in daily_costs:
+            cost_by_date[day] = cost_by_date.get(day, 0.0) + cost
 
-        last_date = sorted_costs[-1][0]
+        earliest_date = min(cost_by_date)
+        most_recent_date = max(cost_by_date)
+
+        # Window by calendar days ending on the most recent date with data, not
+        # by slicing the last N *entries* - a resource with a gap in its cost
+        # history (powered off, then resumed) has no cost_records row at all for
+        # the gap days, and slicing by entry count would silently reach back
+        # past the gap into stale, older pricing. Bounded below by earliest_date
+        # so a resource with less history than the window still averages over
+        # just what actually exists, rather than diluting it with zero-filled
+        # days from before the resource had any data at all.
+        if self.trailing_window_days > 0:
+            window_start = max(most_recent_date - timedelta(days=self.trailing_window_days - 1), earliest_date)
+        else:
+            window_start = earliest_date
+        window_length = (most_recent_date - window_start).days + 1
+
+        # Days inside the window with no cost record are real information (zero
+        # cost that day), not missing data - zero-filled rather than skipped.
+        daily_rate = (
+            sum(cost_by_date.get(window_start + timedelta(days=offset), 0.0) for offset in range(window_length))
+            / window_length
+        )
+
         points = [
-            ForecastPoint(date=last_date + timedelta(days=offset), projected_cost=daily_rate)
+            ForecastPoint(date=most_recent_date + timedelta(days=offset), projected_cost=daily_rate)
             for offset in range(1, horizon_days + 1)
         ]
         return ForecastResult(points=points, daily_rate=daily_rate, insufficient_data=False)
