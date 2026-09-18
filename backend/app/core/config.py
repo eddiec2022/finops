@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     idle_lookback_days: int = 14
     cost_lookback_days: int = 90
     forecast_trailing_window_days: int = 30
+    # Non-peak-scheduling candidate: flag when off-peak average CPU is at most
+    # this fraction of peak average CPU (e.g. 0.5 = off-peak usage is half of
+    # peak or less).
+    off_peak_usage_ratio_threshold: float = 0.5
 
 
 settings = Settings()

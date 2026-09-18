@@ -8,18 +8,10 @@ from app.models.resource import Resource
 from app.models.utilization_metric import UtilizationMetric
 from app.services.azure_inventory import get_or_create_cloud_account
 from app.services.cost_lookup import get_resource_daily_costs
+from app.services.cpu_metrics import CPU_METRIC_BY_RESOURCE_TYPE
 from app.services.forecasting.linear_burn_rate import LinearBurnRateModel
 from app.services.sku_heuristics import SkuSuggestion, suggest_app_service_tier, suggest_vm_sku
 from app.services.utilization_evaluation import evaluate_cpu_utilization
-
-# The CPU metric azure_utilization.py stores for each resource type it
-# supports - must match RESOURCE_TYPE_METRICS in that module (kept as a
-# separate explicit mapping rather than reaching into that list's ordering,
-# since "first metric in the sync list" isn't a documented contract).
-CPU_METRIC_BY_RESOURCE_TYPE: dict[str, str] = {
-    "microsoft.compute/virtualmachines": "Percentage CPU",
-    "microsoft.web/sites": "CpuPercentage",
-}
 
 
 def estimate_monthly_savings(
