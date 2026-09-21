@@ -1,82 +1,45 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import userEvent from "@testing-library/user-event";
 import App from "./App";
-
-const FORECAST_FRAGMENT = "/api/v1/forecast";
-const COST_FRAGMENT = "/api/v1/cost";
-
-function mockFetchResponses(responses: Record<string, unknown>) {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn((input: RequestInfo | URL) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const matchedKey = Object.keys(responses).find((fragment) => url.includes(fragment));
-      if (!matchedKey) {
-        return Promise.reject(new Error(`Unexpected fetch to ${url}`));
-      }
-      return Promise.resolve({
-        ok: true,
-        json: () => Promise.resolve(responses[matchedKey]),
-      } as Response);
-    }),
-  );
-}
+import { mockFetchResponses } from "./testUtils";
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
 describe("App", () => {
-  it("renders the current-spend figure and chart when real data is available", async () => {
+  it("shows the Overview page by default and switches to Recommendations via the nav", async () => {
     mockFetchResponses({
-      [COST_FRAGMENT]: {
-        series: [
-          { date: "2026-09-01", actual_cost: 10 },
-          { date: "2026-09-02", actual_cost: 20 },
-        ],
+      "/api/v1/cost": { series: [] },
+      "/api/v1/forecast": { insufficient_data: true, daily_rate: null, horizon_days: 90, rollups: {}, series: [] },
+      "/api/v1/recommendations/rightsizing": {
+        idle_cpu_threshold_percent: 10,
+        idle_lookback_days: 14,
+        recommendations: [],
       },
-      [FORECAST_FRAGMENT]: {
-        insufficient_data: false,
-        daily_rate: 15,
-        horizon_days: 90,
-        rollups: { "7": 105, "90": 1350 },
-        series: [{ date: "2026-09-03", projected_cost: 15 }],
+      "/api/v1/recommendations/idle-resources": { idle_lookback_days: 14, recommendations: [] },
+      "/api/v1/recommendations/non-peak-scheduling": {
+        idle_lookback_days: 14,
+        off_peak_usage_ratio_threshold: 0.5,
+        business_hours_definition: "Fixed weekday 09:00-17:00 UTC window.",
+        recommendations: [],
+      },
+      "/api/v1/recommendations/reserved-instances": {
+        source: "Azure Microsoft.Consumption reservationRecommendations API",
+        field_mapping_note: "Unverified against real populated data.",
+        recommendations: [],
       },
     });
 
+    const user = userEvent.setup();
     render(<App />);
 
-    await waitFor(() => expect(screen.getByText("$30.00")).toBeInTheDocument());
-    expect(screen.getByText(/spend trend/i)).toBeInTheDocument();
-    expect(screen.queryByText(/not enough usage history/i)).not.toBeInTheDocument();
-  });
+    expect(screen.getByRole("heading", { name: "Overview" })).toBeInTheDocument();
 
-  it("renders the empty state when the forecast reports insufficient data", async () => {
-    mockFetchResponses({
-      [COST_FRAGMENT]: { series: [] },
-      [FORECAST_FRAGMENT]: {
-        insufficient_data: true,
-        daily_rate: null,
-        horizon_days: 90,
-        rollups: {},
-        series: [],
-      },
-    });
+    await user.click(screen.getByRole("button", { name: "Recommendations" }));
 
-    render(<App />);
-
-    await waitFor(() => expect(screen.getByText(/not enough usage history/i)).toBeInTheDocument());
-    expect(screen.queryByText(/solid = actual/i)).not.toBeInTheDocument();
-  });
-
-  it("renders an error message when the backend is unreachable", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(() => Promise.reject(new Error("network error"))),
-    );
-
-    render(<App />);
-
-    await waitFor(() => expect(screen.getByText(/couldn't reach the backend/i)).toBeInTheDocument());
+    expect(screen.getByRole("heading", { name: "Recommendations" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/nothing to flag right now/i)).toBeInTheDocument());
   });
 });
