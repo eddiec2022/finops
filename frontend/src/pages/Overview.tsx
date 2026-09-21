@@ -1,79 +1,138 @@
 import { useEffect, useState } from "react";
-import { getCostHistory, getForecast } from "../api/client";
-import type { CostHistoryResponse, ForecastResponse } from "../api/types";
-import { EmptyState } from "../components/EmptyState";
-import { SpendChart } from "../components/SpendChart";
-import { combineSpendSeries } from "../lib/combineSpendSeries";
-import { formatCurrency } from "../lib/formatCurrency";
+import { getResources } from "../api/client";
+import type { ResourceListItem } from "../api/types";
+import { Breadcrumb, type BreadcrumbSegment } from "../components/Breadcrumb";
+import { DrillList } from "../components/DrillList";
+import { SpendPanel } from "../components/SpendPanel";
+import { resourceLabel, summarizeResourceGroups } from "../lib/groupResources";
 
-const FORECAST_HORIZON_DAYS = 90;
-const TRAILING_SPEND_DAYS = 30;
+type DrillPath =
+  | { level: "subscription" }
+  | { level: "resource-group"; resourceGroup: string }
+  | { level: "resource"; resourceGroup: string; resource: ResourceListItem };
 
-type LoadState =
+type ResourceListState =
   | { status: "loading" }
   | { status: "error" }
-  | { status: "empty" }
-  | { status: "ready"; history: CostHistoryResponse; forecast: ForecastResponse };
-
-function sumTrailingActual(history: CostHistoryResponse, days: number): number {
-  return history.series.slice(-days).reduce((total, point) => total + point.actual_cost, 0);
-}
+  | { status: "ready"; resources: ResourceListItem[] };
 
 export function Overview() {
-  const [state, setState] = useState<LoadState>({ status: "loading" });
+  const [path, setPath] = useState<DrillPath>({ level: "subscription" });
+  const [resourceList, setResourceList] = useState<ResourceListState>({ status: "loading" });
+
+  const resourceGroupFilter = path.level !== "subscription" ? path.resourceGroup : undefined;
 
   useEffect(() => {
-    Promise.all([getCostHistory(), getForecast(FORECAST_HORIZON_DAYS)])
-      .then(([history, forecast]) => {
-        // Both endpoints derive from the same underlying daily-cost query for
-        // the unfiltered aggregate case, so forecast.insufficient_data alone
-        // is a reliable signal that there's no history to show either.
-        if (forecast.insufficient_data) {
-          setState({ status: "empty" });
-          return;
-        }
-        setState({ status: "ready", history, forecast });
-      })
-      .catch(() => setState({ status: "error" }));
-  }, []);
+    // Resource level has nothing further to list - the selected resource is
+    // already known from the click that navigated here, so skip the fetch.
+    if (path.level === "resource") return;
+
+    setResourceList({ status: "loading" });
+    getResources(resourceGroupFilter ? { resourceGroup: resourceGroupFilter } : undefined)
+      .then((response) => setResourceList({ status: "ready", resources: response.resources }))
+      .catch(() => setResourceList({ status: "error" }));
+  }, [path.level, resourceGroupFilter]);
+
+  const breadcrumbSegments: BreadcrumbSegment[] = [
+    {
+      label: "Overview",
+      onClick: path.level !== "subscription" ? () => setPath({ level: "subscription" }) : undefined,
+    },
+  ];
+  if (path.level === "resource-group" || path.level === "resource") {
+    breadcrumbSegments.push({
+      label: path.resourceGroup,
+      onClick:
+        path.level === "resource" ? () => setPath({ level: "resource-group", resourceGroup: path.resourceGroup }) : undefined,
+    });
+  }
+  if (path.level === "resource") {
+    breadcrumbSegments.push({ label: resourceLabel(path.resource) });
+  }
 
   return (
     <div>
-      <h1 className="mb-8 text-2xl font-semibold">Overview</h1>
+      <h1 className="mb-2 text-2xl font-semibold">Overview</h1>
+      <Breadcrumb segments={breadcrumbSegments} />
 
-      {state.status === "loading" && <p className="text-stone-500">Loading spend data…</p>}
-
-      {state.status === "error" && (
-        <div className="rounded-xl bg-red-50 px-6 py-8 text-red-800">
-          Couldn't reach the backend. Check that the API is running and try again.
+      {path.level !== "resource" && (
+        <div className="mb-6">
+          <SpendPanel
+            resourceGroup={resourceGroupFilter}
+            emptyStateDescription={
+              path.level === "resource-group"
+                ? `Resource group "${path.resourceGroup}" hasn't synced enough days of cost data to show a spend trend or forecast yet.`
+                : undefined
+            }
+          />
         </div>
       )}
 
-      {state.status === "empty" && <EmptyState />}
+      {path.level === "subscription" && (
+        <>
+          {resourceList.status === "loading" && <p className="text-stone-500">Loading resource groups…</p>}
+          {resourceList.status === "error" && (
+            <div className="rounded-xl bg-red-50 px-4 py-3 text-sm text-red-800">
+              Couldn't load resource groups. Try refreshing.
+            </div>
+          )}
+          {resourceList.status === "ready" && (
+            <DrillList
+              title="Resource groups"
+              emptyMessage="No resource groups have synced yet."
+              items={summarizeResourceGroups(resourceList.resources).map((group) => ({
+                key: group.resourceGroup,
+                primary: group.resourceGroup,
+                secondary: `${group.resourceCount} resource${group.resourceCount === 1 ? "" : "s"}`,
+                onClick: () => setPath({ level: "resource-group", resourceGroup: group.resourceGroup }),
+              }))}
+            />
+          )}
+        </>
+      )}
 
-      {state.status === "ready" && (
+      {path.level === "resource-group" && (
+        <>
+          {resourceList.status === "loading" && <p className="text-stone-500">Loading resources…</p>}
+          {resourceList.status === "error" && (
+            <div className="rounded-xl bg-red-50 px-4 py-3 text-sm text-red-800">
+              Couldn't load resources. Try refreshing.
+            </div>
+          )}
+          {resourceList.status === "ready" && (
+            <DrillList
+              title={`Resources in ${path.resourceGroup}`}
+              emptyMessage="No resources found in this resource group."
+              items={resourceList.resources.map((resource) => ({
+                key: resource.resource_id,
+                primary: resourceLabel(resource),
+                secondary: resource.resource_type,
+                onClick: () => setPath({ level: "resource", resourceGroup: path.resourceGroup, resource }),
+              }))}
+            />
+          )}
+        </>
+      )}
+
+      {path.level === "resource" && (
         <div className="space-y-6">
           <div className="rounded-xl bg-white p-6 shadow-sm">
-            <p className="text-sm text-stone-500">
-              Spend, last {Math.min(TRAILING_SPEND_DAYS, state.history.series.length)} days
-            </p>
-            <p className="mt-1 font-mono text-4xl font-semibold tabular-nums text-brand-dark">
-              {formatCurrency(sumTrailingActual(state.history, TRAILING_SPEND_DAYS))}
-            </p>
+            <p className="text-sm text-stone-500">Resource</p>
+            <p className="mt-1 text-lg font-semibold text-brand-dark">{resourceLabel(path.resource)}</p>
+            <dl className="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+              <dt className="text-stone-400">Type</dt>
+              <dd className="text-stone-700">{path.resource.resource_type}</dd>
+              <dt className="text-stone-400">Region</dt>
+              <dd className="text-stone-700">{path.resource.region ?? "—"}</dd>
+              <dt className="text-stone-400">Resource group</dt>
+              <dd className="text-stone-700">{path.resource.resource_group ?? "—"}</dd>
+            </dl>
           </div>
 
-          <div className="rounded-xl bg-white p-6 shadow-sm">
-            <div className="mb-4 flex items-baseline justify-between">
-              <h2 className="text-sm font-medium text-stone-700">
-                Spend trend &amp; {FORECAST_HORIZON_DAYS}-day forecast
-              </h2>
-              <span className="text-xs text-stone-400">Solid = actual · Dashed = projected</span>
-            </div>
-            <SpendChart data={combineSpendSeries(state.history.series, state.forecast.series)} />
-            <p className="mt-3 text-xs text-stone-400">
-              Projection is a simple linear burn-rate estimate based on recent daily spend — not a
-              precise prediction.
-            </p>
+          <div className="rounded-xl bg-amber-bg px-6 py-5 text-sm text-amber-text">
+            Per-resource spend and forecast aren't wired up yet — /api/v1/cost and
+            /api/v1/forecast currently filter by resource group or resource type, not by a
+            single resource. See this task's results.txt for the full writeup.
           </div>
         </div>
       )}

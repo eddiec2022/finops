@@ -1,303 +1,406 @@
-# TASK 14 RESULTS - Dashboard: Recommendations List
+# TASK 15 RESULTS - Dashboard: Drill-Down Navigation (Resource Group -> Resource)
+
+## Task-file anomaly flagged before starting (per standing memory)
+
+next_task.txt's deliverables section included "Status of the WSL2/dockerd restart
+monitor log during this task's work" - unrelated on its face to a frontend
+drill-down task. Stopped and asked before proceeding, per this repo's history of
+shell-artifact leaks in next_task.txt. Edson clarified it's real: `ops/wsl-monitoring/`
+is checked into this repo (a systemd timer + `check-docker-restart.sh` that logs
+dockerd restarts to `/var/log/docker-restart-monitor.log` inside WSL2). Status
+captured at start and end of this task - see the dedicated section below. Not a
+security-relevant change, no approval needed, just a status read.
 
 ## Summary
 
-Pure frontend, as scoped - no backend changes at all (verified: `git status` on
-`backend/` is clean throughout this task). Added a Recommendations view, reachable
-via a simple nav tab from the landing page, that calls all four recommendation
-endpoints (rightsizing, idle-resources, non-peak-scheduling, reserved-instances)
-independently, normalizes their genuinely different response shapes into one common
-display shape, and renders them grouped by category with per-category and overall
-empty states.
-
-No backend gaps found this time (unlike Task 13's forecast-endpoint gap) - all four
-endpoints' actual field names and behavior matched their code exactly, since I read
-each service file directly before writing any frontend code rather than assuming
-shapes.
+Full-stack, as scoped: one new backend endpoint (`GET /api/v1/inventory`) plus a
+three-level drill-down UI (subscription -> resource group -> resource) on the
+Overview page, reusing Task 13's spend-figure/chart pattern at the first two levels.
+Hit the exact backend gap the task predicted at the third level (no `resource_id`
+filter on `/cost` or `/forecast`) - flagged it and built an honest fallback instead
+of guessing at a fix, per the task's explicit instruction.
 
 ## What was built
 
-**Navigation:** `App.tsx` now holds simple tab-based state (`page: "overview" |
-"recommendations"`) with two nav buttons in the shared header - no routing library
-added, per the task's explicit "a simple link/tab is fine." The existing landing page
-was extracted unchanged into `frontend/src/pages/Overview.tsx` so `App.tsx` could
-become a shell owning navigation between the two pages.
+**Backend: `GET /api/v1/inventory`** (`backend/app/services/inventory_listing.py`,
+wired into `backend/app/api/inventory.py`). Compute-on-read from the `resources`
+table (same pattern as every other read endpoint - `forecast.py`, `rightsizing.py`),
+scoped to the configured single subscription's `cloud_account_id`, with an optional
+`resource_group` query param mirroring `/cost` and `/forecast`'s existing filter.
+Returns `resource_id` (internal UUID), `external_resource_id` (full ARM path),
+`name`, `resource_group`, `resource_type`, `region`.
 
-**Data normalization** (`frontend/src/lib/normalizeRecommendations.ts`): the four
-endpoints' response shapes are genuinely different, not just cosmetically -
-rightsizing/idle-resources/non-peak-scheduling are all per-resource with a
-`resource_id`, but idle-resources uses `estimated_monthly_waste` while the other two
-use `estimated_monthly_savings`; reserved-instances has no resource at all (it's a
-SKU/scope/term-level Azure recommendation, confirmed in Task 12's investigation), no
-`resource_id`, and its own `estimated_monthly_savings` comes from an explicitly
-unverified field mapping. Rather than forcing a uniform shape onto that difference (or
-silently dropping RI's distinctness), each category has its own `normalize*()`
-function producing a common `RecommendationItem` (`id`, `category`, `title`, `reason`,
-`estimatedMonthlyImpact`, `impactNote`) - four small pure functions, each unit-tested
-against realistic fixtures (10 tests total, including the real non-peak-scheduling
-item live-fetched from the actual subscription).
+One data-shape note worth flagging even though it's not a gap: `name` is not a
+dedicated `resources` column - it only exists inside `raw_metadata` (Task 2's Resource
+Graph query does `project id, name, type, ...` but `azure_inventory.map_resource`
+never promoted it to a real column, only into the `raw_metadata` JSONB blob). Read it
+from there (`resource.raw_metadata.get("name")`) rather than adding a migration to
+promote it to a column, since a single-endpoint read didn't seem to justify a schema
+change - flagging the choice here in case a future task wants `name` indexable/
+filterable, at which point a real column would be the right call.
 
-**Resource titles use the resource's own name, not its full ARM ID.** First pass
-showed the raw `external_resource_id` (a full
-`/subscriptions/.../resourceGroups/.../virtualMachines/NISE-DEV` path) as the card
-title in the live screenshot - technically correct but exactly the "dense, technical,
-cold" failure mode the design skill says to beat, not "calm and clear." Fixed by
-extracting the last path segment (the actual resource name) via a small
-`resourceDisplayName()` helper, falling back to the internal `resource_id` UUID only
-if there's no `external_resource_id` at all. Caught by actually looking at the live
-screenshot, not just passing tests - the tests only exercised the normalize functions
-in isolation, so they wouldn't have caught this on their own.
+**Frontend drill-down** (`frontend/src/pages/Overview.tsx`, rewritten):
+- `DrillPath` state (`subscription | resource-group | resource`, in-memory
+  `useState`, no routing library, per the task's explicit scope limit) drives which
+  level renders.
+- `Breadcrumb` (`frontend/src/components/Breadcrumb.tsx`, new): renders
+  Overview / rg / resource-name, each non-final segment clickable to jump back.
+- `SpendPanel` (`frontend/src/components/SpendPanel.tsx`, new): Task 13's
+  current-spend-figure + chart block extracted verbatim out of the old `Overview.tsx`
+  into its own component taking an optional `resourceGroup` prop, so the subscription
+  and resource-group levels literally reuse the same fetch/render logic scoped to
+  whatever's selected (task requirement 4) rather than two near-duplicate copies.
+- `DrillList` (`frontend/src/components/DrillList.tsx`, new): generic clickable-row
+  list, used for both "resource groups under this subscription" and "resources under
+  this resource group" - same component, different data.
+- `summarizeResourceGroups`/`resourceLabel` (`frontend/src/lib/groupResources.ts`,
+  new, unit-tested): the inventory endpoint returns a flat resource list, not
+  pre-grouped, so the subscription level derives unique resource groups + counts
+  client-side. `resourceLabel` picks the best available display name (name ->
+  external_resource_id -> internal id), same fallback chain Task 14 already
+  established for recommendation cards.
+- Empty states at every level via the existing `EmptyState` component with
+  level-specific copy (task requirement 5) - e.g. resource-group level with no cost
+  data says `Resource group "X" hasn't synced enough days of cost data...` rather than
+  reusing the generic subscription-level message verbatim.
 
-**`RecommendationCard`** (`frontend/src/components/RecommendationCard.tsx`): the
-primary-light teal treatment (`#E1F5EE` bg / `#085041` text) per the design skill's
-explicit guidance for recommendation cards - "here's something good you can do," not
-a warning. Dollar impact in JetBrains Mono, `/mo` suffix. The `impactNote` (each
-endpoint's own "approximate, not a billing quote" caveat) shown as small text under
-the card - present, not buried, but not a scary disclaimer block, per the design
-skill's explicit instruction on this exact point.
+**The flagged backend gap, handled at the resource level:** `/api/v1/cost` and
+`/api/v1/forecast` only accept `resource_group`/`resource_type`, not `resource_id` -
+confirmed by reading `backend/app/services/forecast.py`'s `get_daily_costs` directly
+before writing any frontend code, not assumed. Scoping the chart to a single resource
+by falling back to a `resource_type` filter was considered and rejected: it would
+silently include every other resource of that type across the whole resource group
+(or subscription), showing a chart that looks scoped to one resource but isn't -
+worse than not showing a chart at all. Instead, the resource level shows only the
+resource's own identity (name, type, region, resource group) plus an explicit amber
+callout: "Per-resource spend and forecast aren't wired up yet - /api/v1/cost and
+/api/v1/forecast currently filter by resource group or resource type, not by a
+single resource." No `SpendPanel` is rendered at this level at all. This is the one
+"not my call" gap from the task text - not a hard stop (the task explicitly asked
+for this exact flag-don't-guess treatment), so work continued past it rather than
+stopping the whole task.
 
-**Independent per-category failure isolation**: each of the four endpoints is fetched
-with its own `.then()/.catch()` (not wrapped in a single `Promise.all`), so one
-erroring sets only that category's state to `{status: "error"}` and renders a small
-inline message for that section - the other three categories' sections render
-normally regardless. Verified with a dedicated test that fails only the rightsizing
-fetch and confirms the other three still render their (empty) sections.
+## Actual backend pytest output (`docker compose run --rm backend pytest -q`,
+after `docker compose build backend`)
 
-**Grouping/ordering**: sections grouped by category in a fixed order (rightsizing,
-idle-resources, non-peak-scheduling, reserved-instances), each section's own items
-sorted by `estimatedMonthlyImpact` descending (nulls last) - no filter/sort UI beyond
-that, per the task's explicit "don't over-build" instruction.
+    ........................................................................ [ 59%]
+    .................................................                        [100%]
+    121 passed, 1 warning in 1.05s
 
-**Empty states, both levels the task asked for:**
-- Per-category: a category with zero recommendations shows "No recommendations in
-  this category right now" inline where its section would be - not silence, not an
-  error.
-- Overall: only when *all four* categories have genuinely loaded (not still loading,
-  not errored) *and* are all empty, one warm `EmptyState` card replaces the whole
-  section list ("Nothing to flag right now..."). Deliberately requires all four to be
-  in the `ready` state, not just empty - an errored category never counts toward "we
-  checked and there's nothing," since that would misrepresent an unknown as a
-  negative.
+(114 pre-existing + 7 new in `backend/tests/test_inventory_listing.py`: 4 unit tests
+on `build_resource_list` - all-resources listing, resource_group filter excluding
+other groups, empty-account case, and a resource with no `name` in `raw_metadata`
+falling back to `None` rather than erroring; 2 endpoint tests against the real
+configured subscription's live-synced data, same convention as
+`test_cost_history.py`'s live-data assertions - shape/wiring correctness, not
+hardcoded values; 1 endpoint test confirming the `resource_group` query param
+actually narrows results server-side.)
 
-## Design decisions (flagged explicitly)
+## Actual frontend vitest output (`docker compose run --rm frontend npm test`,
+after `docker compose build frontend`)
 
-1. **Reused `EmptyState` with configurable title/description** instead of building a
-   second near-duplicate component - same visual treatment, different copy for
-   Overview's forecast-specific message vs. Recommendations' overall message. Default
-   props preserve Overview's exact existing text, so Task 13's call site needed no
-   changes.
+     ✓ src/lib/normalizeRecommendations.test.ts (6 tests) 9ms
+     ✓ src/pages/Recommendations.test.tsx (3 tests) 137ms
+     ✓ src/pages/Overview.test.tsx (6 tests) 446ms
+     ✓ src/lib/groupResources.test.ts (6 tests) 20ms
+     ✓ src/lib/combineSpendSeries.test.ts (3 tests) 3ms
+     ✓ src/App.test.tsx (1 test) 185ms
 
-2. **No error/red styling on individual card content, only on a failed *fetch*** -
-   consistent with the design skill's explicit distinction: routine states (idle,
-   over-budget, "nothing to flag") use teal/amber, red is reserved for "a failed sync,
-   a broken connection" - which a category's fetch actually failing genuinely is.
+     Test Files  6 passed (6)
+          Tests  25 passed (25)
 
-3. **`allReadyAndEmpty` requires `status === "ready"` on every category, not just
-   `items.length === 0`** - an errored category is never silently treated as "checked,
-   nothing there." This matters concretely: if rightsizing's endpoint were down, the
-   page must not tell the user "nothing to flag" when the truth is "we don't know."
+(16 pre-existing + 9 new: 6 on `summarizeResourceGroups`/`resourceLabel`
+(`groupResources.test.ts`) covering grouping/counting, excluding resources with no
+resource_group, and the display-name fallback chain; 3 new cases added to
+`Overview.test.tsx` - resource-groups list rendering with counts, the full
+subscription -> resource-group -> resource drill with breadcrumb back-navigation at
+both levels, and a resource-group-scoped empty state. The two pre-existing
+`Overview.test.tsx` cases (aggregate ready state, unreachable-backend error) needed
+an added `/api/v1/inventory` mock response since `Overview` now also fetches that
+endpoint at the subscription level, but their assertions are otherwise unchanged.
 
-## Actual frontend vitest output (`docker compose run --rm frontend npm run test`,
-after rebuilding the frontend image)
-
-    RUN  v2.1.9 /app
-
-    ✓ src/lib/normalizeRecommendations.test.ts (6 tests) 6ms
-    ✓ src/pages/Recommendations.test.tsx (3 tests) 158ms
-    ✓ src/pages/Overview.test.tsx (3 tests) 139ms
-    ✓ src/lib/combineSpendSeries.test.ts (3 tests) 4ms
-    ✓ src/App.test.tsx (1 test) 154ms
-
-    Test Files  5 passed (5)
-         Tests  16 passed (16)
-
-(10 new tests: 6 unit tests on the four `normalize*()` functions against realistic
-fixtures including edge cases - no suggested SKU, no matched signals shouldn't happen
-but defended anyway, missing/null RI fields; 3 component-level tests on the new
-`Recommendations` page covering exactly what the task asked for - grouped rendering
-with a real populated category, one category failing independently without blanking
-the others, and the overall empty state only firing when everything is genuinely
-empty; 1 replacing the old `App.test.tsx` to instead test nav switching between pages,
-since `App` itself no longer fetches anything - that responsibility moved to
-`Overview`, whose own tests moved with it to `pages/Overview.test.tsx` unchanged in
-substance.)
+One test-infrastructure change worth calling out: `mockFetchResponses`
+(`frontend/src/testUtils.ts`) previously only supported one fixed response per URL
+fragment. The drill-down test needs the inventory mock to return different data for
+the unfiltered subscription-level fetch vs. the `resource_group=rg-a`-scoped
+resource-group-level fetch - both match the same `/api/v1/inventory` fragment.
+Extended the shared helper to accept a function of the matched URL as well as a
+plain value, backward-compatible with every existing call site (all of which still
+pass plain objects).)
 
 ## Actual frontend build output (`npm run build` = `tsc -b && vite build`)
 
     vite v6.4.3 building for production...
-    ✓ 655 modules transformed.
-    dist/index.html                   0.72 kB │ gzip:   0.41 kB
-    dist/assets/index-DHm1NW3f.css    9.26 kB │ gzip:   2.46 kB
-    dist/assets/index-DSJ1MlpQ.js   571.73 kB │ gzip: 162.65 kB
-    ✓ built in 3.69s
+    ✓ 659 modules transformed.
+    dist/index.html                   0.72 kB │ gzip:   0.40 kB
+    dist/assets/index-C9QpZZY0.css   10.60 kB │ gzip:   2.76 kB
+    dist/assets/index-gvQPohqU.js   577.10 kB │ gzip: 163.97 kB
+    ✓ built in 3.09s
 
 Type-checks clean, no errors.
 
-## Backend test suite - unchanged, re-run for confidence only (no backend files were
-touched this task)
+## Live check against the real subscription
 
-    115 passed, 1 warning in 0.65s
+Per Edson's instruction mid-task (skip the Chrome-extension browser picker - same
+approach as Tasks 13/14), verified with Playwright launched directly in WSL2
+(headless Chromium, browsers already cached from prior tasks at
+`~/.cache/ms-playwright`; needed `npx playwright install chromium` once since the
+freshly-`npm install`ed Playwright version resolved to a newer bundled-browser
+revision than what was cached) against the actual running stack (`docker compose up`
+- db, backend :8000, frontend :5173, backend/frontend images freshly rebuilt from
+current source).
 
-(Same 115 as Task 13's results - confirms this task introduced zero backend
-regressions, consistent with `git status` showing no changes under `backend/`.)
+Real inventory in this subscription right now (confirmed via direct curl before
+writing any UI code): 9 resources across 2 resource groups -
+- `nise-rg` (6 resources: 1 VM "nise-dev", its OS disk, a NIC, an NSG, a public IP,
+  a vnet) - accounts for **100%** of this subscription's cost_records
+  ($511.85 over 91 days, confirmed via `curl .../cost?resource_group=nise-rg` vs.
+  unfiltered `.../cost`, identical totals).
+- `networkwatcherrg` (3 resources: a Cognitive Services account + project, a Network
+  Watcher) - **$0** attributed cost (confirmed via
+  `curl .../cost?resource_group=networkwatcherrg` = 0 days).
 
-## Live check against the real subscription, all four categories
+Drilled the actual flow end to end:
+1. **Subscription level**: aggregate $48.75/30-day spend figure + 90-day forecast
+   chart (identical to Task 13/14's existing behavior), plus a new "Resource groups"
+   list below showing `networkwatcherrg` (3 resources) and `nise-rg` (6 resources).
+2. **Clicked nise-rg -> resource-group level**: breadcrumb updates to
+   "Overview / nise-rg", spend figure/chart re-fetch scoped to `resource_group=nise-rg`
+   (visually identical to the aggregate view here, correctly - see the 100%-of-cost
+   finding above, not a bug), "Resources in nise-rg" list shows all 6 resources with
+   their type as secondary text.
+3. **Clicked the VM row (microsoft.compute/virtualmachines, "nise-dev") -> resource
+   level**: breadcrumb "Overview / nise-rg / nise-dev", identity card (type =
+   microsoft.compute/virtualmachines, region = eastus, resource group = nise-rg), and
+   the amber gap-note callout in place of a spend chart. No "Spend trend" heading
+   present at this level - confirmed absent, not just unchecked.
+4. **Breadcrumb back-navigation**: clicked "nise-rg" crumb from the resource level ->
+   correctly returned to the resource-group level (list + scoped chart restored).
+   Clicked "Overview" crumb from there -> correctly returned to the subscription
+   level (both resource groups listed again).
 
-Verified in a real headless Chromium instance (Playwright, launched in WSL2 - same
-approach as Task 13, per Edson's instruction to skip the Chrome-extension picker and
-verify locally) against the actual running stack (frontend :5173, backend :8000, both
-freshly rebuilt). No console errors, no failed requests - confirmed via captured
-console/network listeners, not assumed.
+First pass of the verification script had a locator bug (Playwright's loose
+`text=nise-dev` substring-matched the disk resource "nise-dev_OsDisk_1_f335..."
+before the VM row, since resources are listed in `resource_type` order and
+"microsoft.compute/disks" sorts before "microsoft.compute/virtualmachines"; and
+`nav >> text=Overview` matched the App-level page-switcher nav instead of the
+breadcrumb's own `<nav>`, since both are literal `<nav>` elements and the app-level
+one comes first in the DOM). Both were script issues, not app bugs - confirmed by
+screenshotting the actual disk-resource drill-down (worked correctly, just wasn't
+the VM I intended to click) and by fixing the selectors to scope to
+`nav.mb-6` (the breadcrumb's own class) and to click the specific
+`microsoft.compute/virtualmachines` row instead of a loose text match. Re-ran after
+the fix - all assertions passed, screenshots confirm correct rendering at every
+level.
 
-Live data right now, per category (confirmed via direct curl against each endpoint
-before writing any UI code, then re-confirmed by what actually rendered):
-
-- **Rightsizing: 0 recommendations** (genuinely empty - no VM/App Service in this
-  subscription is currently both idle and has a specific smaller SKU to suggest).
-  Renders: "No recommendations in this category right now."
-- **Idle & Orphaned Resources: 0 recommendations** (genuinely empty, consistent with
-  Task 9's findings - no unattached disks, unused IPs, or stopped-not-deallocated VMs
-  right now). Renders: "No recommendations in this category right now."
-- **Non-Peak Scheduling: 1 recommendation** - the one real VM (NISE-DEV), flagged by
-  its name containing "dev" (tag and usage-pattern signals didn't match - the tag
-  isn't set, and there's only 3 days of history against the 14-day window, matching
-  everything Tasks 8/11 already found about this VM's short/gappy history). Renders
-  as a card: title "NISE-DEV" (extracted from the full ARM path, see design decision
-  above), reason "resource name contains 'dev'", $6.93/mo in the primary-light teal
-  card, the endpoint's own "approximate... not a billing quote" note underneath.
-- **Reserved Instances / Savings Plans: 0 recommendations** (genuinely empty, per
-  Task 12's own investigation - this subscription's usage history is too short/gappy
-  for Azure's own reservation engine to have produced a recommendation yet). Renders:
-  "No recommendations in this category right now."
-
-Since real data right now is a mix (one category populated, three empty) rather than
-all four empty, the *overall* "Nothing to flag right now" empty state wasn't
-observable live against the current real subscription - same situation Task 13 hit
-with its own empty state. That path is instead covered by a dedicated component test
-(`Recommendations.test.tsx`, second test) mocking all four endpoints as empty
-simultaneously, which is the only way to exercise it deterministically without
-altering real subscription data (not this task's call to make).
-
-Screenshots saved to this session's scratchpad
-(`task14-overview.png`, `task14-recommendations.png`) rather than committed -
-verification artifacts, not deliverables, same convention as Task 13.
+Screenshots saved to this session's scratchpad (not committed - verification
+artifacts, same convention as Tasks 13/14): subscription level, resource-group level
+(nise-rg), resource level (the VM, "nise-dev", with correct type/region/group and the
+gap-note callout, no spend chart), and both breadcrumb back-navigation steps.
 
 ## WSL2/dockerd restart monitor - status during this task
 
-No new restarts. Still 18 total RESTART_DETECTED entries (same baseline as Task 13's
-results), same pid=258, start="Sun 2026-09-20 15:41:04 EDT", check_ok continuously
-through this task's completion:
+Baseline at task start (~08:28 EDT): dockerd running continuously since
+`Mon 2026-09-21 08:22:40 EDT`, pid 249, `docker-restart-monitor.timer` active
+(30s interval), no restarts since that start time.
 
-    2026-09-20 21:16:25 EDT check_ok start="Sun 2026-09-20 15:41:04 EDT" pid=258
+Checked again at task end (~08:54 EDT): still the same start time and pid (249),
+continuous `check_ok` entries throughout, e.g.:
+
+    2026-09-21 08:54:17 EDT check_ok start="Mon 2026-09-21 08:22:40 EDT" pid=249
+
+No `RESTART_DETECTED` entries during this task's work window. The log's full history
+has 22 `RESTART_DETECTED` entries total, but the most recent one
+(`2026-09-21 08:22:46 EDT`) predates this task's baseline check - i.e. it's the
+restart that produced the 08:22:40 start time already captured as the baseline, not
+something that happened during this task.
 
 ## Data integrity check
 
-resources=9, utilization_metrics=80, cost_records=237 - unchanged from Task 12/13's
-results. This task made zero backend or database changes - pure frontend, exactly as
-scoped.
+resources=9, utilization_metrics=80, cost_records=237 - unchanged from Task 12/13/14.
+This task's only backend change is a new read endpoint (compute-on-read, no writes);
+confirmed via a direct row-count query against the dev database after finishing all
+other work.
 
 ## Ambiguity flagged, not guessed on
 
-- None requiring a stop this task. The one thing worth naming: the four endpoints'
-  response shapes are meaningfully inconsistent with each other (different field
-  names for the same concept, RI having no resource concept at all) - handled per the
-  task's own explicit guidance to "explain the difference rather than mangling it to
-  look uniform" (echoing Task 12's own framing of the same tension), via four
-  separate normalize functions rather than one that pretends the shapes are the same.
-  Not treated as a backend gap needing a flag-and-stop, since nothing was actually
-  wrong or missing on the backend side this time - just genuinely different data by
-  design, matching what each task (9-12) already documented about why.
+- **The predicted backend gap materialized exactly as the task described**: no
+  `resource_id` filter on `/api/v1/cost` or `/api/v1/forecast`. Handled per the
+  task's own explicit instruction (treat it like Task 13's own backend gap - flag
+  plainly, don't silently extend scope or guess at a fix). Concretely: did not add a
+  `resource_id` filter to the backend (that's "any backend changes beyond the one new
+  inventory-listing endpoint," explicitly out of scope), and did not fake a
+  resource-scoped chart via a `resource_type` filter (would misrepresent multi-
+  resource data as single-resource data). This is the one thing in this task that
+  isn't fully "done" - a future task would need to add resource_id filtering to
+  `/cost`/`/forecast` (and probably promote `name` off of `raw_metadata` at the same
+  time, per the note above) to make the third drill-down level show real scoped
+  spend data.
+- Nothing else rose to a stop-and-ask level. The task-file anomaly (WSL2/dockerd
+  monitor line in the deliverables) was confirmed benign/real by Edson before
+  starting, per the section at the top of this file.
 
 ## Full diff
 
 ```diff
-diff --git a/frontend/package.json b/frontend/package.json
-index f15e673..4b76e03 100644
---- a/frontend/package.json
-+++ b/frontend/package.json
-@@ -18,6 +18,7 @@
-   "devDependencies": {
-     "@testing-library/jest-dom": "^6.6.3",
-     "@testing-library/react": "^16.1.0",
-+    "@testing-library/user-event": "^14.5.2",
-     "@types/react": "^18.3.17",
-     "@types/react-dom": "^18.3.5",
-     "@vitejs/plugin-react": "^4.3.4",
-diff --git a/frontend/src/App.test.tsx b/frontend/src/App.test.tsx
-index 634a85e..0465f92 100644
---- a/frontend/src/App.test.tsx
-+++ b/frontend/src/App.test.tsx
-@@ -1,82 +1,45 @@
+diff --git a/backend/app/api/inventory.py b/backend/app/api/inventory.py
+index eb18337..39cc5d4 100644
+--- a/backend/app/api/inventory.py
++++ b/backend/app/api/inventory.py
+@@ -1,8 +1,11 @@
++from typing import Any
++
+ from fastapi import APIRouter, Depends
+ from sqlalchemy.orm import Session
+
+ from app.db.session import get_db
+ from app.services.azure_inventory import sync_inventory
++from app.services.inventory_listing import build_resource_list
+
+ router = APIRouter(prefix="/api/v1/inventory", tags=["inventory"])
+
+@@ -11,3 +14,11 @@ router = APIRouter(prefix="/api/v1/inventory", tags=["inventory"])
+ def trigger_sync(db: Session = Depends(get_db)) -> dict[str, int]:
+     summary = sync_inventory(db)
+     return {"found": summary.found, "created": summary.created, "updated": summary.updated}
++
++
++@router.get("")
++def get_resources(
++    resource_group: str | None = None,
++    db: Session = Depends(get_db),
++) -> dict[str, Any]:
++    return build_resource_list(db, resource_group=resource_group)
+diff --git a/frontend/src/api/client.ts b/frontend/src/api/client.ts
+index ad9672d..bdae098 100644
+--- a/frontend/src/api/client.ts
++++ b/frontend/src/api/client.ts
+@@ -2,6 +2,7 @@ import type {
+   CostHistoryResponse,
+   ForecastResponse,
+   IdleResourcesResponse,
++  InventoryResponse,
+   NonPeakSchedulingResponse,
+   ReservedInstancesResponse,
+   RightsizingResponse,
+@@ -17,12 +18,30 @@ async function getJson<T>(path: string): Promise<T> {
+   return response.json();
+ }
+
+-export function getForecast(horizonDays: number): Promise<ForecastResponse> {
+-  return getJson(`/api/v1/forecast?horizon_days=${horizonDays}`);
++/** Drill-down scope shared by the cost/forecast/inventory endpoints. */
++export interface DrillScope {
++  resourceGroup?: string;
+ }
+
+-export function getCostHistory(): Promise<CostHistoryResponse> {
+-  return getJson("/api/v1/cost");
++function scopeParams({ resourceGroup }: DrillScope = {}): string {
++  const params = new URLSearchParams();
++  if (resourceGroup) params.set("resource_group", resourceGroup);
++  const qs = params.toString();
++  return qs ? `?${qs}` : "";
++}
++
++export function getForecast(horizonDays: number, scope?: DrillScope): Promise<ForecastResponse> {
++  const params = new URLSearchParams({ horizon_days: String(horizonDays) });
++  if (scope?.resourceGroup) params.set("resource_group", scope.resourceGroup);
++  return getJson(`/api/v1/forecast?${params.toString()}`);
++}
++
++export function getCostHistory(scope?: DrillScope): Promise<CostHistoryResponse> {
++  return getJson(`/api/v1/cost${scopeParams(scope)}`);
++}
++
++export function getResources(scope?: DrillScope): Promise<InventoryResponse> {
++  return getJson(`/api/v1/inventory${scopeParams(scope)}`);
+ }
+
+ export function getRightsizingRecommendations(): Promise<RightsizingResponse> {
+diff --git a/frontend/src/api/types.ts b/frontend/src/api/types.ts
+index f193e19..d9eab6b 100644
+--- a/frontend/src/api/types.ts
++++ b/frontend/src/api/types.ts
+@@ -20,6 +20,19 @@ export interface CostHistoryResponse {
+   series: CostHistoryPoint[];
+ }
+
++export interface ResourceListItem {
++  resource_id: string;
++  external_resource_id: string | null;
++  name: string | null;
++  resource_group: string | null;
++  resource_type: string;
++  region: string | null;
++}
++
++export interface InventoryResponse {
++  resources: ResourceListItem[];
++}
++
+ export interface RightsizingRecommendation {
+   resource_id: string;
+   external_resource_id: string | null;
+diff --git a/frontend/src/pages/Overview.test.tsx b/frontend/src/pages/Overview.test.tsx
+index 29f751f..e6ab9ad 100644
+--- a/frontend/src/pages/Overview.test.tsx
++++ b/frontend/src/pages/Overview.test.tsx
+@@ -1,10 +1,42 @@
  import { render, screen, waitFor } from "@testing-library/react";
- import { afterEach, describe, expect, it, vi } from "vitest";
 +import userEvent from "@testing-library/user-event";
- import App from "./App";
--
--const FORECAST_FRAGMENT = "/api/v1/forecast";
--const COST_FRAGMENT = "/api/v1/cost";
--
--function mockFetchResponses(responses: Record<string, unknown>) {
--  vi.stubGlobal(
--    "fetch",
--    vi.fn((input: RequestInfo | URL) => {
--      const url = typeof input === "string" ? input : input.toString();
--      const matchedKey = Object.keys(responses).find((fragment) => url.includes(fragment));
--      if (!matchedKey) {
--        return Promise.reject(new Error(`Unexpected fetch to ${url}`));
--      }
--      return Promise.resolve({
--        ok: true,
--        json: () => Promise.resolve(responses[matchedKey]),
--      } as Response);
--    }),
--  );
--}
-+import { mockFetchResponses } from "./testUtils";
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ import { mockFetchResponses } from "../testUtils";
+ import { Overview } from "./Overview";
+
+ const FORECAST_FRAGMENT = "/api/v1/forecast";
+ const COST_FRAGMENT = "/api/v1/cost";
++const INVENTORY_FRAGMENT = "/api/v1/inventory";
++
++const EMPTY_FORECAST = { insufficient_data: true, daily_rate: null, horizon_days: 90, rollups: {}, series: [] };
++const EMPTY_COST = { series: [] };
++
++const RG_A_VM = {
++  resource_id: "res-1",
++  external_resource_id: "/subscriptions/x/resourceGroups/rg-a/providers/Microsoft.Compute/virtualMachines/vm-web-01",
++  name: "vm-web-01",
++  resource_group: "rg-a",
++  resource_type: "microsoft.compute/virtualmachines",
++  region: "eastus",
++};
++
++const RG_A_DISK = {
++  resource_id: "res-3",
++  external_resource_id: "/subscriptions/x/resourceGroups/rg-a/providers/Microsoft.Compute/disks/vm-web-01-disk",
++  name: "vm-web-01-disk",
++  resource_group: "rg-a",
++  resource_type: "microsoft.compute/disks",
++  region: "eastus",
++};
++
++const RG_B_STORAGE = {
++  resource_id: "res-2",
++  external_resource_id: "/subscriptions/x/resourceGroups/rg-b/providers/Microsoft.Storage/storageAccounts/stlogs01",
++  name: "stlogs01",
++  resource_group: "rg-b",
++  resource_type: "microsoft.storage/storageaccounts",
++  region: "westus",
++};
 
  afterEach(() => {
    vi.unstubAllGlobals();
- });
+@@ -26,6 +58,7 @@ describe("Overview", () => {
+         rollups: { "7": 105, "90": 1350 },
+         series: [{ date: "2026-09-03", projected_cost: 15 }],
+       },
++      [INVENTORY_FRAGMENT]: { resources: [RG_A_VM, RG_B_STORAGE] },
+     });
 
- describe("App", () => {
--  it("renders the current-spend figure and chart when real data is available", async () => {
-+  it("shows the Overview page by default and switches to Recommendations via the nav", async () => {
+     render(<Overview />);
+@@ -37,14 +70,9 @@ describe("Overview", () => {
+
+   it("renders the empty state when the forecast reports insufficient data", async () => {
      mockFetchResponses({
--      [COST_FRAGMENT]: {
--        series: [
--          { date: "2026-09-01", actual_cost: 10 },
--          { date: "2026-09-02", actual_cost: 20 },
--        ],
-+      "/api/v1/cost": { series: [] },
-+      "/api/v1/forecast": { insufficient_data: true, daily_rate: null, horizon_days: 90, rollups: {}, series: [] },
-+      "/api/v1/recommendations/rightsizing": {
-+        idle_cpu_threshold_percent: 10,
-+        idle_lookback_days: 14,
-+        recommendations: [],
-       },
--      [FORECAST_FRAGMENT]: {
--        insufficient_data: false,
--        daily_rate: 15,
--        horizon_days: 90,
--        rollups: { "7": 105, "90": 1350 },
--        series: [{ date: "2026-09-03", projected_cost: 15 }],
-+      "/api/v1/recommendations/idle-resources": { idle_lookback_days: 14, recommendations: [] },
-+      "/api/v1/recommendations/non-peak-scheduling": {
-+        idle_lookback_days: 14,
-+        off_peak_usage_ratio_threshold: 0.5,
-+        business_hours_definition: "Fixed weekday 09:00-17:00 UTC window.",
-+        recommendations: [],
-       },
--    });
--
--    render(<App />);
--
--    await waitFor(() => expect(screen.getByText("$30.00")).toBeInTheDocument());
--    expect(screen.getByText(/spend trend/i)).toBeInTheDocument();
--    expect(screen.queryByText(/not enough usage history/i)).not.toBeInTheDocument();
--  });
--
--  it("renders the empty state when the forecast reports insufficient data", async () => {
--    mockFetchResponses({
 -      [COST_FRAGMENT]: { series: [] },
 -      [FORECAST_FRAGMENT]: {
 -        insufficient_data: true,
@@ -305,73 +408,132 @@ index 634a85e..0465f92 100644
 -        horizon_days: 90,
 -        rollups: {},
 -        series: [],
-+      "/api/v1/recommendations/reserved-instances": {
-+        source: "Azure Microsoft.Consumption reservationRecommendations API",
-+        field_mapping_note: "Unverified against real populated data.",
-+        recommendations: [],
-       },
++      [COST_FRAGMENT]: EMPTY_COST,
++      [FORECAST_FRAGMENT]: EMPTY_FORECAST,
++      [INVENTORY_FRAGMENT]: { resources: [] },
      });
 
-+    const user = userEvent.setup();
-     render(<App />);
+     render(<Overview />);
+@@ -63,4 +91,73 @@ describe("Overview", () => {
 
--    await waitFor(() => expect(screen.getByText(/not enough usage history/i)).toBeInTheDocument());
--    expect(screen.queryByText(/solid = actual/i)).not.toBeInTheDocument();
--  });
--
--  it("renders an error message when the backend is unreachable", async () => {
--    vi.stubGlobal(
--      "fetch",
--      vi.fn(() => Promise.reject(new Error("network error"))),
--    );
-+    expect(screen.getByRole("heading", { name: "Overview" })).toBeInTheDocument();
-
--    render(<App />);
-+    await user.click(screen.getByRole("button", { name: "Recommendations" }));
-
--    await waitFor(() => expect(screen.getByText(/couldn't reach the backend/i)).toBeInTheDocument());
-+    expect(screen.getByRole("heading", { name: "Recommendations" })).toBeInTheDocument();
-+    await waitFor(() => expect(screen.getByText(/nothing to flag right now/i)).toBeInTheDocument());
+     await waitFor(() => expect(screen.getByText(/couldn't reach the backend/i)).toBeInTheDocument());
    });
++
++  it("lists resource groups derived from the inventory endpoint, with resource counts", async () => {
++    mockFetchResponses({
++      [COST_FRAGMENT]: EMPTY_COST,
++      [FORECAST_FRAGMENT]: EMPTY_FORECAST,
++      [INVENTORY_FRAGMENT]: { resources: [RG_A_VM, RG_A_DISK, RG_B_STORAGE] },
++    });
++
++    render(<Overview />);
++
++    await waitFor(() => expect(screen.getByText("rg-a")).toBeInTheDocument());
++    expect(screen.getByText("rg-b")).toBeInTheDocument();
++    expect(screen.getByText("2 resources")).toBeInTheDocument();
++    expect(screen.getByText("1 resource")).toBeInTheDocument();
++  });
++
++  it("drills from subscription -> resource group -> resource with working breadcrumb navigation", async () => {
++    const user = userEvent.setup();
++    mockFetchResponses({
++      [COST_FRAGMENT]: EMPTY_COST,
++      [FORECAST_FRAGMENT]: EMPTY_FORECAST,
++      // The real /api/v1/inventory endpoint filters by resource_group server-side
++      // (see backend/app/services/inventory_listing.py) - mirror that here so the
++      // resource-group-level fetch only returns rg-a's own resources.
++      [INVENTORY_FRAGMENT]: (url: string) =>
++        url.includes("resource_group=rg-a") ? { resources: [RG_A_VM] } : { resources: [RG_A_VM, RG_B_STORAGE] },
++    });
++
++    render(<Overview />);
++
++    await waitFor(() => expect(screen.getByText("rg-a")).toBeInTheDocument());
++    await user.click(screen.getByText("rg-a"));
++
++    // Resource-group level: breadcrumb shows the group, resource list is scoped to it.
++    await waitFor(() => expect(screen.getByText(/resources in rg-a/i)).toBeInTheDocument());
++    expect(screen.getByText("vm-web-01")).toBeInTheDocument();
++    expect(screen.queryByText("stlogs01")).not.toBeInTheDocument();
++
++    await user.click(screen.getByText("vm-web-01"));
++
++    // Resource level: identity detail + explicit gap note, no fabricated scoped chart.
++    await waitFor(() => expect(screen.getByText("microsoft.compute/virtualmachines")).toBeInTheDocument());
++    expect(screen.getByText(/per-resource spend and forecast aren't wired up yet/i)).toBeInTheDocument();
++    expect(screen.queryByText(/spend trend/i)).not.toBeInTheDocument();
++
++    // Breadcrumb back-navigation: rg-a -> Overview.
++    await user.click(screen.getByRole("button", { name: "rg-a" }));
++    await waitFor(() => expect(screen.getByText(/resources in rg-a/i)).toBeInTheDocument());
++
++    await user.click(screen.getByRole("button", { name: "Overview" }));
++    await waitFor(() => expect(screen.getByText("rg-a")).toBeInTheDocument());
++    expect(screen.getByText("rg-b")).toBeInTheDocument();
++  });
++
++  it("shows a scoped empty state when a resource group has no cost history", async () => {
++    const user = userEvent.setup();
++    mockFetchResponses({
++      [COST_FRAGMENT]: EMPTY_COST,
++      [FORECAST_FRAGMENT]: EMPTY_FORECAST,
++      [INVENTORY_FRAGMENT]: { resources: [RG_A_VM] },
++    });
++
++    render(<Overview />);
++
++    await waitFor(() => expect(screen.getByText("rg-a")).toBeInTheDocument());
++    await user.click(screen.getByText("rg-a"));
++
++    await waitFor(() => expect(screen.getByText(/resource group "rg-a" hasn't synced/i)).toBeInTheDocument());
++  });
  });
-diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
-index 032cd16..210d21d 100644
---- a/frontend/src/App.tsx
-+++ b/frontend/src/App.tsx
-@@ -1,86 +1,40 @@
--import { useEffect, useState } from "react";
--import { getCostHistory, getForecast } from "./api/client";
--import type { CostHistoryResponse, ForecastResponse } from "./api/types";
--import { EmptyState } from "./components/EmptyState";
--import { SpendChart } from "./components/SpendChart";
--import { combineSpendSeries } from "./lib/combineSpendSeries";
--import { formatCurrency } from "./lib/formatCurrency";
-+import { useState } from "react";
-+import { Overview } from "./pages/Overview";
-+import { Recommendations } from "./pages/Recommendations";
+diff --git a/frontend/src/pages/Overview.tsx b/frontend/src/pages/Overview.tsx
+index 254836d..35e5945 100644
+--- a/frontend/src/pages/Overview.tsx
++++ b/frontend/src/pages/Overview.tsx
+@@ -1,79 +1,138 @@
+ import { useEffect, useState } from "react";
+-import { getCostHistory, getForecast } from "../api/client";
+-import type { CostHistoryResponse, ForecastResponse } from "../api/types";
+-import { EmptyState } from "../components/EmptyState";
+-import { SpendChart } from "../components/SpendChart";
+-import { combineSpendSeries } from "../lib/combineSpendSeries";
+-import { formatCurrency } from "../lib/formatCurrency";
++import { getResources } from "../api/client";
++import type { ResourceListItem } from "../api/types";
++import { Breadcrumb, type BreadcrumbSegment } from "../components/Breadcrumb";
++import { DrillList } from "../components/DrillList";
++import { SpendPanel } from "../components/SpendPanel";
++import { resourceLabel, summarizeResourceGroups } from "../lib/groupResources";
 
 -const FORECAST_HORIZON_DAYS = 90;
 -const TRAILING_SPEND_DAYS = 30;
-+type Page = "overview" | "recommendations";
++type DrillPath =
++  | { level: "subscription" }
++  | { level: "resource-group"; resourceGroup: string }
++  | { level: "resource"; resourceGroup: string; resource: ResourceListItem };
 
 -type LoadState =
--  | { status: "loading" }
--  | { status: "error" }
++type ResourceListState =
+   | { status: "loading" }
+   | { status: "error" }
 -  | { status: "empty" }
 -  | { status: "ready"; history: CostHistoryResponse; forecast: ForecastResponse };
 -
 -function sumTrailingActual(history: CostHistoryResponse, days: number): number {
 -  return history.series.slice(-days).reduce((total, point) => total + point.actual_cost, 0);
 -}
-+const NAV_ITEMS: { key: Page; label: string }[] = [
-+  { key: "overview", label: "Overview" },
-+  { key: "recommendations", label: "Recommendations" },
-+];
++  | { status: "ready"; resources: ResourceListItem[] };
 
- function App() {
+ export function Overview() {
 -  const [state, setState] = useState<LoadState>({ status: "loading" });
--
--  useEffect(() => {
++  const [path, setPath] = useState<DrillPath>({ level: "subscription" });
++  const [resourceList, setResourceList] = useState<ResourceListState>({ status: "loading" });
++
++  const resourceGroupFilter = path.level !== "subscription" ? path.resourceGroup : undefined;
+
+   useEffect(() => {
 -    Promise.all([getCostHistory(), getForecast(FORECAST_HORIZON_DAYS)])
 -      .then(([history, forecast]) => {
 -        // Both endpoints derive from the same underlying daily-cost query for
@@ -385,995 +547,585 @@ index 032cd16..210d21d 100644
 -      })
 -      .catch(() => setState({ status: "error" }));
 -  }, []);
-+  const [page, setPage] = useState<Page>("overview");
++    // Resource level has nothing further to list - the selected resource is
++    // already known from the click that navigated here, so skip the fetch.
++    if (path.level === "resource") return;
++
++    setResourceList({ status: "loading" });
++    getResources(resourceGroupFilter ? { resourceGroup: resourceGroupFilter } : undefined)
++      .then((response) => setResourceList({ status: "ready", resources: response.resources }))
++      .catch(() => setResourceList({ status: "error" }));
++  }, [path.level, resourceGroupFilter]);
++
++  const breadcrumbSegments: BreadcrumbSegment[] = [
++    {
++      label: "Overview",
++      onClick: path.level !== "subscription" ? () => setPath({ level: "subscription" }) : undefined,
++    },
++  ];
++  if (path.level === "resource-group" || path.level === "resource") {
++    breadcrumbSegments.push({
++      label: path.resourceGroup,
++      onClick:
++        path.level === "resource" ? () => setPath({ level: "resource-group", resourceGroup: path.resourceGroup }) : undefined,
++    });
++  }
++  if (path.level === "resource") {
++    breadcrumbSegments.push({ label: resourceLabel(path.resource) });
++  }
 
    return (
-     <div className="min-h-screen bg-stone-50 text-stone-900">
-       <div className="mx-auto max-w-4xl px-6 py-12">
-         <header className="mb-8">
-           <p className="text-sm font-medium text-brand">FinOps Platform</p>
--          <h1 className="text-2xl font-semibold">Overview</h1>
-+          <nav className="mt-2 flex gap-1">
-+            {NAV_ITEMS.map((item) => (
-+              <button
-+                key={item.key}
-+                type="button"
-+                onClick={() => setPage(item.key)}
-+                className={
-+                  "rounded-lg px-3 py-1.5 text-sm font-medium transition-colors " +
-+                  (page === item.key ? "bg-brand text-white" : "text-stone-600 hover:bg-stone-100")
-+                }
-+              >
-+                {item.label}
-+              </button>
-+            ))}
-+          </nav>
-         </header>
+     <div>
+-      <h1 className="mb-8 text-2xl font-semibold">Overview</h1>
+-
+-      {state.status === "loading" && <p className="text-stone-500">Loading spend data…</p>}
++      <h1 className="mb-2 text-2xl font-semibold">Overview</h1>
++      <Breadcrumb segments={breadcrumbSegments} />
 
--        {state.status === "loading" && <p className="text-stone-500">Loading spend data…</p>}
--
--        {state.status === "error" && (
--          <div className="rounded-xl bg-red-50 px-6 py-8 text-red-800">
--            Couldn't reach the backend. Check that the API is running and try again.
--          </div>
--        )}
--
--        {state.status === "empty" && <EmptyState />}
--
--        {state.status === "ready" && (
--          <div className="space-y-6">
--            <div className="rounded-xl bg-white p-6 shadow-sm">
--              <p className="text-sm text-stone-500">
--                Spend, last {Math.min(TRAILING_SPEND_DAYS, state.history.series.length)} days
--              </p>
--              <p className="mt-1 font-mono text-4xl font-semibold tabular-nums text-brand-dark">
--                {formatCurrency(sumTrailingActual(state.history, TRAILING_SPEND_DAYS))}
--              </p>
--            </div>
--
--            <div className="rounded-xl bg-white p-6 shadow-sm">
--              <div className="mb-4 flex items-baseline justify-between">
--                <h2 className="text-sm font-medium text-stone-700">
--                  Spend trend &amp; {FORECAST_HORIZON_DAYS}-day forecast
--                </h2>
--                <span className="text-xs text-stone-400">Solid = actual · Dashed = projected</span>
--              </div>
--              <SpendChart data={combineSpendSeries(state.history.series, state.forecast.series)} />
--              <p className="mt-3 text-xs text-stone-400">
--                Projection is a simple linear burn-rate estimate based on recent daily spend — not a
--                precise prediction.
--              </p>
--            </div>
--          </div>
--        )}
-+        {page === "overview" ? <Overview /> : <Recommendations />}
-       </div>
-     </div>
-   );
-diff --git a/frontend/src/api/client.ts b/frontend/src/api/client.ts
-index 1c7fb00..ad9672d 100644
---- a/frontend/src/api/client.ts
-+++ b/frontend/src/api/client.ts
-@@ -1,4 +1,11 @@
--import type { CostHistoryResponse, ForecastResponse } from "./types";
-+import type {
-+  CostHistoryResponse,
-+  ForecastResponse,
-+  IdleResourcesResponse,
-+  NonPeakSchedulingResponse,
-+  ReservedInstancesResponse,
-+  RightsizingResponse,
-+} from "./types";
+-      {state.status === "error" && (
+-        <div className="rounded-xl bg-red-50 px-6 py-8 text-red-800">
+-          Couldn't reach the backend. Check that the API is running and try again.
++      {path.level !== "resource" && (
++        <div className="mb-6">
++          <SpendPanel
++            resourceGroup={resourceGroupFilter}
++            emptyStateDescription={
++              path.level === "resource-group"
++                ? `Resource group "${path.resourceGroup}" hasn't synced enough days of cost data to show a spend trend or forecast yet.`
++                : undefined
++            }
++          />
+         </div>
+       )}
 
- const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
-
-@@ -17,3 +24,19 @@ export function getForecast(horizonDays: number): Promise<ForecastResponse> {
- export function getCostHistory(): Promise<CostHistoryResponse> {
-   return getJson("/api/v1/cost");
- }
-+
-+export function getRightsizingRecommendations(): Promise<RightsizingResponse> {
-+  return getJson("/api/v1/recommendations/rightsizing");
-+}
-+
-+export function getIdleResourceRecommendations(): Promise<IdleResourcesResponse> {
-+  return getJson("/api/v1/recommendations/idle-resources");
-+}
-+
-+export function getNonPeakSchedulingRecommendations(): Promise<NonPeakSchedulingResponse> {
-+  return getJson("/api/v1/recommendations/non-peak-scheduling");
-+}
-+
-+export function getReservedInstanceRecommendations(): Promise<ReservedInstancesResponse> {
-+  return getJson("/api/v1/recommendations/reserved-instances");
-+}
-diff --git a/frontend/src/api/types.ts b/frontend/src/api/types.ts
-index 88d13a3..f193e19 100644
---- a/frontend/src/api/types.ts
-+++ b/frontend/src/api/types.ts
-@@ -19,3 +19,95 @@ export interface CostHistoryPoint {
- export interface CostHistoryResponse {
-   series: CostHistoryPoint[];
- }
-+
-+export interface RightsizingRecommendation {
-+  resource_id: string;
-+  external_resource_id: string | null;
-+  resource_type: string;
-+  resource_group: string | null;
-+  region: string | null;
-+  current_sku: string | null;
-+  suggested_sku: string | null;
-+  suggestion_note: string;
-+  avg_cpu_percent: number;
-+  lookback_days: number;
-+  estimated_monthly_savings: number | null;
-+  savings_note: string;
-+}
-+
-+export interface RightsizingResponse {
-+  idle_cpu_threshold_percent: number;
-+  idle_lookback_days: number;
-+  recommendations: RightsizingRecommendation[];
-+}
-+
-+export interface IdleResourceRecommendation {
-+  resource_id: string;
-+  external_resource_id: string | null;
-+  resource_type: string;
-+  resource_group: string | null;
-+  region: string | null;
-+  reason: string;
-+  detail: string;
-+  estimated_monthly_waste: number | null;
-+  waste_note: string;
-+}
-+
-+export interface IdleResourcesResponse {
-+  idle_lookback_days: number;
-+  recommendations: IdleResourceRecommendation[];
-+}
-+
-+export interface NonPeakSignal {
-+  matched: boolean;
-+  detail: string;
-+}
-+
-+export interface NonPeakUsageSignal extends NonPeakSignal {
-+  peak_avg_cpu_percent: number | null;
-+  off_peak_avg_cpu_percent: number | null;
-+}
-+
-+export interface NonPeakSchedulingRecommendation {
-+  resource_id: string;
-+  external_resource_id: string | null;
-+  resource_type: string;
-+  resource_group: string | null;
-+  region: string | null;
-+  signals: {
-+    tag: NonPeakSignal;
-+    naming: NonPeakSignal;
-+    usage_pattern: NonPeakUsageSignal;
-+  };
-+  recommended_schedule: string;
-+  estimated_monthly_savings: number | null;
-+  savings_note: string;
-+}
-+
-+export interface NonPeakSchedulingResponse {
-+  idle_lookback_days: number;
-+  off_peak_usage_ratio_threshold: number;
-+  business_hours_definition: string;
-+  recommendations: NonPeakSchedulingRecommendation[];
-+}
-+
-+export interface ReservedInstanceRecommendation {
-+  id: string | null;
-+  sku: string | null;
-+  location: string | null;
-+  resource_type: string | null;
-+  scope: string | null;
-+  term: string | null;
-+  look_back_period: string | null;
-+  recommended_quantity: number | null;
-+  cost_with_no_reserved_instances: number | null;
-+  total_cost_with_reserved_instances: number | null;
-+  estimated_monthly_savings: number | null;
-+  currency: string | null;
-+}
-+
-+export interface ReservedInstancesResponse {
-+  source: string;
-+  field_mapping_note: string;
-+  recommendations: ReservedInstanceRecommendation[];
-+}
-diff --git a/frontend/src/components/EmptyState.tsx b/frontend/src/components/EmptyState.tsx
-index 923b1fe..f11200a 100644
---- a/frontend/src/components/EmptyState.tsx
-+++ b/frontend/src/components/EmptyState.tsx
-@@ -1,11 +1,16 @@
--export function EmptyState() {
-+interface EmptyStateProps {
-+  title?: string;
-+  description?: string;
-+}
-+
-+export function EmptyState({
-+  title = "Not enough usage history yet",
-+  description = "This subscription hasn't synced enough days of cost data to show a spend trend or forecast. Check back once more usage history has come in.",
-+}: EmptyStateProps) {
-   return (
-     <div className="flex flex-col items-center gap-3 rounded-xl bg-brand-light px-8 py-16 text-center">
--      <p className="text-lg font-medium text-brand-dark">Not enough usage history yet</p>
--      <p className="max-w-sm text-sm text-brand-darker">
--        This subscription hasn't synced enough days of cost data to show a spend trend or
--        forecast. Check back once more usage history has come in.
--      </p>
-+      <p className="text-lg font-medium text-brand-dark">{title}</p>
-+      <p className="max-w-sm text-sm text-brand-darker">{description}</p>
-     </div>
-   );
- }
-diff --git a/frontend/src/components/RecommendationCard.tsx b/frontend/src/components/RecommendationCard.tsx
-new file mode 100644
-index 0000000..fca065d
---- /dev/null
-+++ b/frontend/src/components/RecommendationCard.tsx
-@@ -0,0 +1,26 @@
-+import type { RecommendationItem } from "../lib/normalizeRecommendations";
-+import { formatCurrency } from "../lib/formatCurrency";
-+
-+export function RecommendationCard({ item }: { item: RecommendationItem }) {
-+  return (
-+    <div className="rounded-xl bg-brand-light p-4">
-+      <div className="flex items-start justify-between gap-4">
-+        <div>
-+          <p className="text-sm font-medium text-brand-dark">{item.title}</p>
-+          <p className="mt-1 text-sm text-brand-darker">{item.reason}</p>
-+        </div>
-+        <div className="shrink-0 text-right">
-+          {item.estimatedMonthlyImpact != null ? (
-+            <p className="font-mono text-lg font-semibold tabular-nums text-brand-dark">
-+              {formatCurrency(item.estimatedMonthlyImpact)}
-+              <span className="ml-1 text-xs font-normal text-brand-darker">/mo</span>
-+            </p>
-+          ) : (
-+            <p className="text-xs text-brand-darker">Savings not available</p>
-+          )}
-+        </div>
-+      </div>
-+      <p className="mt-2 text-xs text-brand-darker">{item.impactNote}</p>
-+    </div>
-+  );
-+}
-diff --git a/frontend/src/lib/normalizeRecommendations.test.ts b/frontend/src/lib/normalizeRecommendations.test.ts
-new file mode 100644
-index 0000000..ae76e4a
---- /dev/null
-+++ b/frontend/src/lib/normalizeRecommendations.test.ts
-@@ -0,0 +1,179 @@
-+import { describe, expect, it } from "vitest";
-+import {
-+  normalizeIdleResources,
-+  normalizeNonPeakScheduling,
-+  normalizeReservedInstances,
-+  normalizeRightsizing,
-+} from "./normalizeRecommendations";
-+
-+describe("normalizeRightsizing", () => {
-+  it("builds a reason from the suggested SKU and CPU evidence", () => {
-+    const [item] = normalizeRightsizing({
-+      idle_cpu_threshold_percent: 10,
-+      idle_lookback_days: 14,
-+      recommendations: [
-+        {
-+          resource_id: "r1",
-+          external_resource_id: "/subscriptions/.../vm-1",
-+          resource_type: "microsoft.compute/virtualmachines",
-+          resource_group: "rg-a",
-+          region: "eastus",
-+          current_sku: "Standard_D4s_v3",
-+          suggested_sku: "Standard_D2s_v3",
-+          suggestion_note: "Halved core count within the same series.",
-+          avg_cpu_percent: 3.2,
-+          lookback_days: 14,
-+          estimated_monthly_savings: 45.5,
-+          savings_note: "Approximate, not a billing quote.",
-+        },
-+      ],
-+    });
-+
-+    expect(item.title).toBe("vm-1");
-+    expect(item.reason).toBe("Standard_D4s_v3 → Standard_D2s_v3 (avg CPU 3.2% over 14d)");
-+    expect(item.estimatedMonthlyImpact).toBe(45.5);
-+  });
-+
-+  it("falls back to the suggestion note when there's no specific suggested SKU", () => {
-+    const [item] = normalizeRightsizing({
-+      idle_cpu_threshold_percent: 10,
-+      idle_lookback_days: 14,
-+      recommendations: [
-+        {
-+          resource_id: "r2",
-+          external_resource_id: null,
-+          resource_type: "microsoft.web/sites",
-+          resource_group: null,
-+          region: null,
-+          current_sku: "P1v2",
-+          suggested_sku: null,
-+          suggestion_note: "Already the smallest tier - no specific suggestion.",
-+          avg_cpu_percent: 1.0,
-+          lookback_days: 14,
-+          estimated_monthly_savings: null,
-+          savings_note: "No specific suggested size to compare against; savings can't be estimated.",
-+        },
-+      ],
-+    });
-+
-+    expect(item.title).toBe("r2");
-+    expect(item.reason).toBe("Idle at 1% avg CPU over 14d - Already the smallest tier - no specific suggestion.");
-+    expect(item.estimatedMonthlyImpact).toBeNull();
-+  });
-+});
-+
-+describe("normalizeIdleResources", () => {
-+  it("turns the reason slug and detail into a readable sentence", () => {
-+    const [item] = normalizeIdleResources({
-+      idle_lookback_days: 14,
-+      recommendations: [
-+        {
-+          resource_id: "r3",
-+          external_resource_id: "/subscriptions/.../disk-1",
-+          resource_type: "microsoft.compute/disks",
-+          resource_group: "rg-a",
-+          region: "eastus",
-+          reason: "unattached_disk",
-+          detail: "diskState is Unattached",
-+          estimated_monthly_waste: 12.0,
-+          waste_note: "Approximate, not a billing quote.",
-+        },
-+      ],
-+    });
-+
-+    expect(item.reason).toBe("unattached disk - diskState is Unattached");
-+    expect(item.estimatedMonthlyImpact).toBe(12.0);
-+  });
-+});
-+
-+describe("normalizeNonPeakScheduling", () => {
-+  it("joins every matched signal's detail into the reason", () => {
-+    const [item] = normalizeNonPeakScheduling({
-+      idle_lookback_days: 14,
-+      off_peak_usage_ratio_threshold: 0.5,
-+      business_hours_definition: "Fixed weekday 09:00-17:00 UTC window.",
-+      recommendations: [
-+        {
-+          resource_id: "r4",
-+          external_resource_id: "/subscriptions/.../vm-dev",
-+          resource_type: "microsoft.compute/virtualmachines",
-+          resource_group: "nise-rg",
-+          region: "eastus",
-+          signals: {
-+            tag: { matched: false, detail: "no environment-indicating tag found" },
-+            naming: { matched: true, detail: "resource name contains 'dev'" },
-+            usage_pattern: {
-+              matched: false,
-+              detail: "Only 3 day(s) of history against a 14-day window.",
-+              peak_avg_cpu_percent: null,
-+              off_peak_avg_cpu_percent: null,
-+            },
-+          },
-+          recommended_schedule: "Standard template.",
-+          estimated_monthly_savings: 6.93,
-+          savings_note: "Approximate, not a billing quote.",
-+        },
-+      ],
-+    });
-+
-+    expect(item.reason).toBe("resource name contains 'dev'");
-+    expect(item.estimatedMonthlyImpact).toBe(6.93);
-+  });
-+});
-+
-+describe("normalizeReservedInstances", () => {
-+  it("builds a title from SKU + location and a reason from quantity/term/scope", () => {
-+    const [item] = normalizeReservedInstances({
-+      source: "Azure Microsoft.Consumption reservationRecommendations API",
-+      field_mapping_note: "Unverified against real populated data.",
-+      recommendations: [
-+        {
-+          id: "/subscriptions/.../reservationRecommendations/abc123",
-+          sku: "Standard_D2s_v3",
-+          location: "eastus",
-+          resource_type: "VirtualMachines",
-+          scope: "Single",
-+          term: "P1Y",
-+          look_back_period: "Last30Days",
-+          recommended_quantity: 2,
-+          cost_with_no_reserved_instances: 500,
-+          total_cost_with_reserved_instances: 320,
-+          estimated_monthly_savings: 180,
-+          currency: "USD",
-+        },
-+      ],
-+    });
-+
-+    expect(item.title).toBe("Standard_D2s_v3 · eastus");
-+    expect(item.reason).toBe("Reserve 2 instance(s), P1Y term, Single scope");
-+    expect(item.estimatedMonthlyImpact).toBe(180);
-+    expect(item.impactNote).toBe("Unverified against real populated data.");
-+  });
-+
-+  it("falls back to a generated id and generic title when the API item has none", () => {
-+    const [item] = normalizeReservedInstances({
-+      source: "Azure Microsoft.Consumption reservationRecommendations API",
-+      field_mapping_note: "Unverified against real populated data.",
-+      recommendations: [
-+        {
-+          id: null,
-+          sku: null,
-+          location: null,
-+          resource_type: null,
-+          scope: null,
-+          term: null,
-+          look_back_period: null,
-+          recommended_quantity: null,
-+          cost_with_no_reserved_instances: null,
-+          total_cost_with_reserved_instances: null,
-+          estimated_monthly_savings: null,
-+          currency: null,
-+        },
-+      ],
-+    });
-+
-+    expect(item.id).toBe("reserved-instance-0");
-+    expect(item.title).toBe("Reservation recommendation");
-+    expect(item.reason).toBe("");
-+  });
-+});
-diff --git a/frontend/src/lib/normalizeRecommendations.ts b/frontend/src/lib/normalizeRecommendations.ts
-new file mode 100644
-index 0000000..b14a602
---- /dev/null
-+++ b/frontend/src/lib/normalizeRecommendations.ts
-@@ -0,0 +1,103 @@
-+import type {
-+  IdleResourcesResponse,
-+  NonPeakSchedulingRecommendation,
-+  NonPeakSchedulingResponse,
-+  ReservedInstancesResponse,
-+  RightsizingResponse,
-+} from "../api/types";
-+
-+export type RecommendationCategory =
-+  | "rightsizing"
-+  | "idle-resources"
-+  | "non-peak-scheduling"
-+  | "reserved-instances";
-+
-+export const CATEGORY_LABELS: Record<RecommendationCategory, string> = {
-+  rightsizing: "Rightsizing",
-+  "idle-resources": "Idle & Orphaned Resources",
-+  "non-peak-scheduling": "Non-Peak Scheduling",
-+  "reserved-instances": "Reserved Instances / Savings Plans",
-+};
-+
-+export interface RecommendationItem {
-+  id: string;
-+  category: RecommendationCategory;
-+  title: string;
-+  reason: string;
-+  estimatedMonthlyImpact: number | null;
-+  impactNote: string;
-+}
-+
-+// ARM resource IDs (e.g. /subscriptions/.../resourceGroups/rg/providers/.../vm-1)
-+// are unique but not remotely readable as a title - the resource's own name is
-+// always the last path segment.
-+function resourceDisplayName(externalResourceId: string | null, fallbackId: string): string {
-+  if (!externalResourceId) return fallbackId;
-+  const segments = externalResourceId.split("/").filter(Boolean);
-+  return segments[segments.length - 1] || fallbackId;
-+}
-+
-+export function normalizeRightsizing(response: RightsizingResponse): RecommendationItem[] {
-+  return response.recommendations.map((r) => ({
-+    id: r.resource_id,
-+    category: "rightsizing",
-+    title: resourceDisplayName(r.external_resource_id, r.resource_id),
-+    reason: r.suggested_sku
-+      ? `${r.current_sku ?? "current SKU"} → ${r.suggested_sku} (avg CPU ${r.avg_cpu_percent}% over ${r.lookback_days}d)`
-+      : `Idle at ${r.avg_cpu_percent}% avg CPU over ${r.lookback_days}d - ${r.suggestion_note}`,
-+    estimatedMonthlyImpact: r.estimated_monthly_savings,
-+    impactNote: r.savings_note,
-+  }));
-+}
-+
-+export function normalizeIdleResources(response: IdleResourcesResponse): RecommendationItem[] {
-+  return response.recommendations.map((r) => ({
-+    id: r.resource_id,
-+    category: "idle-resources",
-+    title: resourceDisplayName(r.external_resource_id, r.resource_id),
-+    reason: `${r.reason.replace(/_/g, " ")} - ${r.detail}`,
-+    estimatedMonthlyImpact: r.estimated_monthly_waste,
-+    impactNote: r.waste_note,
-+  }));
-+}
-+
-+function matchedSignalSummary(signals: NonPeakSchedulingRecommendation["signals"]): string {
-+  const matched = [
-+    signals.tag.matched ? signals.tag.detail : null,
-+    signals.naming.matched ? signals.naming.detail : null,
-+    signals.usage_pattern.matched ? signals.usage_pattern.detail : null,
-+  ].filter((detail): detail is string => detail !== null);
-+
-+  // The backend only includes a resource here when at least one signal
-+  // matched (tag OR name OR usage pattern), so this fallback shouldn't be
-+  // reachable in practice - kept as a safe default rather than assuming.
-+  return matched.length > 0 ? matched.join("; ") : "flagged by a non-peak-scheduling signal";
-+}
-+
-+export function normalizeNonPeakScheduling(response: NonPeakSchedulingResponse): RecommendationItem[] {
-+  return response.recommendations.map((r) => ({
-+    id: r.resource_id,
-+    category: "non-peak-scheduling",
-+    title: resourceDisplayName(r.external_resource_id, r.resource_id),
-+    reason: matchedSignalSummary(r.signals),
-+    estimatedMonthlyImpact: r.estimated_monthly_savings,
-+    impactNote: r.savings_note,
-+  }));
-+}
-+
-+export function normalizeReservedInstances(response: ReservedInstancesResponse): RecommendationItem[] {
-+  return response.recommendations.map((r, index) => ({
-+    id: r.id ?? `reserved-instance-${index}`,
-+    category: "reserved-instances",
-+    title: [r.sku, r.location].filter(Boolean).join(" · ") || "Reservation recommendation",
-+    reason: [
-+      r.recommended_quantity != null ? `Reserve ${r.recommended_quantity} instance(s)` : null,
-+      r.term ? `${r.term} term` : null,
-+      r.scope ? `${r.scope} scope` : null,
-+    ]
-+      .filter((part): part is string => part !== null)
-+      .join(", "),
-+    estimatedMonthlyImpact: r.estimated_monthly_savings,
-+    impactNote: response.field_mapping_note,
-+  }));
-+}
-diff --git a/frontend/src/pages/Overview.test.tsx b/frontend/src/pages/Overview.test.tsx
-new file mode 100644
-index 0000000..29f751f
---- /dev/null
-+++ b/frontend/src/pages/Overview.test.tsx
-@@ -0,0 +1,66 @@
-+import { render, screen, waitFor } from "@testing-library/react";
-+import { afterEach, describe, expect, it, vi } from "vitest";
-+import { mockFetchResponses } from "../testUtils";
-+import { Overview } from "./Overview";
-+
-+const FORECAST_FRAGMENT = "/api/v1/forecast";
-+const COST_FRAGMENT = "/api/v1/cost";
-+
-+afterEach(() => {
-+  vi.unstubAllGlobals();
-+});
-+
-+describe("Overview", () => {
-+  it("renders the current-spend figure and chart when real data is available", async () => {
-+    mockFetchResponses({
-+      [COST_FRAGMENT]: {
-+        series: [
-+          { date: "2026-09-01", actual_cost: 10 },
-+          { date: "2026-09-02", actual_cost: 20 },
-+        ],
-+      },
-+      [FORECAST_FRAGMENT]: {
-+        insufficient_data: false,
-+        daily_rate: 15,
-+        horizon_days: 90,
-+        rollups: { "7": 105, "90": 1350 },
-+        series: [{ date: "2026-09-03", projected_cost: 15 }],
-+      },
-+    });
-+
-+    render(<Overview />);
-+
-+    await waitFor(() => expect(screen.getByText("$30.00")).toBeInTheDocument());
-+    expect(screen.getByText(/spend trend/i)).toBeInTheDocument();
-+    expect(screen.queryByText(/not enough usage history/i)).not.toBeInTheDocument();
-+  });
-+
-+  it("renders the empty state when the forecast reports insufficient data", async () => {
-+    mockFetchResponses({
-+      [COST_FRAGMENT]: { series: [] },
-+      [FORECAST_FRAGMENT]: {
-+        insufficient_data: true,
-+        daily_rate: null,
-+        horizon_days: 90,
-+        rollups: {},
-+        series: [],
-+      },
-+    });
-+
-+    render(<Overview />);
-+
-+    await waitFor(() => expect(screen.getByText(/not enough usage history/i)).toBeInTheDocument());
-+    expect(screen.queryByText(/solid = actual/i)).not.toBeInTheDocument();
-+  });
-+
-+  it("renders an error message when the backend is unreachable", async () => {
-+    vi.stubGlobal(
-+      "fetch",
-+      vi.fn(() => Promise.reject(new Error("network error"))),
-+    );
-+
-+    render(<Overview />);
-+
-+    await waitFor(() => expect(screen.getByText(/couldn't reach the backend/i)).toBeInTheDocument());
-+  });
-+});
-diff --git a/frontend/src/pages/Overview.tsx b/frontend/src/pages/Overview.tsx
-new file mode 100644
-index 0000000..254836d
---- /dev/null
-+++ b/frontend/src/pages/Overview.tsx
-@@ -0,0 +1,82 @@
-+import { useEffect, useState } from "react";
-+import { getCostHistory, getForecast } from "../api/client";
-+import type { CostHistoryResponse, ForecastResponse } from "../api/types";
-+import { EmptyState } from "../components/EmptyState";
-+import { SpendChart } from "../components/SpendChart";
-+import { combineSpendSeries } from "../lib/combineSpendSeries";
-+import { formatCurrency } from "../lib/formatCurrency";
-+
-+const FORECAST_HORIZON_DAYS = 90;
-+const TRAILING_SPEND_DAYS = 30;
-+
-+type LoadState =
-+  | { status: "loading" }
-+  | { status: "error" }
-+  | { status: "empty" }
-+  | { status: "ready"; history: CostHistoryResponse; forecast: ForecastResponse };
-+
-+function sumTrailingActual(history: CostHistoryResponse, days: number): number {
-+  return history.series.slice(-days).reduce((total, point) => total + point.actual_cost, 0);
-+}
-+
-+export function Overview() {
-+  const [state, setState] = useState<LoadState>({ status: "loading" });
-+
-+  useEffect(() => {
-+    Promise.all([getCostHistory(), getForecast(FORECAST_HORIZON_DAYS)])
-+      .then(([history, forecast]) => {
-+        // Both endpoints derive from the same underlying daily-cost query for
-+        // the unfiltered aggregate case, so forecast.insufficient_data alone
-+        // is a reliable signal that there's no history to show either.
-+        if (forecast.insufficient_data) {
-+          setState({ status: "empty" });
-+          return;
-+        }
-+        setState({ status: "ready", history, forecast });
-+      })
-+      .catch(() => setState({ status: "error" }));
-+  }, []);
-+
-+  return (
-+    <div>
-+      <h1 className="mb-8 text-2xl font-semibold">Overview</h1>
-+
-+      {state.status === "loading" && <p className="text-stone-500">Loading spend data…</p>}
-+
-+      {state.status === "error" && (
-+        <div className="rounded-xl bg-red-50 px-6 py-8 text-red-800">
-+          Couldn't reach the backend. Check that the API is running and try again.
-+        </div>
-+      )}
-+
-+      {state.status === "empty" && <EmptyState />}
-+
-+      {state.status === "ready" && (
-+        <div className="space-y-6">
-+          <div className="rounded-xl bg-white p-6 shadow-sm">
-+            <p className="text-sm text-stone-500">
-+              Spend, last {Math.min(TRAILING_SPEND_DAYS, state.history.series.length)} days
-+            </p>
-+            <p className="mt-1 font-mono text-4xl font-semibold tabular-nums text-brand-dark">
-+              {formatCurrency(sumTrailingActual(state.history, TRAILING_SPEND_DAYS))}
-+            </p>
-+          </div>
-+
-+          <div className="rounded-xl bg-white p-6 shadow-sm">
-+            <div className="mb-4 flex items-baseline justify-between">
-+              <h2 className="text-sm font-medium text-stone-700">
-+                Spend trend &amp; {FORECAST_HORIZON_DAYS}-day forecast
-+              </h2>
-+              <span className="text-xs text-stone-400">Solid = actual · Dashed = projected</span>
+-      {state.status === "empty" && <EmptyState />}
++      {path.level === "subscription" && (
++        <>
++          {resourceList.status === "loading" && <p className="text-stone-500">Loading resource groups…</p>}
++          {resourceList.status === "error" && (
++            <div className="rounded-xl bg-red-50 px-4 py-3 text-sm text-red-800">
++              Couldn't load resource groups. Try refreshing.
 +            </div>
-+            <SpendChart data={combineSpendSeries(state.history.series, state.forecast.series)} />
-+            <p className="mt-3 text-xs text-stone-400">
-+              Projection is a simple linear burn-rate estimate based on recent daily spend — not a
-+              precise prediction.
-+            </p>
-+          </div>
-+        </div>
-+      )}
-+    </div>
-+  );
-+}
-diff --git a/frontend/src/pages/Recommendations.test.tsx b/frontend/src/pages/Recommendations.test.tsx
-new file mode 100644
-index 0000000..5ea09fd
---- /dev/null
-+++ b/frontend/src/pages/Recommendations.test.tsx
-@@ -0,0 +1,113 @@
-+import { render, screen, waitFor } from "@testing-library/react";
-+import { afterEach, describe, expect, it, vi } from "vitest";
-+import { mockFetchResponses } from "../testUtils";
-+import { Recommendations } from "./Recommendations";
-+
-+const RIGHTSIZING = "/api/v1/recommendations/rightsizing";
-+const IDLE = "/api/v1/recommendations/idle-resources";
-+const NON_PEAK = "/api/v1/recommendations/non-peak-scheduling";
-+const RESERVED_INSTANCES = "/api/v1/recommendations/reserved-instances";
-+
-+const EMPTY_RIGHTSIZING = { idle_cpu_threshold_percent: 10, idle_lookback_days: 14, recommendations: [] };
-+const EMPTY_IDLE = { idle_lookback_days: 14, recommendations: [] };
-+const EMPTY_NON_PEAK = {
-+  idle_lookback_days: 14,
-+  off_peak_usage_ratio_threshold: 0.5,
-+  business_hours_definition: "Fixed weekday 09:00-17:00 UTC window.",
-+  recommendations: [],
-+};
-+const EMPTY_RI = {
-+  source: "Azure Microsoft.Consumption reservationRecommendations API",
-+  field_mapping_note: "Unverified against real populated data.",
-+  recommendations: [],
-+};
-+
-+afterEach(() => {
-+  vi.unstubAllGlobals();
-+});
-+
-+describe("Recommendations", () => {
-+  it("groups recommendations by category and shows a per-category empty note where there's nothing", async () => {
-+    mockFetchResponses({
-+      [RIGHTSIZING]: EMPTY_RIGHTSIZING,
-+      [IDLE]: EMPTY_IDLE,
-+      [NON_PEAK]: {
-+        ...EMPTY_NON_PEAK,
-+        recommendations: [
-+          {
-+            resource_id: "r4",
-+            external_resource_id: "/subscriptions/.../vm-dev",
-+            resource_type: "microsoft.compute/virtualmachines",
-+            resource_group: "nise-rg",
-+            region: "eastus",
-+            signals: {
-+              tag: { matched: false, detail: "no environment-indicating tag found" },
-+              naming: { matched: true, detail: "resource name contains 'dev'" },
-+              usage_pattern: {
-+                matched: false,
-+                detail: "Only 3 day(s) of history against a 14-day window.",
-+                peak_avg_cpu_percent: null,
-+                off_peak_avg_cpu_percent: null,
-+              },
-+            },
-+            recommended_schedule: "Standard template.",
-+            estimated_monthly_savings: 6.93,
-+            savings_note: "Approximate, not a billing quote.",
-+          },
-+        ],
-+      },
-+      [RESERVED_INSTANCES]: EMPTY_RI,
-+    });
-+
-+    render(<Recommendations />);
-+
-+    await waitFor(() => expect(screen.getByText("vm-dev")).toBeInTheDocument());
-+    expect(screen.getByText("$6.93", { exact: false })).toBeInTheDocument();
-+    // Categories with nothing flagged still show their own empty note, not silence.
-+    expect(screen.getAllByText(/no recommendations in this category right now/i)).toHaveLength(3);
-+    expect(screen.queryByText(/nothing to flag right now/i)).not.toBeInTheDocument();
-+  });
-+
-+  it("shows the overall empty state only when every category is genuinely empty", async () => {
-+    mockFetchResponses({
-+      [RIGHTSIZING]: EMPTY_RIGHTSIZING,
-+      [IDLE]: EMPTY_IDLE,
-+      [NON_PEAK]: EMPTY_NON_PEAK,
-+      [RESERVED_INSTANCES]: EMPTY_RI,
-+    });
-+
-+    render(<Recommendations />);
-+
-+    await waitFor(() => expect(screen.getByText(/nothing to flag right now/i)).toBeInTheDocument());
-+    expect(screen.queryByText(/no recommendations in this category right now/i)).not.toBeInTheDocument();
-+  });
-+
-+  it("degrades one category independently when its fetch fails, without blanking the others", async () => {
-+    vi.stubGlobal(
-+      "fetch",
-+      vi.fn((input: RequestInfo | URL) => {
-+        const url = typeof input === "string" ? input : input.toString();
-+        if (url.includes(RIGHTSIZING)) {
-+          return Promise.reject(new Error("network error"));
-+        }
-+        const body = url.includes(IDLE)
-+          ? EMPTY_IDLE
-+          : url.includes(NON_PEAK)
-+            ? EMPTY_NON_PEAK
-+            : url.includes(RESERVED_INSTANCES)
-+              ? EMPTY_RI
-+              : null;
-+        if (!body) {
-+          return Promise.reject(new Error(`Unexpected fetch to ${url}`));
-+        }
-+        return Promise.resolve({ ok: true, json: () => Promise.resolve(body) } as Response);
-+      }),
-+    );
-+
-+    render(<Recommendations />);
-+
-+    await waitFor(() => expect(screen.getByText(/couldn't load recommendations for this category/i)).toBeInTheDocument());
-+    // The other three categories still rendered their own (empty) state, not swallowed by the failure.
-+    expect(screen.getAllByText(/no recommendations in this category right now/i)).toHaveLength(3);
-+  });
-+});
-diff --git a/frontend/src/pages/Recommendations.tsx b/frontend/src/pages/Recommendations.tsx
-new file mode 100644
-index 0000000..2e483b5
---- /dev/null
-+++ b/frontend/src/pages/Recommendations.tsx
-@@ -0,0 +1,126 @@
-+import { useEffect, useState } from "react";
-+import {
-+  getIdleResourceRecommendations,
-+  getNonPeakSchedulingRecommendations,
-+  getReservedInstanceRecommendations,
-+  getRightsizingRecommendations,
-+} from "../api/client";
-+import { EmptyState } from "../components/EmptyState";
-+import { RecommendationCard } from "../components/RecommendationCard";
-+import {
-+  CATEGORY_LABELS,
-+  normalizeIdleResources,
-+  normalizeNonPeakScheduling,
-+  normalizeReservedInstances,
-+  normalizeRightsizing,
-+  type RecommendationCategory,
-+  type RecommendationItem,
-+} from "../lib/normalizeRecommendations";
-+
-+type CategoryState =
-+  | { status: "loading" }
-+  | { status: "error" }
-+  | { status: "ready"; items: RecommendationItem[] };
-+
-+const CATEGORY_ORDER: RecommendationCategory[] = [
-+  "rightsizing",
-+  "idle-resources",
-+  "non-peak-scheduling",
-+  "reserved-instances",
-+];
-+
-+function sortByImpactDesc(items: RecommendationItem[]): RecommendationItem[] {
-+  return [...items].sort(
-+    (a, b) => (b.estimatedMonthlyImpact ?? -Infinity) - (a.estimatedMonthlyImpact ?? -Infinity),
-+  );
-+}
-+
-+export function Recommendations() {
-+  const [byCategory, setByCategory] = useState<Record<RecommendationCategory, CategoryState>>({
-+    rightsizing: { status: "loading" },
-+    "idle-resources": { status: "loading" },
-+    "non-peak-scheduling": { status: "loading" },
-+    "reserved-instances": { status: "loading" },
-+  });
-+
-+  useEffect(() => {
-+    // Each category is fetched and its state updated independently (own
-+    // .then/.catch, not Promise.all) so one endpoint erroring degrades only
-+    // that section instead of blanking the whole page, per the task's
-+    // explicit requirement.
-+    const setCategory = (category: RecommendationCategory, state: CategoryState) =>
-+      setByCategory((prev) => ({ ...prev, [category]: state }));
-+
-+    getRightsizingRecommendations()
-+      .then((response) => setCategory("rightsizing", { status: "ready", items: normalizeRightsizing(response) }))
-+      .catch(() => setCategory("rightsizing", { status: "error" }));
-+
-+    getIdleResourceRecommendations()
-+      .then((response) =>
-+        setCategory("idle-resources", { status: "ready", items: normalizeIdleResources(response) }),
-+      )
-+      .catch(() => setCategory("idle-resources", { status: "error" }));
-+
-+    getNonPeakSchedulingRecommendations()
-+      .then((response) =>
-+        setCategory("non-peak-scheduling", { status: "ready", items: normalizeNonPeakScheduling(response) }),
-+      )
-+      .catch(() => setCategory("non-peak-scheduling", { status: "error" }));
-+
-+    getReservedInstanceRecommendations()
-+      .then((response) =>
-+        setCategory("reserved-instances", { status: "ready", items: normalizeReservedInstances(response) }),
-+      )
-+      .catch(() => setCategory("reserved-instances", { status: "error" }));
-+  }, []);
-+
-+  const states = CATEGORY_ORDER.map((category) => byCategory[category]);
-+  const allSettled = states.every((state) => state.status !== "loading");
-+  const allReadyAndEmpty = states.every((state) => state.status === "ready" && state.items.length === 0);
-+
-+  return (
-+    <div>
-+      <h1 className="mb-8 text-2xl font-semibold">Recommendations</h1>
-+
-+      {!allSettled && <p className="text-stone-500">Loading recommendations…</p>}
-+
-+      {allSettled && allReadyAndEmpty && (
-+        <EmptyState
-+          title="Nothing to flag right now"
-+          description="None of the four recommendation categories found anything to flag against this subscription's current usage and cost data. Check back as more usage history syncs in."
-+        />
++          )}
++          {resourceList.status === "ready" && (
++            <DrillList
++              title="Resource groups"
++              emptyMessage="No resource groups have synced yet."
++              items={summarizeResourceGroups(resourceList.resources).map((group) => ({
++                key: group.resourceGroup,
++                primary: group.resourceGroup,
++                secondary: `${group.resourceCount} resource${group.resourceCount === 1 ? "" : "s"}`,
++                onClick: () => setPath({ level: "resource-group", resourceGroup: group.resourceGroup }),
++              }))}
++            />
++          )}
++        </>
 +      )}
 +
-+      {allSettled && !allReadyAndEmpty && (
-+        <div className="space-y-8">
-+          {CATEGORY_ORDER.map((category) => {
-+            const state = byCategory[category];
-+            return (
-+              <section key={category}>
-+                <h2 className="mb-3 text-sm font-medium text-stone-700">{CATEGORY_LABELS[category]}</h2>
-+
-+                {state.status === "error" && (
-+                  <div className="rounded-xl bg-red-50 px-4 py-3 text-sm text-red-800">
-+                    Couldn't load recommendations for this category. Try refreshing.
-+                  </div>
-+                )}
-+
-+                {state.status === "ready" && state.items.length === 0 && (
-+                  <p className="text-sm text-stone-400">No recommendations in this category right now.</p>
-+                )}
-+
-+                {state.status === "ready" && state.items.length > 0 && (
-+                  <div className="space-y-3">
-+                    {sortByImpactDesc(state.items).map((item) => (
-+                      <RecommendationCard key={item.id} item={item} />
-+                    ))}
-+                  </div>
-+                )}
-+              </section>
-+            );
-+          })}
-+        </div>
++      {path.level === "resource-group" && (
++        <>
++          {resourceList.status === "loading" && <p className="text-stone-500">Loading resources…</p>}
++          {resourceList.status === "error" && (
++            <div className="rounded-xl bg-red-50 px-4 py-3 text-sm text-red-800">
++              Couldn't load resources. Try refreshing.
++            </div>
++          )}
++          {resourceList.status === "ready" && (
++            <DrillList
++              title={`Resources in ${path.resourceGroup}`}
++              emptyMessage="No resources found in this resource group."
++              items={resourceList.resources.map((resource) => ({
++                key: resource.resource_id,
++                primary: resourceLabel(resource),
++                secondary: resource.resource_type,
++                onClick: () => setPath({ level: "resource", resourceGroup: path.resourceGroup, resource }),
++              }))}
++            />
++          )}
++        </>
 +      )}
-+    </div>
-+  );
-+}
+
+-      {state.status === "ready" && (
++      {path.level === "resource" && (
+         <div className="space-y-6">
+           <div className="rounded-xl bg-white p-6 shadow-sm">
+-            <p className="text-sm text-stone-500">
+-              Spend, last {Math.min(TRAILING_SPEND_DAYS, state.history.series.length)} days
+-            </p>
+-            <p className="mt-1 font-mono text-4xl font-semibold tabular-nums text-brand-dark">
+-              {formatCurrency(sumTrailingActual(state.history, TRAILING_SPEND_DAYS))}
+-            </p>
++            <p className="text-sm text-stone-500">Resource</p>
++            <p className="mt-1 text-lg font-semibold text-brand-dark">{resourceLabel(path.resource)}</p>
++            <dl className="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
++              <dt className="text-stone-400">Type</dt>
++              <dd className="text-stone-700">{path.resource.resource_type}</dd>
++              <dt className="text-stone-400">Region</dt>
++              <dd className="text-stone-700">{path.resource.region ?? "—"}</dd>
++              <dt className="text-stone-400">Resource group</dt>
++              <dd className="text-stone-700">{path.resource.resource_group ?? "—"}</dd>
++            </dl>
+           </div>
+
+-          <div className="rounded-xl bg-white p-6 shadow-sm">
+-            <div className="mb-4 flex items-baseline justify-between">
+-              <h2 className="text-sm font-medium text-stone-700">
+-                Spend trend &amp; {FORECAST_HORIZON_DAYS}-day forecast
+-              </h2>
+-              <span className="text-xs text-stone-400">Solid = actual · Dashed = projected</span>
+-            </div>
+-            <SpendChart data={combineSpendSeries(state.history.series, state.forecast.series)} />
+-            <p className="mt-3 text-xs text-stone-400">
+-              Projection is a simple linear burn-rate estimate based on recent daily spend — not a
+-              precise prediction.
+-            </p>
++          <div className="rounded-xl bg-amber-bg px-6 py-5 text-sm text-amber-text">
++            Per-resource spend and forecast aren't wired up yet — /api/v1/cost and
++            /api/v1/forecast currently filter by resource group or resource type, not by a
++            single resource. See this task's results.txt for the full writeup.
+           </div>
+         </div>
+       )}
 diff --git a/frontend/src/testUtils.ts b/frontend/src/testUtils.ts
-new file mode 100644
-index 0000000..04eb309
---- /dev/null
+index 04eb309..ac836cd 100644
+--- a/frontend/src/testUtils.ts
 +++ b/frontend/src/testUtils.ts
-@@ -0,0 +1,19 @@
-+import { vi } from "vitest";
+@@ -1,7 +1,14 @@
+ import { vi } from "vitest";
+
+-/** Stubs global fetch to resolve based on which URL fragment a request matches. */
+-export function mockFetchResponses(responses: Record<string, unknown>) {
++type FetchResponseValue = unknown | ((url: string) => unknown);
 +
-+/** Stubs global fetch to resolve based on which URL fragment a request matches. */
-+export function mockFetchResponses(responses: Record<string, unknown>) {
-+  vi.stubGlobal(
-+    "fetch",
-+    vi.fn((input: RequestInfo | URL) => {
-+      const url = typeof input === "string" ? input : input.toString();
-+      const matchedKey = Object.keys(responses).find((fragment) => url.includes(fragment));
-+      if (!matchedKey) {
-+        return Promise.reject(new Error(`Unexpected fetch to ${url}`));
-+      }
-+      return Promise.resolve({
-+        ok: true,
-+        json: () => Promise.resolve(responses[matchedKey]),
-+      } as Response);
-+    }),
-+  );
-+}
++/**
++ * Stubs global fetch to resolve based on which URL fragment a request
++ * matches. A response value can be a plain object, or a function of the full
++ * matched URL for tests that need to vary the response by query string (e.g.
++ * a resource_group-scoped request vs. the unscoped one).
++ */
++export function mockFetchResponses(responses: Record<string, FetchResponseValue>) {
+   vi.stubGlobal(
+     "fetch",
+     vi.fn((input: RequestInfo | URL) => {
+@@ -10,9 +17,11 @@ export function mockFetchResponses(responses: Record<string, unknown>) {
+       if (!matchedKey) {
+         return Promise.reject(new Error(`Unexpected fetch to ${url}`));
+       }
++      const value = responses[matchedKey];
++      const body = typeof value === "function" ? (value as (url: string) => unknown)(url) : value;
+       return Promise.resolve({
+         ok: true,
+-        json: () => Promise.resolve(responses[matchedKey]),
++        json: () => Promise.resolve(body),
+       } as Response);
+     }),
+   );
+=== NEW FILE: backend/app/services/inventory_listing.py ===
+import uuid
+from typing import Any
+
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.models.resource import Resource
+from app.services.azure_inventory import get_or_create_cloud_account
+
+
+def build_resource_list(
+    db: Session,
+    resource_group: str | None = None,
+    cloud_account_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    """Compute-on-read listing of synced resources, for drill-down discovery.
+
+    Added for Task 15: /api/v1/cost and /api/v1/forecast already accept
+    resource_group/resource_type filters, but nothing exposed what resource
+    groups or resources actually exist to filter down to. Same
+    single-subscription cloud_account_id convention as forecast.py/rightsizing.py.
+    """
+    if cloud_account_id is None:
+        cloud_account_id = get_or_create_cloud_account(db, settings.azure_subscription_id).id
+
+    query = db.query(Resource).filter(Resource.cloud_account_id == cloud_account_id)
+    if resource_group:
+        query = query.filter(Resource.resource_group == resource_group)
+    resources = query.order_by(Resource.resource_group, Resource.resource_type, Resource.external_resource_id).all()
+
+    return {
+        "resources": [
+            {
+                "resource_id": str(resource.id),
+                "external_resource_id": resource.external_resource_id,
+                # Not a dedicated column - only captured in raw_metadata (see
+                # RESOURCE_GRAPH_QUERY's `project ... name ...` in azure_inventory.py).
+                "name": resource.raw_metadata.get("name") if isinstance(resource.raw_metadata, dict) else None,
+                "resource_group": resource.resource_group,
+                "resource_type": resource.resource_type,
+                "region": resource.region,
+            }
+            for resource in resources
+        ],
+    }
+=== NEW FILE: backend/tests/test_inventory_listing.py ===
+from app.models.cloud_account import CloudAccount
+from app.models.provider import Provider
+from app.models.resource import Resource
+from app.services.inventory_listing import build_resource_list
+
+
+def _seed_account(db_session, external_id: str) -> CloudAccount:
+    account = CloudAccount(provider=Provider.AZURE, external_id=external_id, display_name="Inventory Listing Test Sub")
+    db_session.add(account)
+    db_session.flush()
+    return account
+
+
+def _add_resource(db_session, account, external_id, resource_group, resource_type, name, region="eastus"):
+    resource = Resource(
+        cloud_account_id=account.id,
+        provider=Provider.AZURE,
+        external_resource_id=external_id,
+        resource_type=resource_type,
+        region=region,
+        resource_group=resource_group,
+        tags={},
+        raw_metadata={"name": name},
+    )
+    db_session.add(resource)
+    return resource
+
+
+def test_build_resource_list_returns_all_resources_for_account(db_session):
+    account = _seed_account(db_session, "test-sub-inventory-listing-all")
+    _add_resource(db_session, account, "vm-a", "rg-a", "microsoft.compute/virtualmachines", "vm-web-01")
+    _add_resource(db_session, account, "st-a", "rg-a", "microsoft.storage/storageaccounts", "stlogs01")
+    db_session.commit()
+
+    result = build_resource_list(db_session, cloud_account_id=account.id)
+
+    assert len(result["resources"]) == 2
+    names = {r["name"] for r in result["resources"]}
+    assert names == {"vm-web-01", "stlogs01"}
+    first = result["resources"][0]
+    assert set(first.keys()) == {"resource_id", "external_resource_id", "name", "resource_group", "resource_type", "region"}
+
+
+def test_build_resource_list_resource_group_filter_excludes_other_groups(db_session):
+    account = _seed_account(db_session, "test-sub-inventory-listing-rg")
+    _add_resource(db_session, account, "vm-a", "rg-a", "microsoft.compute/virtualmachines", "vm-web-01")
+    _add_resource(db_session, account, "vm-b", "rg-b", "microsoft.compute/virtualmachines", "vm-web-02")
+    db_session.commit()
+
+    result = build_resource_list(db_session, resource_group="rg-a", cloud_account_id=account.id)
+
+    assert len(result["resources"]) == 1
+    assert result["resources"][0]["external_resource_id"] == "vm-a"
+
+
+def test_build_resource_list_no_resources_returns_empty_list(db_session):
+    account = _seed_account(db_session, "test-sub-inventory-listing-empty")
+    db_session.commit()
+
+    result = build_resource_list(db_session, cloud_account_id=account.id)
+
+    assert result["resources"] == []
+
+
+def test_build_resource_list_missing_name_in_raw_metadata_returns_none(db_session):
+    account = _seed_account(db_session, "test-sub-inventory-listing-noname")
+    resource = Resource(
+        cloud_account_id=account.id,
+        provider=Provider.AZURE,
+        external_resource_id="vm-noname",
+        resource_type="microsoft.compute/virtualmachines",
+        region="eastus",
+        resource_group="rg-a",
+        tags={},
+        raw_metadata={},
+    )
+    db_session.add(resource)
+    db_session.commit()
+
+    result = build_resource_list(db_session, cloud_account_id=account.id)
+
+    assert result["resources"][0]["name"] is None
+
+
+def test_inventory_endpoint_aggregate(client):
+    response = client.get("/api/v1/inventory")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert isinstance(body["resources"], list)
+    # The real configured subscription already has synced resources (Task 2's
+    # live sync) - assert wiring/shape correctness against that real data,
+    # same principle as the cost history endpoint tests.
+    assert len(body["resources"]) > 0
+    first = body["resources"][0]
+    assert set(first.keys()) == {"resource_id", "external_resource_id", "name", "resource_group", "resource_type", "region"}
+
+
+def test_inventory_endpoint_resource_group_filter(client):
+    all_resources = client.get("/api/v1/inventory").json()["resources"]
+    some_group = next((r["resource_group"] for r in all_resources if r["resource_group"]), None)
+    assert some_group is not None, "expected at least one resource with a resource_group in the live subscription"
+
+    response = client.get("/api/v1/inventory", params={"resource_group": some_group})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["resources"]) > 0
+    assert all(r["resource_group"] == some_group for r in body["resources"])
+=== NEW FILE: frontend/src/components/Breadcrumb.tsx ===
+export interface BreadcrumbSegment {
+  label: string;
+  onClick?: () => void;
+}
+
+export function Breadcrumb({ segments }: { segments: BreadcrumbSegment[] }) {
+  return (
+    <nav className="mb-6 flex flex-wrap items-center gap-1.5 text-sm">
+      {segments.map((segment, index) => (
+        <span key={`${index}-${segment.label}`} className="flex items-center gap-1.5">
+          {index > 0 && (
+            <span aria-hidden="true" className="text-stone-300">
+              /
+            </span>
+          )}
+          {segment.onClick ? (
+            <button type="button" onClick={segment.onClick} className="text-brand hover:underline">
+              {segment.label}
+            </button>
+          ) : (
+            <span className="font-medium text-stone-700">{segment.label}</span>
+          )}
+        </span>
+      ))}
+    </nav>
+  );
+}
+=== NEW FILE: frontend/src/components/DrillList.tsx ===
+export interface DrillListItem {
+  key: string;
+  primary: string;
+  secondary?: string;
+  onClick: () => void;
+}
+
+interface DrillListProps {
+  title: string;
+  items: DrillListItem[];
+  emptyMessage: string;
+}
+
+export function DrillList({ title, items, emptyMessage }: DrillListProps) {
+  return (
+    <div className="rounded-xl bg-white p-6 shadow-sm">
+      <h2 className="mb-3 text-sm font-medium text-stone-700">{title}</h2>
+
+      {items.length === 0 ? (
+        <p className="text-sm text-stone-400">{emptyMessage}</p>
+      ) : (
+        <div className="divide-y divide-stone-100">
+          {items.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              onClick={item.onClick}
+              className="flex w-full items-center justify-between gap-4 rounded-lg px-2 py-3 text-left transition-colors hover:bg-brand-light"
+            >
+              <span className="truncate text-sm font-medium text-stone-800">{item.primary}</span>
+              <span className="flex shrink-0 items-center gap-2 text-xs text-stone-400">
+                {item.secondary}
+                <span aria-hidden="true">&rarr;</span>
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+=== NEW FILE: frontend/src/components/SpendPanel.tsx ===
+import { useEffect, useState } from "react";
+import { getCostHistory, getForecast } from "../api/client";
+import type { CostHistoryResponse, ForecastResponse } from "../api/types";
+import { combineSpendSeries } from "../lib/combineSpendSeries";
+import { formatCurrency } from "../lib/formatCurrency";
+import { EmptyState } from "./EmptyState";
+import { SpendChart } from "./SpendChart";
+
+const FORECAST_HORIZON_DAYS = 90;
+const TRAILING_SPEND_DAYS = 30;
+
+type LoadState =
+  | { status: "loading" }
+  | { status: "error" }
+  | { status: "empty" }
+  | { status: "ready"; history: CostHistoryResponse; forecast: ForecastResponse };
+
+function sumTrailingActual(history: CostHistoryResponse, days: number): number {
+  return history.series.slice(-days).reduce((total, point) => total + point.actual_cost, 0);
+}
+
+interface SpendPanelProps {
+  /** Scopes the underlying /cost and /forecast calls to one resource group. Omit for the aggregate view. */
+  resourceGroup?: string;
+  emptyStateDescription?: string;
+}
+
+/**
+ * Current-spend figure + spend/forecast chart, extracted from Task 13's
+ * Overview page so Task 15's drill-down levels (subscription, resource group)
+ * can reuse the exact same pattern scoped to whatever's selected.
+ */
+export function SpendPanel({ resourceGroup, emptyStateDescription }: SpendPanelProps) {
+  const [state, setState] = useState<LoadState>({ status: "loading" });
+
+  useEffect(() => {
+    setState({ status: "loading" });
+    const scope = resourceGroup ? { resourceGroup } : undefined;
+
+    Promise.all([getCostHistory(scope), getForecast(FORECAST_HORIZON_DAYS, scope)])
+      .then(([history, forecast]) => {
+        // Both endpoints derive from the same underlying daily-cost query for
+        // a given scope, so forecast.insufficient_data alone is a reliable
+        // signal that there's no history to show either.
+        if (forecast.insufficient_data) {
+          setState({ status: "empty" });
+          return;
+        }
+        setState({ status: "ready", history, forecast });
+      })
+      .catch(() => setState({ status: "error" }));
+  }, [resourceGroup]);
+
+  if (state.status === "loading") {
+    return <p className="text-stone-500">Loading spend data…</p>;
+  }
+
+  if (state.status === "error") {
+    return (
+      <div className="rounded-xl bg-red-50 px-6 py-8 text-red-800">
+        Couldn't reach the backend. Check that the API is running and try again.
+      </div>
+    );
+  }
+
+  if (state.status === "empty") {
+    return <EmptyState description={emptyStateDescription} />;
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="rounded-xl bg-white p-6 shadow-sm">
+        <p className="text-sm text-stone-500">
+          Spend, last {Math.min(TRAILING_SPEND_DAYS, state.history.series.length)} days
+        </p>
+        <p className="mt-1 font-mono text-4xl font-semibold tabular-nums text-brand-dark">
+          {formatCurrency(sumTrailingActual(state.history, TRAILING_SPEND_DAYS))}
+        </p>
+      </div>
+
+      <div className="rounded-xl bg-white p-6 shadow-sm">
+        <div className="mb-4 flex items-baseline justify-between">
+          <h2 className="text-sm font-medium text-stone-700">
+            Spend trend &amp; {FORECAST_HORIZON_DAYS}-day forecast
+          </h2>
+          <span className="text-xs text-stone-400">Solid = actual · Dashed = projected</span>
+        </div>
+        <SpendChart data={combineSpendSeries(state.history.series, state.forecast.series)} />
+        <p className="mt-3 text-xs text-stone-400">
+          Projection is a simple linear burn-rate estimate based on recent daily spend — not a
+          precise prediction.
+        </p>
+      </div>
+    </div>
+  );
+}
+=== NEW FILE: frontend/src/lib/groupResources.test.ts ===
+import { describe, expect, it } from "vitest";
+import type { ResourceListItem } from "../api/types";
+import { resourceLabel, summarizeResourceGroups } from "./groupResources";
+
+function makeResource(overrides: Partial<ResourceListItem>): ResourceListItem {
+  return {
+    resource_id: "id-1",
+    external_resource_id: "/subscriptions/x/resourceGroups/rg-a/providers/Microsoft.Compute/virtualMachines/vm-1",
+    name: "vm-1",
+    resource_group: "rg-a",
+    resource_type: "microsoft.compute/virtualmachines",
+    region: "eastus",
+    ...overrides,
+  };
+}
+
+describe("summarizeResourceGroups", () => {
+  it("groups resources by resource_group and counts them", () => {
+    const resources = [
+      makeResource({ resource_id: "1", resource_group: "rg-b" }),
+      makeResource({ resource_id: "2", resource_group: "rg-a" }),
+      makeResource({ resource_id: "3", resource_group: "rg-a" }),
+    ];
+
+    expect(summarizeResourceGroups(resources)).toEqual([
+      { resourceGroup: "rg-a", resourceCount: 2 },
+      { resourceGroup: "rg-b", resourceCount: 1 },
+    ]);
+  });
+
+  it("excludes resources with no resource_group", () => {
+    const resources = [makeResource({ resource_id: "1", resource_group: null })];
+
+    expect(summarizeResourceGroups(resources)).toEqual([]);
+  });
+
+  it("returns an empty list for no resources", () => {
+    expect(summarizeResourceGroups([])).toEqual([]);
+  });
+});
+
+describe("resourceLabel", () => {
+  it("prefers name when present", () => {
+    expect(resourceLabel(makeResource({ name: "vm-web-01" }))).toBe("vm-web-01");
+  });
+
+  it("falls back to external_resource_id when name is missing", () => {
+    const resource = makeResource({ name: null, external_resource_id: "/subscriptions/x/vm-1" });
+    expect(resourceLabel(resource)).toBe("/subscriptions/x/vm-1");
+  });
+
+  it("falls back to internal resource_id when both are missing", () => {
+    const resource = makeResource({ name: null, external_resource_id: null, resource_id: "internal-id" });
+    expect(resourceLabel(resource)).toBe("internal-id");
+  });
+});
+=== NEW FILE: frontend/src/lib/groupResources.ts ===
+import type { ResourceListItem } from "../api/types";
+
+export interface ResourceGroupSummary {
+  resourceGroup: string;
+  resourceCount: number;
+}
+
+/**
+ * Groups a flat resource list into unique resource groups with counts, sorted
+ * alphabetically. Resources with no resource_group are excluded - there's
+ * nothing to drill into for them.
+ */
+export function summarizeResourceGroups(resources: ResourceListItem[]): ResourceGroupSummary[] {
+  const counts = new Map<string, number>();
+  for (const resource of resources) {
+    if (!resource.resource_group) continue;
+    counts.set(resource.resource_group, (counts.get(resource.resource_group) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([resourceGroup, resourceCount]) => ({ resourceGroup, resourceCount }))
+    .sort((a, b) => a.resourceGroup.localeCompare(b.resourceGroup));
+}
+
+/** Best-available display label for a resource: name, then ARM id, then internal id. */
+export function resourceLabel(resource: ResourceListItem): string {
+  return resource.name ?? resource.external_resource_id ?? resource.resource_id;
+}
 ```

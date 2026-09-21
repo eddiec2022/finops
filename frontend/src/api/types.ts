@@ -20,6 +20,19 @@ export interface CostHistoryResponse {
   series: CostHistoryPoint[];
 }
 
+export interface ResourceListItem {
+  resource_id: string;
+  external_resource_id: string | null;
+  name: string | null;
+  resource_group: string | null;
+  resource_type: string;
+  region: string | null;
+}
+
+export interface InventoryResponse {
+  resources: ResourceListItem[];
+}
+
 export interface RightsizingRecommendation {
   resource_id: string;
   external_resource_id: string | null;

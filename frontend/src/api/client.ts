@@ -2,6 +2,7 @@ import type {
   CostHistoryResponse,
   ForecastResponse,
   IdleResourcesResponse,
+  InventoryResponse,
   NonPeakSchedulingResponse,
   ReservedInstancesResponse,
   RightsizingResponse,
@@ -17,12 +18,30 @@ async function getJson<T>(path: string): Promise<T> {
   return response.json();
 }
 
-export function getForecast(horizonDays: number): Promise<ForecastResponse> {
-  return getJson(`/api/v1/forecast?horizon_days=${horizonDays}`);
+/** Drill-down scope shared by the cost/forecast/inventory endpoints. */
+export interface DrillScope {
+  resourceGroup?: string;
 }
 
-export function getCostHistory(): Promise<CostHistoryResponse> {
-  return getJson("/api/v1/cost");
+function scopeParams({ resourceGroup }: DrillScope = {}): string {
+  const params = new URLSearchParams();
+  if (resourceGroup) params.set("resource_group", resourceGroup);
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
+}
+
+export function getForecast(horizonDays: number, scope?: DrillScope): Promise<ForecastResponse> {
+  const params = new URLSearchParams({ horizon_days: String(horizonDays) });
+  if (scope?.resourceGroup) params.set("resource_group", scope.resourceGroup);
+  return getJson(`/api/v1/forecast?${params.toString()}`);
+}
+
+export function getCostHistory(scope?: DrillScope): Promise<CostHistoryResponse> {
+  return getJson(`/api/v1/cost${scopeParams(scope)}`);
+}
+
+export function getResources(scope?: DrillScope): Promise<InventoryResponse> {
+  return getJson(`/api/v1/inventory${scopeParams(scope)}`);
 }
 
 export function getRightsizingRecommendations(): Promise<RightsizingResponse> {
