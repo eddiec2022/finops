@@ -83,7 +83,15 @@ def map_resource(row: dict[str, Any]) -> dict[str, Any]:
 
     mapped: dict[str, Any] = {
         "provider": Provider.AZURE,
-        "external_resource_id": row["id"],
+        # Normalized to lowercase - Azure resource IDs are canonically
+        # case-insensitive, and Resource Graph doesn't reliably return the same
+        # casing for a given resource across syncs (confirmed in Task 17: the same
+        # VM's id changed from .../NISE-RG/.../NISE-DEV to .../nise-rg/.../nise-dev
+        # between two real syncs). upsert_resources matches on this column by exact
+        # equality, so without normalizing here, a casing change reads as a brand
+        # new resource instead of an update - see the Task 18 migration that both
+        # fixes this and cleans up the one duplicate this already caused.
+        "external_resource_id": row["id"].lower(),
         "name": row.get("name"),
         "resource_type": row.get("type", ""),
         "region": row.get("location"),
@@ -122,6 +130,10 @@ def upsert_resources(
     created = 0
     updated = 0
     for mapped in mapped_resources:
+        # mapped["external_resource_id"] is already lowercased by map_resource, and
+        # the Task 18 migration normalized every stored row the same way - so this
+        # exact-equality match is effectively case-insensitive without needing
+        # func.lower() on both sides of the comparison.
         existing = (
             db.query(Resource)
             .filter_by(external_resource_id=mapped["external_resource_id"])

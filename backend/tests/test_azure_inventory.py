@@ -12,7 +12,10 @@ def test_map_resource_vm():
     mapped = map_resource(VM_ROW)
 
     assert mapped["provider"] == Provider.AZURE
-    assert mapped["external_resource_id"] == VM_ROW["id"]
+    # Lowercased at write time (Task 18) - Azure resource IDs are canonically
+    # case-insensitive but Resource Graph doesn't reliably return the same casing
+    # for a given resource across syncs (Task 17's live finding).
+    assert mapped["external_resource_id"] == VM_ROW["id"].lower()
     assert mapped["name"] == "vm-web-01"
     assert mapped["resource_type"] == "microsoft.compute/virtualmachines"
     assert mapped["region"] == "eastus"
@@ -72,7 +75,7 @@ def test_sync_inventory_creates_resources(db_session):
     assert db_session.query(Resource).count() == before + 2
     assert (
         db_session.query(Resource)
-        .filter(Resource.external_resource_id.in_([VM_ROW["id"], STORAGE_ACCOUNT_ROW["id"]]))
+        .filter(Resource.external_resource_id.in_([VM_ROW["id"].lower(), STORAGE_ACCOUNT_ROW["id"].lower()]))
         .count()
         == 2
     )
@@ -97,7 +100,28 @@ def test_sync_inventory_upsert_does_not_duplicate(db_session):
 
     vm = (
         db_session.query(Resource)
-        .filter_by(external_resource_id=VM_ROW["id"])
+        .filter_by(external_resource_id=VM_ROW["id"].lower())
         .one()
     )
     assert vm.tags == {"env": "prod", "owner": "sre-team"}
+
+
+def test_sync_inventory_case_drift_updates_existing_row_not_duplicate(db_session):
+    """Regression test for Task 17's live finding: Azure Resource Graph returning
+    a previously-synced resource's id in different casing on a later sync must
+    update the existing row, not create a second one."""
+    before = db_session.query(Resource).count()
+
+    sync_inventory(db_session, fetch=_fake_fetch([VM_ROW]))
+    assert db_session.query(Resource).count() == before + 1
+
+    recased_row = {**VM_ROW, "id": VM_ROW["id"].upper()}
+    summary = sync_inventory(db_session, fetch=_fake_fetch([recased_row]))
+
+    assert summary.found == 1
+    assert summary.created == 0
+    assert summary.updated == 1
+    assert db_session.query(Resource).count() == before + 1
+
+    resource = db_session.query(Resource).filter_by(external_resource_id=VM_ROW["id"].lower()).one()
+    assert resource.external_resource_id == VM_ROW["id"].lower()

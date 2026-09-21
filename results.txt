@@ -1,354 +1,451 @@
-# TASK 17 RESULTS - Full Phase 1 (Azure) Regression Pass
+# TASK 18 RESULTS - Fix: Case-Sensitive Resource Upsert Causing Duplicate Resources & Broken Cost Sync
 
-## Headline finding
+## Summary
 
-This audit found a critical, live, actively-reproducing bug: **Azure Resource
-Graph is now returning a different casing for the VM's ARM resource ID than it did
-when Task 2 first synced it**, and the inventory sync's upsert key
-(`external_resource_id`, matched case-sensitively) treats the new casing as a brand
-new resource instead of the same VM. Doing exactly what this task's own scope item 1
-asked ("trigger a fresh sync") created a duplicate resource row in the live dev
-database, and that duplicate then **completely breaks cost sync** (500 error, full
-traceback below) and **duplicates a recommendation** on the live Recommendations
-page. This is not a scenario I constructed to test with - it's what actually happened
-when I followed this task's own first instruction. Full detail in item 1 and the
-prioritized follow-up list below. Per this task's explicit scope, I have not fixed
-it, cleaned it up, or modified any code - only verified, reproduced, and documented
-it. **The live dev database currently contains this duplicate row as a direct,
-unavoidable result of following this task's instructions**, and cost sync is
-currently non-functional until a follow-up task addresses it.
+Fixed the root cause Task 17 found (case-sensitive `external_resource_id` upsert
+matching in `azure_inventory.py`), cleaned up the one live duplicate it had already
+caused via a real, auditable, generic data migration (not a one-off manual
+`DELETE`), added a regression test for the exact scenario that was unguarded, and
+re-verified everything against the live subscription: inventory sync is back to 9
+resources with no new duplicate, cost sync returns 200 (not 500) with fresh data
+through today, and the dashboard/Recommendations page each show "nise-dev" exactly
+once. All 127 backend tests pass.
 
-No code was changed this task (`git status` clean except `next_task.txt`, which I
-didn't touch) - this is a pure verification/audit task, per its own scope.
+## Decision: fix just the match query, or normalize storage too (as asked - "your call, flag either way")
 
----
+Normalized `external_resource_id` to lowercase at write time in
+`map_resource` (`backend/app/services/azure_inventory.py`), rather than only
+wrapping `upsert_resources`'s match query in `func.lower(...)` (the narrower fix
+`azure_cost.py`'s `_resolve_resource_id` already uses for its own, separate,
+read-only lookup).
 
-## 1. Inventory
+Reasoning: normalizing at the single write entrypoint closes the whole class of
+bug, not just this one comparison. Concretely:
+- With only a query-side fix, the *stored* value would still flip-flop in casing
+  across syncs depending on whatever Azure happened to return that time (since
+  `upsert_resources`'s update branch overwrites every mapped field, including
+  `external_resource_id`, on each sync) - functionally safe against duplicates once
+  matching is case-insensitive, but leaves the column's actual content
+  nondeterministic, which is a worse foundation for anything else that might read or
+  index on it later.
+- With write-time normalization, the column is always canonical, so a plain
+  exact-equality match (what `upsert_resources` already does) is correctly
+  case-insensitive with no query change needed beyond the one-line
+  `.lower()` in `map_resource` - simpler than adding `func.lower()` wrapping, and
+  slightly cheaper (a plain indexed equality vs. a function call on every row
+  scanned, though at this table's current size that's not a real performance
+  concern - it's about not adding a wrapper that a plain normalization makes
+  unnecessary).
+- The existing `uq_resources_external_resource_id` unique constraint
+  (migration `80706cac4f93`) is case-sensitive by construction (standard Postgres
+  string comparison, no special collation). Once every stored value is canonically
+  lowercase, that constraint already enforces exactly the case-insensitive
+  uniqueness we want, with zero schema change - so I didn't touch the constraint or
+  add a new migration for it. Flagging this explicitly since it's the kind of thing
+  that looks like it should need a matching schema change but doesn't, once the
+  values themselves are normalized.
+- Did not touch `azure_cost.py`'s `_resolve_resource_id` - it does its own
+  `func.lower(...)` comparison for a different purpose (matching Cost Management's
+  `ResourceId` dimension, an external string never stored in our own table), stays
+  correct and safe regardless of how `resources.external_resource_id` is stored, and
+  touching it wasn't part of this task's scope (the upsert key, not cost matching).
 
-**What I did:** Snapshotted the `resources` table before syncing (9 rows). Triggered
-`POST /api/v1/inventory/sync` (the task's own instruction). Independently queried
-Azure Resource Graph directly via a standalone script (same SDK, bypassing the app's
-own `azure_inventory.py` code entirely) to get Azure's actual current state, not
-just re-trusting the app's own sync logic. Compared all three: pre-sync DB, post-sync
-DB, and the independent live query.
+## What was built
 
-**Result: FAIL (data-integrity bug), with count reconciling correctly otherwise.**
+**Code fix** (`backend/app/services/azure_inventory.py`): `map_resource` now sets
+`"external_resource_id": row["id"].lower()`, with a comment explaining why
+(referencing the exact live Task 17 finding). `upsert_resources`'s existing
+`.filter_by(external_resource_id=mapped["external_resource_id"])` needed no logic
+change - just a comment explaining why the plain equality match is now correct.
 
-- Independent live Resource Graph query confirms Azure's subscription genuinely has
-  **9 resources** right now - matches the pre-sync DB count exactly. Full resource
-  list (name, type, resource group) from the independent query matches the DB's
-  pre-sync contents 1:1. This part is correct.
-- But: `POST /api/v1/inventory/sync` returned `{"found": 9, "created": 1, "updated":
-  8}` - it found 9 resources from Azure (correct), but created a **10th row** instead
-  of updating the existing VM row, because Azure Resource Graph now returns the VM's
-  `id` as
-  `/subscriptions/.../resourceGroups/nise-rg/providers/Microsoft.Compute/virtualMachines/nise-dev`
-  (all lowercase), while the original Task 2 sync stored it as
-  `/subscriptions/.../resourceGroups/NISE-RG/providers/Microsoft.Compute/virtualMachines/NISE-DEV`
-  (mixed case) - confirmed by re-running the independent Resource Graph query, which
-  right now returns the *disk*'s `id` still in the original uppercase
-  (`.../NISE-RG/.../disks/...`) while the *VM*'s `id` has changed to lowercase. Same
-  resource group, same sync, two different casings for two different resource types
-  - this is Azure's own indexing being inconsistent over time, not a one-off fluke.
-- `backend/app/services/azure_inventory.py`'s `upsert_resources` matches existing
-  rows via `.filter_by(external_resource_id=mapped["external_resource_id"])` - an
-  exact, case-sensitive string match. When Azure returns different casing than last
-  time, this doesn't match the existing row, so a new one gets created instead of
-  updated.
-- Notably, `backend/app/services/azure_cost.py`'s `_resolve_resource_id` *already*
-  has a code comment acknowledging this exact problem ("Azure resource IDs are
-  canonically case-insensitive, and Cost Management's ResourceId dimension doesn't
-  always match Resource Graph's casing... for the same resource") and does a
-  case-insensitive `func.lower(...)` comparison - but `upsert_resources`'s own
-  upsert key was never given the same treatment, so the exact case-sensitive gap that
-  cost-sync's own code was written to defend against is precisely what caused this.
-- Confirmed the two VM rows are the same physical Azure VM, not actually two VMs:
-  identical `created_at` (both `2026-06-14 20:38:10.731+00`, sourced from Azure's own
-  `timeCreated` property), identical `name` ("nise-dev"), identical `resource_group`
-  ("nise-rg" - only the `external_resource_id`/`id` field's casing differs).
-- `GET /api/v1/inventory` (Task 15's endpoint) correctly reflects the DB's actual
-  (now-duplicated) state - confirmed the endpoint layer itself is not the bug, it's
-  faithfully serving what's in the table. Also confirmed `resources.name` (Task 16's
-  migration) is populated correctly for the new row too (map_resource sets it
-  directly now, not just via backfill).
+**Data cleanup migration**
+(`backend/alembic/versions/2450695ea788_merge_case_drift_duplicate_resources.py`),
+written generically (not hardcoded to the one VM's UUIDs) so it would catch any
+other resource this same bug affected, per the task's explicit ask:
+1. Finds every group of `resources` rows that collide on
+   `lower(external_resource_id)`.
+2. For each group, picks one canonical row - the one with existing `cost_records`
+   (real historical financial data already correctly attributed), falling back to
+   the earliest-created row if no group member has any cost_records.
+3. For every non-canonical row in the group: reassigns its `cost_records` and
+   `utilization_metrics` onto the canonical row wherever that doesn't collide with
+   something the canonical already has (same `cloud_account_id`/`date`/
+   `charge_type` for cost, same `metric_name`/`timestamp` for utilization) -
+   preserving real data instead of discarding it. Anything left over after that
+   (i.e. a genuine duplicate reading/charge the canonical already has) gets deleted,
+   then the non-canonical resource row itself is deleted.
+4. Finally normalizes every remaining `resources.external_resource_id` to
+   lowercase, so historical rows match the new write-time normalization too.
 
-## 2. Utilization
+**Regression test**
+(`backend/tests/test_azure_inventory.py::test_sync_inventory_case_drift_updates_existing_row_not_duplicate`):
+syncs a resource once, then syncs the exact same resource again with its `id`
+field uppercased (simulating Azure returning different casing on a later sync -
+the exact unguarded scenario), and asserts `created == 0`, `updated == 1`, and the
+resource count doesn't grow. Three existing tests needed their assertions updated
+to expect lowercased `external_resource_id` values (they weren't testing casing
+behavior, just happened to compare against the fixture's original mixed-case
+string, which is no longer what gets stored).
 
-**What I did:** Triggered `POST /api/v1/utilization/sync`. Independently queried
-Azure Monitor directly (same SDK, bypassing `azure_utilization.py`) for the VM's
-"Percentage CPU" metric over the same 7-day window, and compared averages.
+## Actual backend pytest output (`docker compose run --rm backend pytest -q`,
+after `docker compose build backend`)
 
-**Result: PASS on data correctness, with a compounding side-effect of the inventory bug.**
+    ........................................................................ [ 56%]
+    .......................................................                  [100%]
+    127 passed, 1 warning in 0.75s
 
-- Independent Azure Monitor query: 49 data points over 7 days, average 3.18% CPU.
-- App's stored data for the real VM resource (`784c331d...`) after the same sync: 64
-  data points, average 3.50% CPU. Same order of magnitude, consistent with real VM
-  behavior sampled at slightly different windows (my independent query ran a few
-  minutes after the app's sync) - not garbage or obviously wrong numbers. **The
-  Azure Monitor connector is pulling genuinely correct data.**
-- Side effect of the inventory bug: `sync_utilization` queries *every* resource
-  matching `RESOURCE_TYPE_METRICS.keys()` with no dedup by physical resource, so it
-  queried Azure Monitor for **both** VM rows. Because Azure Monitor also resolves
-  resource URIs case-insensitively, **both rows got real utilization data** for what
-  is actually one physical VM (64 CPU readings on the original row, 48 on the
-  duplicate, averages 3.50% vs 2.88% - close but not identical, again consistent with
-  slightly different query timing between the two sequential per-resource calls, not
-  two different VMs). This means the duplicate doesn't stay obviously "empty" for
-  long - once utilization re-syncs, it looks like a second real resource with its own
-  real metrics, which would make it *harder*, not easier, for someone to notice the
-  duplicate later.
+(126 pre-existing + 1 new regression test. Three pre-existing tests in
+`test_azure_inventory.py` had assertions updated to expect lowercased values - not
+counted as new, since they test the same behavior, just against the corrected
+expected output.)
 
-## 3. Cost & Forecast
+## The migration - confirmed run, and the live duplicate's exact fate verified against real data
 
-**What I did:** Exercised all four filter combinations (unfiltered, resource_group,
-resource_type, resource_id) against real data for both `/api/v1/cost` and
-`/api/v1/forecast`. Sanity-checked for negative values and actual/forecast
-continuity. Attempted a fresh cost sync (the task's own scope item 3 instruction to
-exercise every filter combination against real data implies using current data,
-which I could - a fresh sync was not itself required by item 3, but I attempted one
-anyway as part of exercising the sync surface, which is how the duplicate's second,
-more severe consequence surfaced).
+**Before** (snapshotted immediately before running the migration):
 
-**Result: PASS on filter correctness against existing data. FAIL - cost sync is currently broken.**
+    resources: 10   cost_records: 237   utilization_metrics: 520
 
-Filter correctness (all against the existing, now-stale-but-intact data, last synced
-2026-09-17):
-| Filter | Result |
-|---|---|
-| unfiltered | 91 days, $511.85 total, no negative values |
-| `resource_group=nise-rg` | 91 days, $511.85 (100% of subscription cost - consistent with Task 15/16's own findings) |
-| `resource_group=networkwatcherrg` | 0 days (genuinely $0 attributed cost) |
-| `resource_type=microsoft.compute/virtualmachines` | 55 days, $442.72 - equals the real VM's own resource_id-filtered total, since the duplicate VM row has zero cost attributed to it |
-| `resource_id=<real VM>` | 55 days, $442.72 |
-| `resource_id=<duplicate VM>` | 0 days, correctly empty |
-| forecast unfiltered | `insufficient_data: false`, `daily_rate: 1.625`, all three rollup windows present, no negative projected values |
-| forecast continuity | last actual (2026-09-17): $1.10/day; first projected (2026-09-18): $1.625/day - close in magnitude, expected since the forecast is a burn-rate average over a trailing window, not a same-day continuation |
-| forecast `resource_id=<duplicate VM>` | correctly `insufficient_data: true`, not garbage |
+    id=784c331d... external_resource_id=".../NISE-RG/.../NISE-DEV"  name=nise-dev  created_at=2026-06-14 20:38:10.731+00
+    id=fa1f955c... external_resource_id=".../nise-rg/.../nise-dev"  name=nise-dev  created_at=2026-06-14 20:38:10.731+00
+    (fa1f955c had 220 utilization_metrics rows, 0 cost_records; 784c331d had 300 utilization_metrics rows, all 237 cost_records)
 
-**Cost sync is broken:** `POST /api/v1/cost/sync` now returns a 500. Full traceback
-(from `docker compose logs backend`):
+Ran it for real: `docker compose run --rm backend alembic upgrade head` ->
 
-    File "/app/app/services/azure_cost.py", line 120, in upsert_cost_records
-        resource_id = _resolve_resource_id(db, row["external_resource_id"])
-    File "/app/app/services/azure_cost.py", line 111, in _resolve_resource_id
-        .one_or_none()
-    sqlalchemy.exc.MultipleResultsFound: Multiple rows were found when one or none was required
+    INFO  [alembic.runtime.migration] Running upgrade 0a3c0e882688 -> 2450695ea788,
+    merge case-drift duplicate resources, normalize external_resource_id casing
 
-`_resolve_resource_id`'s case-insensitive lookup (`func.lower(Resource.external_resource_id) == external_resource_id.lower()`)
-now matches *both* VM rows, and `.one_or_none()` requires 0 or 1. This is the
-inventory bug's most severe consequence: **the entire cost-sync endpoint is down
-for the whole subscription**, not just for the one affected VM, since the exception
-is unhandled and propagates out of the whole sync loop before any `db.commit()`.
-Confirmed no partial/corrupt writes resulted - `cost_records` count and latest date
-are unchanged from before the failed attempt (`get_db`'s session teardown has no
-explicit rollback, but `db.close()` with an uncommitted transaction and
-`autocommit=False` discards pending changes, which the unchanged row count confirms
-empirically). The practical effect is that cost data is now stuck at 2026-09-17 and
-cannot be refreshed until this is fixed - not a data-corruption risk, but a
-functionality outage.
+**After** (checked the real data directly, not assumed from the migration code):
 
-## 4. Recommendations
+    resources: 9   cost_records: 237   utilization_metrics: 300
 
-**What I did:** Fetched all four category endpoints against live data, cross-checked
-each result (or lack of one) against the underlying utilization/cost data directly.
+    select version_num from alembic_version;  -> 2450695ea788
+    select count(*) from resources where id='fa1f955c-5def-499b-b9a2-b76766df5100';  -> 0 (fully deleted)
+    select id, external_resource_id, name from resources where resource_type='microsoft.compute/virtualmachines';
+      -> exactly one row: 784c331d..., external_resource_id now lowercase
+         (".../resourcegroups/nise-rg/providers/microsoft.compute/virtualmachines/nise-dev")
+    select external_resource_id from resources order by external_resource_id;
+      -> all 9 rows confirmed fully lowercase (including path segments like
+         "resourcegroups", "microsoft.compute", "virtualmachines" - not just the
+         resource-name segment)
+    select count(*) from utilization_metrics where resource_id='784c331d...';  -> 300 (unchanged from before)
+    select count(*) from utilization_metrics where resource_id='fa1f955c...';  -> 0
 
-**Result: PASS on evaluation logic correctness, FAIL - duplicate resource produces a duplicate user-visible recommendation.**
+**cost_records (237) was unaffected** - the duplicate had zero cost_records to begin
+with (confirmed in Task 17), so nothing needed reassigning there; the merge logic
+for that table ran, found nothing to do, and that's exactly correct.
 
-- **Rightsizing: empty.** Correct - the real VM's CPU history currently spans only 7
-  days (`2026-09-15` to `2026-09-21`), short of the 14-day `idle_lookback_days`
-  required by `evaluate_cpu_utilization`'s `span_days < lookback_days` check, so it's
-  excluded from evaluation entirely (by design - "insufficient data" is excluded, not
-  flagged/cleared on a partial average, per the function's own docstring). Consistent
-  with Task 14's own documented findings about this VM's short/gappy history, which
-  has grown (3 days -> 7 days) but still hasn't reached 14.
-- **Idle & Orphaned Resources: empty.** Consistent with the real resource list - the
-  disk is attached to the running VM (not orphaned), the public IP is attached to the
-  NIC, nothing is stopped-but-not-deallocated. Matches Task 9's own findings.
-- **Reserved Instances / Savings Plans: empty.** Matches Task 12's own investigation
-  - this subscription's usage history is still too short/gappy for Azure's own live
-  recommendation engine to have produced anything.
-- **Non-Peak Scheduling: two near-identical recommendations for the same physical
-  VM.** This is the inventory bug surfacing directly in a user-facing feature:
-  `build_non_peak_scheduling_recommendations` doesn't require the 14-day utilization
-  span the way rightsizing does (its naming/tag signals don't depend on utilization
-  history), so **both** VM rows get evaluated and both match the "resource name
-  contains 'dev'" naming signal. The result: "NISE-DEV" ($6.93/mo estimated savings,
-  the real resource with real cost data) and "nise-dev" ("Savings not available", the
-  duplicate with zero cost data) both appear as separate cards on the live
-  Recommendations page. Screenshot: `task17-4-recommendations.png`. A domain
-  reviewer looking at this page would reasonably wonder why the same VM is
-  recommended twice with different numbers.
+**utilization_metrics went from 520 to 300** - the canonical resource's own count
+(300) is *identical* before and after, meaning **zero** of the duplicate's 220
+rows were reassigned; all 220 were exact duplicates (same `metric_name` +
+`timestamp` the canonical already had) and were correctly dropped as genuine
+duplicate readings, not reassigned. This makes sense in hindsight: Azure Monitor's
+hourly granularity buckets timestamps to fixed points regardless of when you query,
+so two queries against the same physical VM over overlapping historical windows
+converge to the same timestamp set - there was never any unique signal in the
+duplicate's utilization data to preserve. No data was lost; 300 real readings for
+the one real VM, same as before the duplicate ever existed.
 
-## 5. Dashboard/UX
+## Live re-verification against the real subscription
 
-**What I did:** Walked the full drill-down (subscription -> resource group ->
-resource) via Playwright in WSL2 for every resource group and resource that actually
-exists right now (2 groups, 10 resources including the duplicate), confirmed
-breadcrumb navigation, confirmed empty vs. populated states, checked the
-Recommendations page, and monitored console/network errors throughout.
-
-**Result: PASS on rendering correctness of what the data says (breadcrumbs, empty
-states, filtering, navigation all work exactly as built); the duplicate resource
-shows up as a duplicate row, which is correct behavior for wrong underlying data,
-not a UI bug.**
-
-- Subscription level: "Resource groups" list correctly shows `networkwatcherrg (3
-  resources)` and `nise-rg (7 resources)` - the 7 (was 6) directly reflects the
-  duplicate.
-- `nise-rg` resource-group level: resource list literally shows "nise-dev" twice
-  (screenshot: `task17-2-nise-rg-level.png`) - directly visible to anyone browsing
-  the dashboard, not just discoverable via API/DB inspection.
-- Drilled into every individual resource type present: the disk (steady daily cost,
-  gap-free 91-day series, real chart renders correctly, no gap note), the *real* VM
-  row (real $284.58/30-day figure, real chart), the *duplicate* VM row (correctly
-  shows the scoped empty state - "nise-dev hasn't synced enough days of cost data..."
-  - confirming the resource-level `SpendPanel` scoping logic itself, Task 16's work,
-  is functioning exactly as designed; the bug is entirely upstream in inventory sync,
-  not in the drill-down/filtering code built in Tasks 15-16), and
-  `NetworkWatcher_eastus` under `networkwatcherrg` (correctly shows the empty state
-  for a genuinely zero-cost resource).
-- Breadcrumb navigation confirmed working at every level tested (Overview -> group,
-  group -> Overview, resource -> group).
-- Recommendations page renders all four categories with the correct dollar-impact
-  formatting (JetBrains Mono, `/mo` suffix, primary-light teal treatment) per
-  GOV-001 3.6 - confirmed visually, not just via API response shape.
-- **Zero console errors and zero network errors (4xx/5xx)** across every page/flow
-  exercised through the actual UI (subscription level, both resource groups, five
-  individual resource drill-downs, Recommendations page). The cost-sync 500 found in
-  item 3 is not reachable through normal UI navigation - there's no sync trigger
-  button anywhere in the dashboard (sync is API/ops-only, per `App.tsx`'s nav having
-  only Overview/Recommendations tabs), so a reviewer clicking through the dashboard
-  itself would see the duplicate-name symptom but not a crash.
-
-## 6. Revisiting the `sumTrailingActual` quirk (Task 16's finding)
-
-**What I did:** Checked whether the "last 30 series entries, not last 30 calendar
-days" quirk is visible anywhere beyond the single VM-scoped case Task 16 found, by
-checking date-gap coverage at every level/resource type currently in the system.
-
-**Result: confirmed narrowly scoped - not urgent, but real and worth a follow-up.**
-
-| Scope | Entries | Calendar days spanned | Gap-free? |
-|---|---|---|---|
-| Subscription (unfiltered) | 91 | 91 | Yes |
-| `nise-rg` (resource-group level) | 91 | 91 | Yes |
-| Disk resource (steady daily storage cost) | 91 | 91 | Yes |
-| **VM resource (intermittent compute cost)** | **55** | **83** | **No - 28 gap days** |
-
-The quirk is invisible at the subscription level, invisible at the resource-group
-level (because `nise-rg`'s disk carries cost on every single day, filling the
-group's series completely even on days the VM itself wasn't billed), and invisible
-for the disk resource specifically. It is **only** visible when drilling into a
-compute resource whose billing history has real gaps (VM stopped/deallocated some
-days) - i.e., exactly the one case Task 16 already found, and no broader than that
-in this subscription's current data. It would become visible for any other VM/App
-Service resource with a similarly gappy history, which is a realistic case for
-FinOps users generally (that's the whole point of tracking idle/stopped resources),
-so it's a real bug, not a curiosity.
-
-**My priority recommendation: low-to-medium priority, well-defined quick fix, not
-urgent.** Reasoning: it produces a misleading number, not a crash or blocked
-workflow (unlike the inventory-duplicate bug above); it only affects the one
-resource-level trailing-spend figure, not the chart itself (the chart plots real
-dated points either way, so a careful user could infer the gaps from the x-axis);
-and the fix is small and well-understood (filter `history.series` by
-`date >= mostRecentDate - 30d` instead of `slice(-30)` in
-`frontend/src/components/SpendPanel.tsx`'s `sumTrailingActual`). I'd bundle it with
-whatever follow-up task next touches `SpendPanel`, rather than a dedicated task on
-its own.
-
-## 7. General sweep
-
-Beyond what's captured in items 1-6: no other broken states, no other console/network
-errors, no other obviously-wrong data found in the areas exercised. The one other
-observation worth naming: `resources.region` and `sku` are consistently populated for
-every real resource checked (not a gap), and `resource_group` casing is consistently
-lowercase across every row regardless of the `external_resource_id` casing issue
-(only the `id`/`external_resource_id` field is affected, not `resourceGroup` -
-useful scoping detail for whoever fixes item 1, since it confirms `resource_group`-
-based filtering elsewhere in the app was never at risk from this).
-
----
-
-## Prioritized follow-up list
-
-1. **[CRITICAL - fix immediately] Case-insensitive resource upsert key.**
-   `backend/app/services/azure_inventory.py`'s `upsert_resources` must match
-   existing rows case-insensitively (mirror the `func.lower(...)` pattern
-   `azure_cost.py`'s `_resolve_resource_id` already uses), not via exact
-   `external_resource_id` string equality. Without this, **cost sync stays broken**
-   for this subscription indefinitely (every future cost sync attempt will hit the
-   same `MultipleResultsFound` crash as long as both VM rows exist), and any other
-   resource whose ARM ID casing drifts in Azure's own indexing over time (this is
-   apparently an Azure Resource Graph behavior, not specific to this one VM) will
-   silently create more duplicates. **Must also include, as part of the same fix, a
-   one-time cleanup of the existing duplicate VM row in the live dev database** -
-   merging or removing the newer, cost-data-less row (`fa1f955c-5def-499b-b9a2-
-   b76766df5100`) - since the bug is now live, not hypothetical, and cost sync can't
-   function again until it's resolved. Consider whether `external_resource_id`
-   should be stored/compared in a normalized (lowercased) form generally, to close
-   this class of bug rather than just this one instance.
-2. **[HIGH] Utilization sync should dedupe by physical resource, not resource row.**
-   Even after (1) is fixed, `sync_utilization`'s per-`Resource`-row loop with no
-   awareness of "these two rows are the same physical resource" is a symptom of the
-   same underlying assumption (that DB rows and physical resources are 1:1) - worth
-   revisiting alongside (1) so a future case-insensitivity edge case (or any other
-   future duplicate-producing bug) doesn't silently double-count API calls and data
-   again.
-3. **[MEDIUM] `SpendPanel.sumTrailingActual` calendar-day quirk** (Task 16's
-   finding, re-confirmed and scoped precisely in item 6 above) - real, but narrow
-   impact and simple fix. Bundle with the next task touching `SpendPanel`.
-4. **[LOW] Recommendations page has no defense against the same physical resource
-   appearing twice** (as seen in item 4) - arguably not worth a dedicated fix once
-   (1) is resolved and duplicates can't occur, but if (1)'s fix is delayed, a
-   short-term mitigation (e.g., dedupe recommendations by `external_resource_id`
-   case-insensitively) could reduce visible confusion in the meantime. I'd defer
-   this entirely to (1) being fixed rather than treating it as its own task.
+1. **Inventory sync**: `POST /api/v1/inventory/sync` -> `{"found": 9, "created": 0,
+   "updated": 9}`. All 9 real resources matched and updated in place - critically,
+   Azure Resource Graph's *live, current* casing for the VM (still lowercase, same
+   as when Task 17 first observed the drift) matched correctly against the
+   newly-normalized stored value, with **zero** new rows created. Confirmed
+   `resources` count is still 9 after this sync, not 10.
+2. **Cost sync**: `POST /api/v1/cost/sync` -> `200 OK`,
+   `{"found":241,"created":12,"updated":229}` (previously a 500 with
+   `MultipleResultsFound`). `cost_records` now has 249 rows with `latest_date =
+   2026-09-21` (today) - cost data was stuck at 2026-09-17 since Task 17 broke
+   sync; it's now fully current again.
+3. **Dashboard**: drilled into `nise-rg` via Playwright in WSL2 (same approach as
+   Tasks 15-17) - "Resources in nise-rg" now lists "nise-dev" exactly once (6
+   resources total, correctly back down from 7), and the resource-group tile at the
+   subscription level correctly reads "nise-rg 6 resources". Screenshot:
+   `task18-1-nise-rg-fixed.png` - also shows the spend chart now extending through
+   the current date, reflecting the freshly-synced cost data.
+4. **Recommendations**: the Non-Peak Scheduling category now shows exactly one card
+   for "nise-dev" ($24.52/mo, reflecting the fresh cost data) instead of two.
+   Screenshot: `task18-2-recommendations-fixed.png`.
+5. Zero console errors during this verification pass.
 
 ## WSL2/dockerd restart monitor - status during this task
 
 Checked at task start and end. No new restarts - same pid 249, start time
-`Mon 2026-09-21 08:22:40 EDT` unchanged throughout (same baseline as Tasks 15/16),
+`Mon 2026-09-21 08:22:40 EDT` unchanged throughout (same baseline as Tasks 15-17),
 timer active, continuous `check_ok` entries, e.g. at task end:
 
-    2026-09-21 15:06:13 EDT check_ok start="Mon 2026-09-21 08:22:40 EDT" pid=249
+    2026-09-21 15:43:54 EDT check_ok start="Mon 2026-09-21 08:22:40 EDT" pid=249
 
-Total `RESTART_DETECTED` count unchanged at 22 across Tasks 15, 16, and 17; the most
-recent one still predates all three tasks' work windows.
+Total `RESTART_DETECTED` count unchanged at 22 across Tasks 15-18; the most recent
+one still predates all four tasks' work windows.
 
-## Data integrity check - IMPORTANT: state changed as a direct result of this task
+## Data integrity check
 
-This task's own scope instructed triggering fresh inventory and utilization syncs
-(item 1) and exercising cost sync (item 3) against the live subscription - doing so
-is what surfaced and reproduced the bug above, and it left real, lasting state
-changes in the live dev database as a result:
-
-- `resources`: **9 -> 10** (the duplicate VM row created by the inventory-sync bug -
-  not cleaned up, per this task's explicit "report, don't fix" scope)
-- `utilization_metrics`: **80 -> 520** (440 new rows from the fresh utilization sync,
-  legitimately real data, but split across both VM rows per item 2's finding)
-- `cost_records`: **237** (unchanged - the cost-sync attempt crashed before writing
-  anything, confirmed no partial/corrupt writes)
-- `cloud_accounts`: **1** (unchanged)
-
-I did not revert, delete, or otherwise clean up the duplicate resource or the
-doubled utilization data - that would be "fixing," which this task's scope
-explicitly excludes. Whoever picks up follow-up item (1) above needs to know the
-live DB is in this state right now, not a hypothetical one they'd need to reproduce
-first.
+Final state: `resources=9`, `cost_records=249` (up from 237 - genuine fresh sync,
+not drift), `utilization_metrics=300` (down from 520 - the duplicate's 220
+redundant readings removed, canonical resource's own 300 untouched),
+`cloud_accounts=1` (unchanged). This restores the subscription to its correct,
+non-duplicated state and leaves it with current data, closing out both the schema-
+level bug and the specific live incident Task 17 found and this task inherited.
 
 ## Ambiguity flagged, not guessed on
 
-- Whether to clean up the duplicate resource row I discovered (and inadvertently
-  caused, by following this task's own "trigger a fresh sync" instruction) was the
-  one real judgment call this task raised. Per the task's own explicit "Explicitly
-  out of scope: Fixing anything found here" and CLAUDE.md's human-decision-boundary
-  rule, I left it as-is and documented it thoroughly instead of touching it - this
-  felt like exactly the kind of "not my call" situation those rules describe, even
-  though it's tempting to "just delete the one bad row." A follow-up task should
-  make that call deliberately, as part of a real fix to the upsert-key logic, not as
-  a one-off manual cleanup with no code change behind it (which would just recur on
-  the next sync anyway).
-- No other genuine ambiguity - the rest of this task's scope was mechanical
-  verification against live data, which I could resolve directly with evidence
-  rather than needing to guess or ask.
+- The `resource_id`-vs-normalize-storage decision above - not genuinely ambiguous
+  once weighed, but flagged with full reasoning per the task's explicit request,
+  same convention as Task 16's `resource_id`-vs-`external_resource_id` call.
+- **Utilization metrics: reassign-with-collision-fallback-to-delete**, rather than
+  a simpler "always delete the loser's utilization data" - flagged because it's a
+  real design choice with a real alternative. I chose the more careful option
+  (attempt to preserve everything, only drop genuine duplicates) because, unlike
+  Task 17's live investigation (where I could just observe the two rows' overlap
+  without consequence), this migration needed to be safe for the *generic* case the
+  task asked for - "any other future occurrence... not just this one VM" - where a
+  duplicate pair's utilization data might not overlap identically the way this
+  specific VM's did. Confirmed after running it that the simpler "just delete"
+  approach would have produced the identical end result for *this* incident (zero
+  reassignments actually happened), but the more careful version is the right
+  default for a script meant to be reused.
+- No other genuine ambiguity. The canonical-row selection rule (prefer the row with
+  existing `cost_records`) was explicitly specified by the task itself for this
+  incident; I generalized it to "most cost_records, tie-break earliest created_at"
+  for groups the task didn't specifically describe, which is a natural, defensible
+  extension of the same stated rule rather than an independent judgment call.
+
+## Full diff
+
+```diff
+diff --git a/backend/app/services/azure_inventory.py b/backend/app/services/azure_inventory.py
+index e539a57..82ebcae 100644
+--- a/backend/app/services/azure_inventory.py
++++ b/backend/app/services/azure_inventory.py
+@@ -83,7 +83,15 @@ def map_resource(row: dict[str, Any]) -> dict[str, Any]:
+
+     mapped: dict[str, Any] = {
+         "provider": Provider.AZURE,
+-        "external_resource_id": row["id"],
++        # Normalized to lowercase - Azure resource IDs are canonically
++        # case-insensitive, and Resource Graph doesn't reliably return the same
++        # casing for a given resource across syncs (confirmed in Task 17: the same
++        # VM's id changed from .../NISE-RG/.../NISE-DEV to .../nise-rg/.../nise-dev
++        # between two real syncs). upsert_resources matches on this column by exact
++        # equality, so without normalizing here, a casing change reads as a brand
++        # new resource instead of an update - see the Task 18 migration that both
++        # fixes this and cleans up the one duplicate this already caused.
++        "external_resource_id": row["id"].lower(),
+         "name": row.get("name"),
+         "resource_type": row.get("type", ""),
+         "region": row.get("location"),
+@@ -122,6 +130,10 @@ def upsert_resources(
+     created = 0
+     updated = 0
+     for mapped in mapped_resources:
++        # mapped["external_resource_id"] is already lowercased by map_resource, and
++        # the Task 18 migration normalized every stored row the same way - so this
++        # exact-equality match is effectively case-insensitive without needing
++        # func.lower() on both sides of the comparison.
+         existing = (
+             db.query(Resource)
+             .filter_by(external_resource_id=mapped["external_resource_id"])
+diff --git a/backend/tests/test_azure_inventory.py b/backend/tests/test_azure_inventory.py
+index 97df340..193e714 100644
+--- a/backend/tests/test_azure_inventory.py
++++ b/backend/tests/test_azure_inventory.py
+@@ -12,7 +12,10 @@ def test_map_resource_vm():
+     mapped = map_resource(VM_ROW)
+
+     assert mapped["provider"] == Provider.AZURE
+-    assert mapped["external_resource_id"] == VM_ROW["id"]
++    # Lowercased at write time (Task 18) - Azure resource IDs are canonically
++    # case-insensitive but Resource Graph doesn't reliably return the same casing
++    # for a given resource across syncs (Task 17's live finding).
++    assert mapped["external_resource_id"] == VM_ROW["id"].lower()
+     assert mapped["name"] == "vm-web-01"
+     assert mapped["resource_type"] == "microsoft.compute/virtualmachines"
+     assert mapped["region"] == "eastus"
+@@ -72,7 +75,7 @@ def test_sync_inventory_creates_resources(db_session):
+     assert db_session.query(Resource).count() == before + 2
+     assert (
+         db_session.query(Resource)
+-        .filter(Resource.external_resource_id.in_([VM_ROW["id"], STORAGE_ACCOUNT_ROW["id"]]))
++        .filter(Resource.external_resource_id.in_([VM_ROW["id"].lower(), STORAGE_ACCOUNT_ROW["id"].lower()]))
+         .count()
+         == 2
+     )
+@@ -97,7 +100,28 @@ def test_sync_inventory_upsert_does_not_duplicate(db_session):
+
+     vm = (
+         db_session.query(Resource)
+-        .filter_by(external_resource_id=VM_ROW["id"])
++        .filter_by(external_resource_id=VM_ROW["id"].lower())
+         .one()
+     )
+     assert vm.tags == {"env": "prod", "owner": "sre-team"}
++
++
++def test_sync_inventory_case_drift_updates_existing_row_not_duplicate(db_session):
++    """Regression test for Task 17's live finding: Azure Resource Graph returning
++    a previously-synced resource's id in different casing on a later sync must
++    update the existing row, not create a second one."""
++    before = db_session.query(Resource).count()
++
++    sync_inventory(db_session, fetch=_fake_fetch([VM_ROW]))
++    assert db_session.query(Resource).count() == before + 1
++
++    recased_row = {**VM_ROW, "id": VM_ROW["id"].upper()}
++    summary = sync_inventory(db_session, fetch=_fake_fetch([recased_row]))
++
++    assert summary.found == 1
++    assert summary.created == 0
++    assert summary.updated == 1
++    assert db_session.query(Resource).count() == before + 1
++
++    resource = db_session.query(Resource).filter_by(external_resource_id=VM_ROW["id"].lower()).one()
++    assert resource.external_resource_id == VM_ROW["id"].lower()
+=== NEW FILE: backend/alembic/versions/2450695ea788_merge_case_drift_duplicate_resources.py ===
+"""merge case-drift duplicate resources, normalize external_resource_id casing
+
+Revision ID: 2450695ea788
+Revises: 0a3c0e882688
+Create Date: 2026-09-21 16:00:00.000000
+
+Task 17 found that Azure Resource Graph can return a previously-synced resource's
+ARM id in different casing on a later sync (confirmed live: the NISE-DEV VM's id
+changed from `.../NISE-RG/.../NISE-DEV` to `.../nise-rg/.../nise-dev` between Task
+2's original sync and Task 17's re-sync). `upsert_resources` matched existing rows
+by an exact, case-sensitive `external_resource_id` comparison, so the casing change
+read as a brand new resource instead of an update - producing a second `resources`
+row for one physical VM. `azure_inventory.map_resource` now lowercases
+`external_resource_id` at write time (see that file), which prevents this going
+forward. This migration cleans up every row the bug already affected - not
+hardcoded to the one VM incident, so it also catches any other resource this same
+drift hit that hasn't been noticed yet.
+
+For each group of resources rows that collide on `lower(external_resource_id)`:
+1. picks one canonical row - the one with existing cost_records (real historical
+   financial data already correctly attributed), falling back to the earliest-
+   created row if no group member has any cost_records;
+2. reassigns cost_records and utilization_metrics from the other row(s) onto the
+   canonical row wherever that doesn't collide with something the canonical already
+   has (same cloud_account/date/charge_type, or same metric/timestamp) - preserving
+   real data rather than discarding it;
+3. drops any remaining rows that *do* collide - those are genuine duplicate
+   readings of the same physical resource (the same metric at the same timestamp,
+   or the same charge on the same day), not distinct data;
+4. deletes the non-canonical resource row(s).
+
+Finally, normalizes every remaining resources.external_resource_id to lowercase, so
+the existing case-sensitive uq_resources_external_resource_id constraint continues
+to do its job correctly now that "the same resource" can never be stored under two
+different casings again.
+
+This is a lossy data migration (it deletes rows) - downgrade() cannot restore the
+merged/deleted data, so it's a documented no-op rather than a fake reversal.
+"""
+from typing import Sequence, Union
+
+import sqlalchemy as sa
+from alembic import op
+
+revision: str = "2450695ea788"
+down_revision: Union[str, None] = "0a3c0e882688"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+def upgrade() -> None:
+    conn = op.get_bind()
+
+    duplicate_groups = conn.execute(
+        sa.text(
+            """
+            SELECT array_agg(id ORDER BY id) AS ids
+            FROM resources
+            GROUP BY lower(external_resource_id)
+            HAVING count(*) > 1
+            """
+        )
+    ).fetchall()
+
+    for (ids,) in duplicate_groups:
+        canonical_row = conn.execute(
+            sa.text(
+                """
+                SELECT r.id
+                FROM resources r
+                LEFT JOIN (
+                    SELECT resource_id, count(*) AS cnt
+                    FROM cost_records
+                    WHERE resource_id = ANY(:ids)
+                    GROUP BY resource_id
+                ) c ON c.resource_id = r.id
+                WHERE r.id = ANY(:ids)
+                ORDER BY COALESCE(c.cnt, 0) DESC, r.created_at ASC, r.id ASC
+                LIMIT 1
+                """
+            ),
+            {"ids": ids},
+        ).scalar_one()
+
+        losers = [row_id for row_id in ids if row_id != canonical_row]
+
+        for loser in losers:
+            # Reassign cost_records that don't collide with what the canonical
+            # resource already has for the same account/date/charge_type.
+            conn.execute(
+                sa.text(
+                    """
+                    UPDATE cost_records
+                    SET resource_id = :canonical
+                    WHERE resource_id = :loser
+                      AND NOT EXISTS (
+                          SELECT 1 FROM cost_records c2
+                          WHERE c2.resource_id = :canonical
+                            AND c2.cloud_account_id = cost_records.cloud_account_id
+                            AND c2.date = cost_records.date
+                            AND c2.charge_type = cost_records.charge_type
+                      )
+                    """
+                ),
+                {"canonical": canonical_row, "loser": loser},
+            )
+            # Any cost_records left on the loser are genuine duplicates (same
+            # account/date/charge_type the canonical already has) - drop them.
+            conn.execute(
+                sa.text("DELETE FROM cost_records WHERE resource_id = :loser"),
+                {"loser": loser},
+            )
+
+            # Same pattern for utilization_metrics, keyed on (metric_name, timestamp).
+            conn.execute(
+                sa.text(
+                    """
+                    UPDATE utilization_metrics
+                    SET resource_id = :canonical
+                    WHERE resource_id = :loser
+                      AND NOT EXISTS (
+                          SELECT 1 FROM utilization_metrics u2
+                          WHERE u2.resource_id = :canonical
+                            AND u2.metric_name = utilization_metrics.metric_name
+                            AND u2.timestamp = utilization_metrics.timestamp
+                      )
+                    """
+                ),
+                {"canonical": canonical_row, "loser": loser},
+            )
+            conn.execute(
+                sa.text("DELETE FROM utilization_metrics WHERE resource_id = :loser"),
+                {"loser": loser},
+            )
+
+            conn.execute(sa.text("DELETE FROM resources WHERE id = :loser"), {"loser": loser})
+
+    conn.execute(sa.text("UPDATE resources SET external_resource_id = lower(external_resource_id)"))
+
+
+def downgrade() -> None:
+    # Lossy: merged/deleted rows can't be reconstructed. Left as a documented no-op
+    # rather than a fake reversal - reverting past this point means restoring from
+    # a backup taken before it ran, not running alembic downgrade.
+    pass
+```
