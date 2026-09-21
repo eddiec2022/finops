@@ -24,6 +24,8 @@ export interface ResourceListItem {
   resource_id: string;
   external_resource_id: string | null;
   name: string | null;
+  /** "azure" | "aws" | "gcp" - lets the UI adapt copy (e.g. drill-down labels) without hardcoding a provider. */
+  provider: string;
   resource_group: string | null;
   resource_type: string;
   region: string | null;

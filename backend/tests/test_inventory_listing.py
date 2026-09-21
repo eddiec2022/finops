@@ -39,7 +39,16 @@ def test_build_resource_list_returns_all_resources_for_account(db_session):
     names = {r["name"] for r in result["resources"]}
     assert names == {"vm-web-01", "stlogs01"}
     first = result["resources"][0]
-    assert set(first.keys()) == {"resource_id", "external_resource_id", "name", "resource_group", "resource_type", "region"}
+    assert set(first.keys()) == {
+        "resource_id",
+        "external_resource_id",
+        "name",
+        "provider",
+        "resource_group",
+        "resource_type",
+        "region",
+    }
+    assert first["provider"] == "azure"
 
 
 def test_build_resource_list_resource_group_filter_excludes_other_groups(db_session):
@@ -95,7 +104,15 @@ def test_inventory_endpoint_aggregate(client):
     # same principle as the cost history endpoint tests.
     assert len(body["resources"]) > 0
     first = body["resources"][0]
-    assert set(first.keys()) == {"resource_id", "external_resource_id", "name", "resource_group", "resource_type", "region"}
+    assert set(first.keys()) == {
+        "resource_id",
+        "external_resource_id",
+        "name",
+        "provider",
+        "resource_group",
+        "resource_type",
+        "region",
+    }
 
 
 def test_inventory_endpoint_resource_group_filter(client):

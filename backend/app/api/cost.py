@@ -4,7 +4,9 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.db.session import get_db
+from app.services.aws_cost import sync_aws_cost
 from app.services.azure_cost import sync_cost
 from app.services.forecast import build_daily_cost_history
 
@@ -13,8 +15,16 @@ router = APIRouter(prefix="/api/v1/cost", tags=["cost"])
 
 @router.post("/sync")
 def trigger_sync(db: Session = Depends(get_db)) -> dict[str, int]:
+    # Same pattern as inventory's sync dispatch - Azure's own call/behavior is
+    # unchanged; AWS only runs, and only adds to the totals, when configured.
     summary = sync_cost(db)
-    return {"found": summary.found, "created": summary.created, "updated": summary.updated}
+    result = {"found": summary.found, "created": summary.created, "updated": summary.updated}
+    if settings.aws_configured:
+        aws_summary = sync_aws_cost(db)
+        result["found"] += aws_summary.found
+        result["created"] += aws_summary.created
+        result["updated"] += aws_summary.updated
+    return result
 
 
 @router.get("")

@@ -4,7 +4,7 @@ import type { ResourceListItem } from "../api/types";
 import { Breadcrumb, type BreadcrumbSegment } from "../components/Breadcrumb";
 import { DrillList } from "../components/DrillList";
 import { SpendPanel } from "../components/SpendPanel";
-import { resourceLabel, summarizeResourceGroups } from "../lib/groupResources";
+import { listProvider, middleLevelLabel, resourceLabel, summarizeResourceGroups } from "../lib/groupResources";
 
 type DrillPath =
   | { level: "subscription" }
@@ -64,7 +64,7 @@ export function Overview() {
             <dd className="text-stone-700">{path.resource.resource_type}</dd>
             <dt className="text-stone-400">Region</dt>
             <dd className="text-stone-700">{path.resource.region ?? "—"}</dd>
-            <dt className="text-stone-400">Resource group</dt>
+            <dt className="text-stone-400">{middleLevelLabel(path.resource.provider)}</dt>
             <dd className="text-stone-700">{path.resource.resource_group ?? "—"}</dd>
           </dl>
         </div>
@@ -76,7 +76,7 @@ export function Overview() {
           resourceId={path.level === "resource" ? path.resource.resource_id : undefined}
           emptyStateDescription={
             path.level === "resource-group"
-              ? `Resource group "${path.resourceGroup}" hasn't synced enough days of cost data to show a spend trend or forecast yet.`
+              ? `${middleLevelLabel(listProvider(resourceList.status === "ready" ? resourceList.resources : []))} "${path.resourceGroup}" hasn't synced enough days of cost data to show a spend trend or forecast yet.`
               : path.level === "resource"
                 ? `${resourceLabel(path.resource)} hasn't synced enough days of cost data to show a spend trend or forecast yet.`
                 : undefined
@@ -94,8 +94,8 @@ export function Overview() {
           )}
           {resourceList.status === "ready" && (
             <DrillList
-              title="Resource groups"
-              emptyMessage="No resource groups have synced yet."
+              title={middleLevelLabel(listProvider(resourceList.resources), { plural: true })}
+              emptyMessage={`No ${middleLevelLabel(listProvider(resourceList.resources), { plural: true }).toLowerCase()} have synced yet.`}
               items={summarizeResourceGroups(resourceList.resources).map((group) => ({
                 key: group.resourceGroup,
                 primary: group.resourceGroup,
@@ -118,7 +118,7 @@ export function Overview() {
           {resourceList.status === "ready" && (
             <DrillList
               title={`Resources in ${path.resourceGroup}`}
-              emptyMessage="No resources found in this resource group."
+              emptyMessage={`No resources found in this ${middleLevelLabel(listProvider(resourceList.resources)).toLowerCase()}.`}
               items={resourceList.resources.map((resource) => ({
                 key: resource.resource_id,
                 primary: resourceLabel(resource),

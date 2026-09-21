@@ -15,6 +15,7 @@ const RG_A_VM = {
   resource_id: "res-1",
   external_resource_id: "/subscriptions/x/resourceGroups/rg-a/providers/Microsoft.Compute/virtualMachines/vm-web-01",
   name: "vm-web-01",
+  provider: "azure",
   resource_group: "rg-a",
   resource_type: "microsoft.compute/virtualmachines",
   region: "eastus",
@@ -24,6 +25,7 @@ const RG_A_DISK = {
   resource_id: "res-3",
   external_resource_id: "/subscriptions/x/resourceGroups/rg-a/providers/Microsoft.Compute/disks/vm-web-01-disk",
   name: "vm-web-01-disk",
+  provider: "azure",
   resource_group: "rg-a",
   resource_type: "microsoft.compute/disks",
   region: "eastus",
@@ -33,6 +35,7 @@ const RG_B_STORAGE = {
   resource_id: "res-2",
   external_resource_id: "/subscriptions/x/resourceGroups/rg-b/providers/Microsoft.Storage/storageAccounts/stlogs01",
   name: "stlogs01",
+  provider: "azure",
   resource_group: "rg-b",
   resource_type: "microsoft.storage/storageaccounts",
   region: "westus",
@@ -105,6 +108,20 @@ describe("Overview", () => {
     expect(screen.getByText("rg-b")).toBeInTheDocument();
     expect(screen.getByText("2 resources")).toBeInTheDocument();
     expect(screen.getByText("1 resource")).toBeInTheDocument();
+  });
+
+  it("labels the middle drill-down level 'Resource types' for an AWS account", async () => {
+    const AWS_EC2 = { ...RG_A_VM, provider: "aws", resource_group: "EC2 instance" };
+    mockFetchResponses({
+      [COST_FRAGMENT]: EMPTY_COST,
+      [FORECAST_FRAGMENT]: EMPTY_FORECAST,
+      [INVENTORY_FRAGMENT]: { resources: [AWS_EC2] },
+    });
+
+    render(<Overview />);
+
+    await waitFor(() => expect(screen.getByText("Resource types")).toBeInTheDocument());
+    expect(screen.queryByText("Resource groups")).not.toBeInTheDocument();
   });
 
   it("drills from subscription -> resource group -> resource with working breadcrumb navigation, showing real scoped spend at every level", async () => {

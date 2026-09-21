@@ -34,6 +34,11 @@ def build_resource_list(
                 "resource_id": str(resource.id),
                 "external_resource_id": resource.external_resource_id,
                 "name": resource.name,
+                # Added for Task 19 - lets the frontend tell an AWS resource
+                # from an Azure one (e.g. to label the drill-down's middle level
+                # "Resource types" vs. "Resource groups", per GOV-002 Section 3)
+                # without hardcoding an assumption about which provider it is.
+                "provider": resource.provider.value,
                 "resource_group": resource.resource_group,
                 "resource_type": resource.resource_type,
                 "region": resource.region,

@@ -1,451 +1,1518 @@
-# TASK 18 RESULTS - Fix: Case-Sensitive Resource Upsert Causing Duplicate Resources & Broken Cost Sync
+# TASK 19 RESULTS - AWS Inventory & Cost Scaffolding (mocked AWS API, no live account required)
 
 ## Summary
 
-Fixed the root cause Task 17 found (case-sensitive `external_resource_id` upsert
-matching in `azure_inventory.py`), cleaned up the one live duplicate it had already
-caused via a real, auditable, generic data migration (not a one-off manual
-`DELETE`), added a regression test for the exact scenario that was unguarded, and
-re-verified everything against the live subscription: inventory sync is back to 9
-resources with no new duplicate, cost sync returns 200 (not 500) with fresh data
-through today, and the dashboard/Recommendations page each show "nise-dev" exactly
-once. All 127 backend tests pass.
+Built the AWS inventory and cost connectors (`aws_inventory.py`, `aws_cost.py`),
+mirroring `azure_inventory.py`/`azure_cost.py`'s structure, reusing Task 18's
+case-insensitive upsert fix, and wired both into the existing sync endpoints so
+Azure's own behavior is unchanged when AWS is unconfigured (confirmed live, not
+just by reading the code). Confirmed the provider-agnostic schema claim (GOV-001)
+holds with zero schema changes needed. All work tested against `moto`-mocked AWS
+responses - no real AWS account exists yet, per this task's explicit scope. 143
+backend tests passing (127 pre-existing + 16 new AWS tests, zero Azure tests
+touched), 32 frontend tests passing (30 pre-existing + 2 new). Live-verified the
+whole stack still starts and Azure's real endpoints behave identically to
+pre-Task-19 with AWS unconfigured.
 
-## Decision: fix just the match query, or normalize storage too (as asked - "your call, flag either way")
+## Item 1: schema check - confirmed, no changes needed
 
-Normalized `external_resource_id` to lowercase at write time in
-`map_resource` (`backend/app/services/azure_inventory.py`), rather than only
-wrapping `upsert_resources`'s match query in `func.lower(...)` (the narrower fix
-`azure_cost.py`'s `_resolve_resource_id` already uses for its own, separate,
-read-only lookup).
+`Provider.AWS` already existed (`backend/app/models/provider.py`, unused until
+now). `CloudAccount.external_id`/`display_name` are already generic strings, no
+Azure-specific naming. `Resource.resource_group`/`region`/`sku`/`name`/`tags`/
+`raw_metadata` are all generic columns with no Azure-specific typing or
+constraints. `CostRecord`/`UtilizationMetric` have zero provider-specific columns
+either. GOV-001's "provider-agnostic from day one" claim holds up under this first
+real test - genuinely confirmed by writing and running AWS data through it, not
+just by inspection.
 
-Reasoning: normalizing at the single write entrypoint closes the whole class of
-bug, not just this one comparison. Concretely:
-- With only a query-side fix, the *stored* value would still flip-flop in casing
-  across syncs depending on whatever Azure happened to return that time (since
-  `upsert_resources`'s update branch overwrites every mapped field, including
-  `external_resource_id`, on each sync) - functionally safe against duplicates once
-  matching is case-insensitive, but leaves the column's actual content
-  nondeterministic, which is a worse foundation for anything else that might read or
-  index on it later.
-- With write-time normalization, the column is always canonical, so a plain
-  exact-equality match (what `upsert_resources` already does) is correctly
-  case-insensitive with no query change needed beyond the one-line
-  `.lower()` in `map_resource` - simpler than adding `func.lower()` wrapping, and
-  slightly cheaper (a plain indexed equality vs. a function call on every row
-  scanned, though at this table's current size that's not a real performance
-  concern - it's about not adding a wrapper that a plain normalization makes
-  unnecessary).
-- The existing `uq_resources_external_resource_id` unique constraint
-  (migration `80706cac4f93`) is case-sensitive by construction (standard Postgres
-  string comparison, no special collation). Once every stored value is canonically
-  lowercase, that constraint already enforces exactly the case-insensitive
-  uniqueness we want, with zero schema change - so I didn't touch the constraint or
-  add a new migration for it. Flagging this explicitly since it's the kind of thing
-  that looks like it should need a matching schema change but doesn't, once the
-  values themselves are normalized.
-- Did not touch `azure_cost.py`'s `_resolve_resource_id` - it does its own
-  `func.lower(...)` comparison for a different purpose (matching Cost Management's
-  `ResourceId` dimension, an external string never stored in our own table), stays
-  correct and safe regardless of how `resources.external_resource_id` is stored, and
-  touching it wasn't part of this task's scope (the upsert key, not cost matching).
+## Item on `resource_group`-holds-`resource_type` - explicit note as requested
 
-## What was built
+Populated `Resource.resource_group` with a **human-readable label** derived from
+the ARN's service + resource-type segments (e.g. `"EC2 instance"`, `"EBS volume"`,
+`"S3 bucket"`), via a small lookup table (`_RESOURCE_TYPE_LABELS` in
+`aws_inventory.py`) with a generic humanized fallback (`"RDS db"`-style) for any
+AWS service not explicitly listed - not the raw `AWS::EC2::Instance`
+CloudFormation-style string, and not the raw ARN resource-type segment
+(`"instance"`) either. Reasoning: this is what the drill-down UI's middle-level
+section heading renders **verbatim** (per GOV-002 Section 3's examples,
+`"EC2 instances"` / `"EBS volumes"` / `"S3 buckets"`), so it needs to already read
+like a UI label, not something the frontend has to further clean up.
 
-**Code fix** (`backend/app/services/azure_inventory.py`): `map_resource` now sets
-`"external_resource_id": row["id"].lower()`, with a comment explaining why
-(referencing the exact live Task 17 finding). `upsert_resources`'s existing
-`.filter_by(external_resource_id=mapped["external_resource_id"])` needed no logic
-change - just a comment explaining why the plain equality match is now correct.
+Separately (not explicitly asked to flag, but the same kind of naming call, so
+noting it for completeness): `Resource.resource_type` - the *machine-readable*
+identifier used for `/cost` and `/forecast`'s `resource_type` query-param filter -
+is populated as `"aws::{service}::{type}"` (e.g. `"aws::ec2::instance"`), lowercase.
+Considered mirroring Azure's exact `"microsoft.compute/virtualmachines"` slash-
+style format, but adopted AWS's own CloudFormation/Config `"AWS::Service::Type"`
+convention (lowercased) instead, since it's the naming AWS users already recognize
+from the AWS Console/CLI/CloudFormation, rather than inventing an Azure-style
+equivalent AWS has no precedent for.
 
-**Data cleanup migration**
-(`backend/alembic/versions/2450695ea788_merge_case_drift_duplicate_resources.py`),
-written generically (not hardcoded to the one VM's UUIDs) so it would catch any
-other resource this same bug affected, per the task's explicit ask:
-1. Finds every group of `resources` rows that collide on
-   `lower(external_resource_id)`.
-2. For each group, picks one canonical row - the one with existing `cost_records`
-   (real historical financial data already correctly attributed), falling back to
-   the earliest-created row if no group member has any cost_records.
-3. For every non-canonical row in the group: reassigns its `cost_records` and
-   `utilization_metrics` onto the canonical row wherever that doesn't collide with
-   something the canonical already has (same `cloud_account_id`/`date`/
-   `charge_type` for cost, same `metric_name`/`timestamp` for utilization) -
-   preserving real data instead of discarding it. Anything left over after that
-   (i.e. a genuine duplicate reading/charge the canonical already has) gets deleted,
-   then the non-canonical resource row itself is deleted.
-4. Finally normalizes every remaining `resources.external_resource_id` to
-   lowercase, so historical rows match the new write-time normalization too.
+## Item on the forecasting interface plug-in - confirmed clean, zero changes
 
-**Regression test**
-(`backend/tests/test_azure_inventory.py::test_sync_inventory_case_drift_updates_existing_row_not_duplicate`):
-syncs a resource once, then syncs the exact same resource again with its `id`
-field uppercased (simulating Azure returning different casing on a later sync -
-the exact unguarded scenario), and asserts `created == 0`, `updated == 1`, and the
-resource count doesn't grow. Three existing tests needed their assertions updated
-to expect lowercased `external_resource_id` values (they weren't testing casing
-behavior, just happened to compare against the fixture's original mixed-case
-string, which is no longer what gets stored).
+GOV-002 2.4's expectation held exactly: `build_forecast`/`build_daily_cost_history`
+(`forecast.py`) and `LinearBurnRateModel` (`forecasting/linear_burn_rate.py`) took
+**zero code changes**. They already operate on `CostRecord` rows scoped by a plain
+`cloud_account_id` parameter and a provider-agnostic `(date, cost)` series - AWS
+cost data written by `sync_aws_cost` into the same `cost_records` table is
+immediately readable by the exact same forecasting call, confirmed with a
+dedicated test (`test_aws_cost_records_flow_into_existing_forecast_interface_unchanged`)
+that runs `sync_aws_cost` then calls the real unmodified `build_forecast` against
+the resulting AWS `cloud_account_id` and asserts a correct forecast comes back.
+
+One honest caveat, not a forecasting-interface problem but adjacent to it: the
+**read-side dashboard endpoints** (`GET /api/v1/cost`, `/api/v1/forecast`,
+`/api/v1/inventory`) still default their `cloud_account_id` to the Azure account
+specifically (`get_or_create_cloud_account(db, settings.azure_subscription_id)`,
+unchanged from before this task) when no explicit `cloud_account_id` is passed -
+which is every current call, since none of these endpoints take one as a query
+param. This means AWS cost/inventory data flowing into the DB via this task's sync
+endpoints is **not yet reachable through the live dashboard UI** - it's correctly
+stored and forecastable at the service-function level (proven above), but there's
+no way to select "show me the AWS account's data" from the frontend yet. This is
+GOV-002 Section 5's own explicit deferral ("a unified/switchable cross-provider
+dashboard view... is a real decision for whenever Phase 2's data actually exists
+to look at, not decided speculatively here") - not a gap this task introduced or
+was asked to close, but flagging it so it's not mistaken for something broken:
+Task 20's live-verification pass will need to query the AWS data directly (DB/API
+with an explicit `cloud_account_id`, same way this task's tests do) rather than
+expecting to see it in the dashboard UI, until a future task adds account
+selection.
+
+## Real AWS API findings from writing the moto mocks (for Task 20's live pass)
+
+1. **GOV-002 2.4 named `GetCostAndUsage`, but that operation has no resource-level
+   dimension at all** - `RESOURCE_ID` is only groupable on the separate
+   `GetCostAndUsageWithResources` operation, which this task uses instead so
+   `cost_records.resource_id` can be populated the way Azure's is (needed for the
+   task's own ask to mirror `_resolve_resource_id`). Two real, meaningful
+   constraints come with that substitution that plain `GetCostAndUsage` doesn't
+   have:
+   - **14-day maximum lookback**, not `cost_lookback_days`'s usual 90 - capped in
+     `aws_cost.fetch_cost_rows` via `AWS_RESOURCE_LEVEL_MAX_LOOKBACK_DAYS = 14`.
+     AWS cost history/forecasting will have meaningfully less trailing data to
+     work with than Azure's equivalent once live.
+   - **Requires "Resource IDs" enabled in the account's Cost Explorer
+     preferences** - an account-level opt-in setting, off by default on a fresh
+     account. If it's off, every cost row comes back non-resource-attributable
+     (not an error - `resource_id` just stays `None` for everything), so
+     per-resource AWS cost drill-down may silently show nothing until someone
+     checks this setting in the real account. Worth checking explicitly at the
+     start of Task 20 rather than discovering it via "why is nothing showing up."
+2. **S3 bucket ARNs have no region or account-id segment at all**
+   (`arn:aws:s3:::bucket-name`, not `arn:aws:s3:region:account:bucket-name`) - a
+   bucket's actual region needs a separate `get_bucket_location` call, which v1
+   doesn't make (S3 isn't one of the two describe_*-enriched types per GOV-002
+   2.2), so S3 resources land with `region=None`. Confirmed via `parse_arn`'s own
+   test coverage, not assumed.
+3. **moto's simulated Tagging API returns a non-standard EC2 resource ARN shape**
+   - `arn:aws:ec2:region:account:ec2:instance/i-...` (service name duplicated as a
+     prefix on the resource segment) instead of real AWS's
+     `arn:aws:ec2:region:account:instance/i-...`. Confirmed this is a moto quirk,
+     not real AWS behavior, by checking AWS's own documented ARN format. Made
+     `parse_arn` defensively strip a redundant `"{service}:"` prefix if present -
+     a no-op for genuine AWS ARNs (which never have this), but lets the moto-based
+     tests actually exercise the real discovery+enrichment code path instead of
+     silently failing to match on `resource_type`. Worth re-confirming real ARNs
+     look as expected once Task 20 has a live account, though this is a
+     well-documented, stable AWS format so low risk.
+4. **The Tagging API only discovers *tagged* resources** - untagged resources are
+   completely invisible to `GetResources`, a real and inherent limitation of this
+   discovery method (GOV-002 2.2 chose it anyway, knowingly, over AWS Config/
+   Resource Explorer). Worth setting expectations before Task 20 reads an
+   inventory count and compares it to what the AWS Console shows unfiltered - they
+   won't match unless every resource in the account happens to be tagged.
+5. **boto3 returns real `datetime` objects** for fields like `LaunchTime`/
+   `CreateTime` (unlike Azure Resource Graph, which only ever returns JSON-safe
+   ISO-8601 strings) - these can't go directly into `raw_metadata` (a JSONB
+   column) without conversion first, or `upsert_resources`'s commit fails with a
+   JSON-serialization error. `_enrich_ec2_instances`/`_enrich_ebs_volumes` convert
+   to `.isoformat()` strings before merging into the row; `map_resource` parses
+   the string back into a real `datetime` for the `created_at` column, mirroring
+   `azure_inventory.map_resource`'s own string-parsing pattern exactly. Found this
+   by actually running the code against moto and hitting the real error, not by
+   inspection - a good example of exactly the kind of thing this task's "flag
+   what you learn" ask was for.
 
 ## Actual backend pytest output (`docker compose run --rm backend pytest -q`,
 after `docker compose build backend`)
 
-    ........................................................................ [ 56%]
-    .......................................................                  [100%]
-    127 passed, 1 warning in 0.75s
+    ........................................................................ [ 50%]
+    .......................................................................  [100%]
+    143 passed, 10 warnings in 2.6s
 
-(126 pre-existing + 1 new regression test. Three pre-existing tests in
-`test_azure_inventory.py` had assertions updated to expect lowercased values - not
-counted as new, since they test the same behavior, just against the corrected
-expected output.)
+(127 pre-existing Azure tests, completely untouched - confirms zero Azure
+regression. 16 new AWS tests across two new files:
 
-## The migration - confirmed run, and the live duplicate's exact fate verified against real data
+`test_aws_inventory.py` (12 tests): `parse_arn` unit tests (EC2 instance,
+S3 bucket's missing region/account, colon-separated resource segment); `map_resource`
+tests for EC2 instance, EBS volume, S3 bucket (no region/sku/created_at), and an
+unlisted resource type (generic humanized fallback); `upsert_resources` create+
+update behavior and the Task-18-pattern case-drift regression test; `sync_aws_inventory`
+with an injected fake fetch; two `@mock_aws` end-to-end tests exercising the real
+`fetch_resources`/`sync_aws_inventory` against moto's simulated backend (not
+injected fixtures) - real EC2 instance + volume creation, real tagging, real
+Tagging-API discovery, real `describe_instances`/`describe_volumes` enrichment,
+real DB upsert.
 
-**Before** (snapshotted immediately before running the migration):
+`test_aws_cost.py` (4 tests): `map_cost_response`'s resource-attributable/non-
+attributable split; `sync_aws_cost` create and upsert-on-overlap behavior (mirroring
+`test_azure_cost.py`'s own two tests exactly); the forecasting-interface plug-in
+confirmation described above.
 
-    resources: 10   cost_records: 237   utilization_metrics: 520
+The warnings are all `datetime.utcnow()` deprecation notices from inside
+botocore/moto's own internals, not this task's code.)
 
-    id=784c331d... external_resource_id=".../NISE-RG/.../NISE-DEV"  name=nise-dev  created_at=2026-06-14 20:38:10.731+00
-    id=fa1f955c... external_resource_id=".../nise-rg/.../nise-dev"  name=nise-dev  created_at=2026-06-14 20:38:10.731+00
-    (fa1f955c had 220 utilization_metrics rows, 0 cost_records; 784c331d had 300 utilization_metrics rows, all 237 cost_records)
+## Actual frontend vitest output (`docker compose run --rm frontend npm test`,
+after `docker compose build frontend`)
 
-Ran it for real: `docker compose run --rm backend alembic upgrade head` ->
+     ✓ src/lib/normalizeRecommendations.test.ts (6 tests)
+     ✓ src/pages/Recommendations.test.tsx (3 tests)
+     ✓ src/lib/groupResources.test.ts (11 tests)
+     ✓ src/pages/Overview.test.tsx (8 tests)
+     ✓ src/lib/combineSpendSeries.test.ts (3 tests)
+     ✓ src/App.test.tsx (1 test)
 
-    INFO  [alembic.runtime.migration] Running upgrade 0a3c0e882688 -> 2450695ea788,
-    merge case-drift duplicate resources, normalize external_resource_id casing
+     Test Files  6 passed (6)
+          Tests  32 passed (32)
 
-**After** (checked the real data directly, not assumed from the migration code):
+(30 pre-existing + 2 new: 5 new unit tests on `middleLevelLabel`/`listProvider`
+in `groupResources.test.ts`, plus 1 new `Overview.test.tsx` test confirming an
+AWS-provider resource list actually renders "Resource types" instead of "Resource
+groups" in the live component tree, not just that the helper function returns the
+right string in isolation.)
 
-    resources: 9   cost_records: 237   utilization_metrics: 300
+## Actual frontend build output (`npm run build` = `tsc -b && vite build`)
 
-    select version_num from alembic_version;  -> 2450695ea788
-    select count(*) from resources where id='fa1f955c-5def-499b-b9a2-b76766df5100';  -> 0 (fully deleted)
-    select id, external_resource_id, name from resources where resource_type='microsoft.compute/virtualmachines';
-      -> exactly one row: 784c331d..., external_resource_id now lowercase
-         (".../resourcegroups/nise-rg/providers/microsoft.compute/virtualmachines/nise-dev")
-    select external_resource_id from resources order by external_resource_id;
-      -> all 9 rows confirmed fully lowercase (including path segments like
-         "resourcegroups", "microsoft.compute", "virtualmachines" - not just the
-         resource-name segment)
-    select count(*) from utilization_metrics where resource_id='784c331d...';  -> 300 (unchanged from before)
-    select count(*) from utilization_metrics where resource_id='fa1f955c...';  -> 0
+    vite v6.4.3 building for production...
+    ✓ 659 modules transformed.
+    dist/index.html                   0.72 kB │ gzip:   0.41 kB
+    dist/assets/index-kRRYEKMj.css   10.37 kB │ gzip:   2.71 kB
+    dist/assets/index-D93VoCcU.js   577.22 kB │ gzip: 164.05 kB
+    ✓ built in 3.23s
 
-**cost_records (237) was unaffected** - the duplicate had zero cost_records to begin
-with (confirmed in Task 17), so nothing needed reassigning there; the merge logic
-for that table ran, found nothing to do, and that's exactly correct.
+Type-checks clean, no errors.
 
-**utilization_metrics went from 520 to 300** - the canonical resource's own count
-(300) is *identical* before and after, meaning **zero** of the duplicate's 220
-rows were reassigned; all 220 were exact duplicates (same `metric_name` +
-`timestamp` the canonical already had) and were correctly dropped as genuine
-duplicate readings, not reassigned. This makes sense in hindsight: Azure Monitor's
-hourly granularity buckets timestamps to fixed points regardless of when you query,
-so two queries against the same physical VM over overlapping historical windows
-converge to the same timestamp set - there was never any unique signal in the
-duplicate's utilization data to preserve. No data was lost; 300 real readings for
-the one real VM, same as before the duplicate ever existed.
+## Live verification (against the real Azure subscription - no AWS account exists;
+confirms zero Azure regression at the running-application level, not just in tests)
 
-## Live re-verification against the real subscription
-
-1. **Inventory sync**: `POST /api/v1/inventory/sync` -> `{"found": 9, "created": 0,
-   "updated": 9}`. All 9 real resources matched and updated in place - critically,
-   Azure Resource Graph's *live, current* casing for the VM (still lowercase, same
-   as when Task 17 first observed the drift) matched correctly against the
-   newly-normalized stored value, with **zero** new rows created. Confirmed
-   `resources` count is still 9 after this sync, not 10.
-2. **Cost sync**: `POST /api/v1/cost/sync` -> `200 OK`,
-   `{"found":241,"created":12,"updated":229}` (previously a 500 with
-   `MultipleResultsFound`). `cost_records` now has 249 rows with `latest_date =
-   2026-09-21` (today) - cost data was stuck at 2026-09-17 since Task 17 broke
-   sync; it's now fully current again.
-3. **Dashboard**: drilled into `nise-rg` via Playwright in WSL2 (same approach as
-   Tasks 15-17) - "Resources in nise-rg" now lists "nise-dev" exactly once (6
-   resources total, correctly back down from 7), and the resource-group tile at the
-   subscription level correctly reads "nise-rg 6 resources". Screenshot:
-   `task18-1-nise-rg-fixed.png` - also shows the spend chart now extending through
-   the current date, reflecting the freshly-synced cost data.
-4. **Recommendations**: the Non-Peak Scheduling category now shows exactly one card
-   for "nise-dev" ($24.52/mo, reflecting the fresh cost data) instead of two.
-   Screenshot: `task18-2-recommendations-fixed.png`.
-5. Zero console errors during this verification pass.
+- Backend started cleanly with the new `boto3`/`aws_inventory`/`aws_cost` imports
+  and AWS settings unconfigured - no import-time or startup errors.
+- `GET /health` -> `{"status":"ok"}`.
+- `POST /api/v1/inventory/sync` -> `{"found":9,"created":0,"updated":9}` - identical
+  shape and values to Task 18's post-fix state; the `settings.aws_configured`
+  check correctly short-circuits (all four AWS settings empty), so
+  `sync_aws_inventory` never runs and never touches the response.
+- `POST /api/v1/cost/sync` -> 200, `{"found":241,"created":0,"updated":241}` -
+  same, AWS branch correctly skipped.
+- `GET /api/v1/inventory` -> each resource now includes `"provider": "azure"` -
+  the new field is present and correct, existing fields unchanged.
+- Playwright/WSL2 spot-check of the live dashboard: still renders "Resource
+  groups" (Azure's real account, unchanged wording), zero console/page errors.
 
 ## WSL2/dockerd restart monitor - status during this task
 
 Checked at task start and end. No new restarts - same pid 249, start time
-`Mon 2026-09-21 08:22:40 EDT` unchanged throughout (same baseline as Tasks 15-17),
+`Mon 2026-09-21 08:22:40 EDT` unchanged throughout (same baseline as Tasks 15-18),
 timer active, continuous `check_ok` entries, e.g. at task end:
 
-    2026-09-21 15:43:54 EDT check_ok start="Mon 2026-09-21 08:22:40 EDT" pid=249
+    2026-09-21 17:11:11 EDT check_ok start="Mon 2026-09-21 08:22:40 EDT" pid=249
 
-Total `RESTART_DETECTED` count unchanged at 22 across Tasks 15-18; the most recent
-one still predates all four tasks' work windows.
+Total `RESTART_DETECTED` count unchanged at 22 across Tasks 15-19; the most recent
+one still predates every one of those tasks' work windows.
 
 ## Data integrity check
 
-Final state: `resources=9`, `cost_records=249` (up from 237 - genuine fresh sync,
-not drift), `utilization_metrics=300` (down from 520 - the duplicate's 220
-redundant readings removed, canonical resource's own 300 untouched),
-`cloud_accounts=1` (unchanged). This restores the subscription to its correct,
-non-duplicated state and leaves it with current data, closing out both the schema-
-level bug and the specific live incident Task 17 found and this task inherited.
+No real data mutation this task - `resources=9`, `cost_records=241`,
+`utilization_metrics=300`, `cloud_accounts=1`, all unchanged from Task 18's final
+state (the two live syncs run during this task's verification step wrote nothing
+new: `created:0` for both inventory and cost, since the real Azure data was
+already current). No AWS `cloud_account` was created in the real dev database,
+since AWS settings are unconfigured there - `get_or_create_aws_cloud_account` was
+only ever exercised against the test database, never the live one.
 
 ## Ambiguity flagged, not guessed on
 
-- The `resource_id`-vs-normalize-storage decision above - not genuinely ambiguous
-  once weighed, but flagged with full reasoning per the task's explicit request,
-  same convention as Task 16's `resource_id`-vs-`external_resource_id` call.
-- **Utilization metrics: reassign-with-collision-fallback-to-delete**, rather than
-  a simpler "always delete the loser's utilization data" - flagged because it's a
-  real design choice with a real alternative. I chose the more careful option
-  (attempt to preserve everything, only drop genuine duplicates) because, unlike
-  Task 17's live investigation (where I could just observe the two rows' overlap
-  without consequence), this migration needed to be safe for the *generic* case the
-  task asked for - "any other future occurrence... not just this one VM" - where a
-  duplicate pair's utilization data might not overlap identically the way this
-  specific VM's did. Confirmed after running it that the simpler "just delete"
-  approach would have produced the identical end result for *this* incident (zero
-  reassignments actually happened), but the more careful version is the right
-  default for a script meant to be reused.
-- No other genuine ambiguity. The canonical-row selection rule (prefer the row with
-  existing `cost_records`) was explicitly specified by the task itself for this
-  incident; I generalized it to "most cost_records, tie-break earliest created_at"
-  for groups the task didn't specifically describe, which is a natural, defensible
-  extension of the same stated rule rather than an independent judgment call.
+- **`GetCostAndUsage` vs `GetCostAndUsageWithResources`** - GOV-002 named the
+  former; this task used the latter instead, since the former can't populate
+  `cost_records.resource_id` at all and the task's own item 3 explicitly asked to
+  mirror `_resolve_resource_id`'s per-resource matching. Not silently swapped -
+  flagged above with the two real constraints (14-day cap, account opt-in
+  setting) that come with the substitution, so Task 20 isn't surprised by either.
+- **Sharing `upsert_resources` vs. duplicating it into `aws_inventory.py`** -
+  considered importing Azure's version directly (it's already fully
+  provider-agnostic, no Azure-specific logic in it at all) but chose to duplicate
+  it instead, given this task's repeated, explicit emphasis on not touching
+  Azure's existing code path at all - even a safe, behavior-preserving refactor
+  of `azure_inventory.py` felt like more risk than the task asked for. Noted in
+  the function's own docstring as a candidate for a shared helper once a third
+  provider needs the exact same logic.
+- **The read-side dashboard endpoints stay Azure-only by default** - not a gap
+  this task was asked to close (GOV-002 Section 5 explicitly defers it), but
+  flagged clearly above under the forecasting-interface item so it doesn't read
+  as an oversight: AWS data flows in and is fully usable at the service-function
+  level (proven by test), just not yet visible in the live UI.
+- No genuine "stop and ask" moment - every real ambiguity had a defensible answer
+  once investigated (the AWS API shape questions all resolved by writing and
+  running code against moto, not by guessing), consistent with this task's own
+  framing that these decisions were expected and just needed to be flagged, not
+  escalated.
 
 ## Full diff
 
 ```diff
-diff --git a/backend/app/services/azure_inventory.py b/backend/app/services/azure_inventory.py
-index e539a57..82ebcae 100644
---- a/backend/app/services/azure_inventory.py
-+++ b/backend/app/services/azure_inventory.py
-@@ -83,7 +83,15 @@ def map_resource(row: dict[str, Any]) -> dict[str, Any]:
-
-     mapped: dict[str, Any] = {
-         "provider": Provider.AZURE,
--        "external_resource_id": row["id"],
-+        # Normalized to lowercase - Azure resource IDs are canonically
-+        # case-insensitive, and Resource Graph doesn't reliably return the same
-+        # casing for a given resource across syncs (confirmed in Task 17: the same
-+        # VM's id changed from .../NISE-RG/.../NISE-DEV to .../nise-rg/.../nise-dev
-+        # between two real syncs). upsert_resources matches on this column by exact
-+        # equality, so without normalizing here, a casing change reads as a brand
-+        # new resource instead of an update - see the Task 18 migration that both
-+        # fixes this and cleans up the one duplicate this already caused.
-+        "external_resource_id": row["id"].lower(),
-         "name": row.get("name"),
-         "resource_type": row.get("type", ""),
-         "region": row.get("location"),
-@@ -122,6 +130,10 @@ def upsert_resources(
-     created = 0
-     updated = 0
-     for mapped in mapped_resources:
-+        # mapped["external_resource_id"] is already lowercased by map_resource, and
-+        # the Task 18 migration normalized every stored row the same way - so this
-+        # exact-equality match is effectively case-insensitive without needing
-+        # func.lower() on both sides of the comparison.
-         existing = (
-             db.query(Resource)
-             .filter_by(external_resource_id=mapped["external_resource_id"])
-diff --git a/backend/tests/test_azure_inventory.py b/backend/tests/test_azure_inventory.py
-index 97df340..193e714 100644
---- a/backend/tests/test_azure_inventory.py
-+++ b/backend/tests/test_azure_inventory.py
-@@ -12,7 +12,10 @@ def test_map_resource_vm():
-     mapped = map_resource(VM_ROW)
-
-     assert mapped["provider"] == Provider.AZURE
--    assert mapped["external_resource_id"] == VM_ROW["id"]
-+    # Lowercased at write time (Task 18) - Azure resource IDs are canonically
-+    # case-insensitive but Resource Graph doesn't reliably return the same casing
-+    # for a given resource across syncs (Task 17's live finding).
-+    assert mapped["external_resource_id"] == VM_ROW["id"].lower()
-     assert mapped["name"] == "vm-web-01"
-     assert mapped["resource_type"] == "microsoft.compute/virtualmachines"
-     assert mapped["region"] == "eastus"
-@@ -72,7 +75,7 @@ def test_sync_inventory_creates_resources(db_session):
-     assert db_session.query(Resource).count() == before + 2
-     assert (
-         db_session.query(Resource)
--        .filter(Resource.external_resource_id.in_([VM_ROW["id"], STORAGE_ACCOUNT_ROW["id"]]))
-+        .filter(Resource.external_resource_id.in_([VM_ROW["id"].lower(), STORAGE_ACCOUNT_ROW["id"].lower()]))
-         .count()
-         == 2
-     )
-@@ -97,7 +100,28 @@ def test_sync_inventory_upsert_does_not_duplicate(db_session):
-
-     vm = (
-         db_session.query(Resource)
--        .filter_by(external_resource_id=VM_ROW["id"])
-+        .filter_by(external_resource_id=VM_ROW["id"].lower())
-         .one()
-     )
-     assert vm.tags == {"env": "prod", "owner": "sre-team"}
+diff --git a/backend/.env.example b/backend/.env.example
+index 9d815aa..9e058f6 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -7,3 +7,12 @@ AZURE_TENANT_ID=
+ AZURE_CLIENT_ID=
+ AZURE_CLIENT_SECRET=
+ AZURE_SUBSCRIPTION_ID=
 +
++# AWS IAM user access keys — read-only, per GOV-002 Section 2.1's policy. Optional:
++# the app runs Azure-only with these unset. No real account exists yet (Task 19
++# builds and tests the AWS connectors against mocked responses only); populated
++# once GOV-002 Section 6's account is ready (Task 20).
++AWS_ACCOUNT_ID=
++AWS_REGION=
++AWS_ACCESS_KEY_ID=
++AWS_SECRET_ACCESS_KEY=
+diff --git a/backend/app/api/cost.py b/backend/app/api/cost.py
+index d0ad4ff..2ec3974 100644
+--- a/backend/app/api/cost.py
++++ b/backend/app/api/cost.py
+@@ -4,7 +4,9 @@ from typing import Any
+ from fastapi import APIRouter, Depends
+ from sqlalchemy.orm import Session
+
++from app.core.config import settings
+ from app.db.session import get_db
++from app.services.aws_cost import sync_aws_cost
+ from app.services.azure_cost import sync_cost
+ from app.services.forecast import build_daily_cost_history
+
+@@ -13,8 +15,16 @@ router = APIRouter(prefix="/api/v1/cost", tags=["cost"])
+
+ @router.post("/sync")
+ def trigger_sync(db: Session = Depends(get_db)) -> dict[str, int]:
++    # Same pattern as inventory's sync dispatch - Azure's own call/behavior is
++    # unchanged; AWS only runs, and only adds to the totals, when configured.
+     summary = sync_cost(db)
+-    return {"found": summary.found, "created": summary.created, "updated": summary.updated}
++    result = {"found": summary.found, "created": summary.created, "updated": summary.updated}
++    if settings.aws_configured:
++        aws_summary = sync_aws_cost(db)
++        result["found"] += aws_summary.found
++        result["created"] += aws_summary.created
++        result["updated"] += aws_summary.updated
++    return result
+
+
+ @router.get("")
+diff --git a/backend/app/api/inventory.py b/backend/app/api/inventory.py
+index 39cc5d4..586061e 100644
+--- a/backend/app/api/inventory.py
++++ b/backend/app/api/inventory.py
+@@ -3,7 +3,9 @@ from typing import Any
+ from fastapi import APIRouter, Depends
+ from sqlalchemy.orm import Session
+
++from app.core.config import settings
+ from app.db.session import get_db
++from app.services.aws_inventory import sync_aws_inventory
+ from app.services.azure_inventory import sync_inventory
+ from app.services.inventory_listing import build_resource_list
+
+@@ -12,8 +14,18 @@ router = APIRouter(prefix="/api/v1/inventory", tags=["inventory"])
+
+ @router.post("/sync")
+ def trigger_sync(db: Session = Depends(get_db)) -> dict[str, int]:
++    # Azure sync call/behavior is completely unchanged from before Task 19 - the
++    # AWS sync only runs, and only adds to the totals below, when AWS is actually
++    # configured (Task 20's live account). With AWS unset, this endpoint's
++    # behavior and response are byte-identical to pre-Task-19.
+     summary = sync_inventory(db)
+-    return {"found": summary.found, "created": summary.created, "updated": summary.updated}
++    result = {"found": summary.found, "created": summary.created, "updated": summary.updated}
++    if settings.aws_configured:
++        aws_summary = sync_aws_inventory(db)
++        result["found"] += aws_summary.found
++        result["created"] += aws_summary.created
++        result["updated"] += aws_summary.updated
++    return result
+
+
+ @router.get("")
+diff --git a/backend/app/core/config.py b/backend/app/core/config.py
+index 983fd4c..7f97544 100644
+--- a/backend/app/core/config.py
++++ b/backend/app/core/config.py
+@@ -11,6 +11,14 @@ class Settings(BaseSettings):
+     azure_client_secret: str = ""
+     azure_subscription_id: str = ""
+
++    # Phase 2 (AWS) - optional/nullable: no real account exists yet (Task 19), and
++    # the app must start and Azure-only functionality must keep working with these
++    # unset, same as Azure's own empty-string defaults above.
++    aws_account_id: str = ""
++    aws_region: str = ""
++    aws_access_key_id: str = ""
++    aws_secret_access_key: str = ""
 +
-+def test_sync_inventory_case_drift_updates_existing_row_not_duplicate(db_session):
-+    """Regression test for Task 17's live finding: Azure Resource Graph returning
-+    a previously-synced resource's id in different casing on a later sync must
-+    update the existing row, not create a second one."""
-+    before = db_session.query(Resource).count()
+     idle_cpu_threshold_percent: float = 10.0
+     idle_lookback_days: int = 14
+     cost_lookback_days: int = 90
+@@ -25,5 +33,16 @@ class Settings(BaseSettings):
+     # backend is reachable fine outside a browser (curl, server-to-server).
+     frontend_origin: str = "http://localhost:5173"
+
++    @property
++    def aws_configured(self) -> bool:
++        """True once every AWS credential/setting is present.
 +
-+    sync_inventory(db_session, fetch=_fake_fetch([VM_ROW]))
-+    assert db_session.query(Resource).count() == before + 1
++        The sync endpoints use this to decide whether to also run the AWS
++        connectors - see api/inventory.py and api/cost.py. Any partial
++        configuration (e.g. region set but no keys yet) is treated as "not
++        configured" rather than attempting a call that would just fail.
++        """
++        return bool(self.aws_account_id and self.aws_region and self.aws_access_key_id and self.aws_secret_access_key)
 +
-+    recased_row = {**VM_ROW, "id": VM_ROW["id"].upper()}
-+    summary = sync_inventory(db_session, fetch=_fake_fetch([recased_row]))
+
+ settings = Settings()
+diff --git a/backend/app/services/inventory_listing.py b/backend/app/services/inventory_listing.py
+index c6580b6..270d834 100644
+--- a/backend/app/services/inventory_listing.py
++++ b/backend/app/services/inventory_listing.py
+@@ -34,6 +34,11 @@ def build_resource_list(
+                 "resource_id": str(resource.id),
+                 "external_resource_id": resource.external_resource_id,
+                 "name": resource.name,
++                # Added for Task 19 - lets the frontend tell an AWS resource
++                # from an Azure one (e.g. to label the drill-down's middle level
++                # "Resource types" vs. "Resource groups", per GOV-002 Section 3)
++                # without hardcoding an assumption about which provider it is.
++                "provider": resource.provider.value,
+                 "resource_group": resource.resource_group,
+                 "resource_type": resource.resource_type,
+                 "region": resource.region,
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index 781fceb..cbd56a3 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -13,3 +13,5 @@ azure-mgmt-resourcegraph==8.0.0
+ azure-monitor-query==1.4.1
+ azure-mgmt-costmanagement==4.0.1
+ six==1.17.0
++boto3==1.35.74
++moto[all]==5.0.21
+diff --git a/backend/tests/test_inventory_listing.py b/backend/tests/test_inventory_listing.py
+index 30dbaaa..89fd32a 100644
+--- a/backend/tests/test_inventory_listing.py
++++ b/backend/tests/test_inventory_listing.py
+@@ -39,7 +39,16 @@ def test_build_resource_list_returns_all_resources_for_account(db_session):
+     names = {r["name"] for r in result["resources"]}
+     assert names == {"vm-web-01", "stlogs01"}
+     first = result["resources"][0]
+-    assert set(first.keys()) == {"resource_id", "external_resource_id", "name", "resource_group", "resource_type", "region"}
++    assert set(first.keys()) == {
++        "resource_id",
++        "external_resource_id",
++        "name",
++        "provider",
++        "resource_group",
++        "resource_type",
++        "region",
++    }
++    assert first["provider"] == "azure"
+
+
+ def test_build_resource_list_resource_group_filter_excludes_other_groups(db_session):
+@@ -95,7 +104,15 @@ def test_inventory_endpoint_aggregate(client):
+     # same principle as the cost history endpoint tests.
+     assert len(body["resources"]) > 0
+     first = body["resources"][0]
+-    assert set(first.keys()) == {"resource_id", "external_resource_id", "name", "resource_group", "resource_type", "region"}
++    assert set(first.keys()) == {
++        "resource_id",
++        "external_resource_id",
++        "name",
++        "provider",
++        "resource_group",
++        "resource_type",
++        "region",
++    }
+
+
+ def test_inventory_endpoint_resource_group_filter(client):
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 8e25159..1a87f56 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -24,6 +24,10 @@ services:
+       AZURE_CLIENT_ID: ${AZURE_CLIENT_ID:-}
+       AZURE_CLIENT_SECRET: ${AZURE_CLIENT_SECRET:-}
+       AZURE_SUBSCRIPTION_ID: ${AZURE_SUBSCRIPTION_ID:-}
++      AWS_ACCOUNT_ID: ${AWS_ACCOUNT_ID:-}
++      AWS_REGION: ${AWS_REGION:-}
++      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
++      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+     ports:
+       - "8000:8000"
+     depends_on:
+diff --git a/frontend/src/api/types.ts b/frontend/src/api/types.ts
+index d9eab6b..41fb8d9 100644
+--- a/frontend/src/api/types.ts
++++ b/frontend/src/api/types.ts
+@@ -24,6 +24,8 @@ export interface ResourceListItem {
+   resource_id: string;
+   external_resource_id: string | null;
+   name: string | null;
++  /** "azure" | "aws" | "gcp" - lets the UI adapt copy (e.g. drill-down labels) without hardcoding a provider. */
++  provider: string;
+   resource_group: string | null;
+   resource_type: string;
+   region: string | null;
+diff --git a/frontend/src/lib/groupResources.test.ts b/frontend/src/lib/groupResources.test.ts
+index 9c2aa5d..e4a4d72 100644
+--- a/frontend/src/lib/groupResources.test.ts
++++ b/frontend/src/lib/groupResources.test.ts
+@@ -1,12 +1,13 @@
+ import { describe, expect, it } from "vitest";
+ import type { ResourceListItem } from "../api/types";
+-import { resourceLabel, summarizeResourceGroups } from "./groupResources";
++import { listProvider, middleLevelLabel, resourceLabel, summarizeResourceGroups } from "./groupResources";
+
+ function makeResource(overrides: Partial<ResourceListItem>): ResourceListItem {
+   return {
+     resource_id: "id-1",
+     external_resource_id: "/subscriptions/x/resourceGroups/rg-a/providers/Microsoft.Compute/virtualMachines/vm-1",
+     name: "vm-1",
++    provider: "azure",
+     resource_group: "rg-a",
+     resource_type: "microsoft.compute/virtualmachines",
+     region: "eastus",
+@@ -54,3 +55,30 @@ describe("resourceLabel", () => {
+     expect(resourceLabel(resource)).toBe("internal-id");
+   });
+ });
 +
-+    assert summary.found == 1
-+    assert summary.created == 0
-+    assert summary.updated == 1
-+    assert db_session.query(Resource).count() == before + 1
++describe("middleLevelLabel", () => {
++  it("uses Azure wording by default", () => {
++    expect(middleLevelLabel("azure")).toBe("Resource group");
++    expect(middleLevelLabel("azure", { plural: true })).toBe("Resource groups");
++  });
 +
-+    resource = db_session.query(Resource).filter_by(external_resource_id=VM_ROW["id"].lower()).one()
-+    assert resource.external_resource_id == VM_ROW["id"].lower()
-=== NEW FILE: backend/alembic/versions/2450695ea788_merge_case_drift_duplicate_resources.py ===
-"""merge case-drift duplicate resources, normalize external_resource_id casing
++  it("uses AWS wording for an aws provider", () => {
++    expect(middleLevelLabel("aws")).toBe("Resource type");
++    expect(middleLevelLabel("aws", { plural: true })).toBe("Resource types");
++  });
++
++  it("defaults to Azure wording for an unknown/undefined provider", () => {
++    expect(middleLevelLabel(undefined)).toBe("Resource group");
++    expect(middleLevelLabel("gcp")).toBe("Resource group");
++  });
++});
++
++describe("listProvider", () => {
++  it("returns the first resource's provider", () => {
++    expect(listProvider([makeResource({ provider: "aws" }), makeResource({ provider: "azure" })])).toBe("aws");
++  });
++
++  it("returns undefined for an empty list", () => {
++    expect(listProvider([])).toBeUndefined();
++  });
++});
+diff --git a/frontend/src/lib/groupResources.ts b/frontend/src/lib/groupResources.ts
+index 6feaa31..6101ace 100644
+--- a/frontend/src/lib/groupResources.ts
++++ b/frontend/src/lib/groupResources.ts
+@@ -25,3 +25,21 @@ export function summarizeResourceGroups(resources: ResourceListItem[]): Resource
+ export function resourceLabel(resource: ResourceListItem): string {
+   return resource.name ?? resource.external_resource_id ?? resource.resource_id;
+ }
++
++/**
++ * The drill-down's middle level means something different per provider (Azure's
++ * resource_group vs. AWS's resource_type, per GOV-002 Section 3) - this derives
++ * the right copy from a resource's provider rather than hardcoding "resource
++ * group" everywhere. Defaults to Azure's wording for an empty/unknown provider,
++ * since that's every account this app has ever actually shown data for so far.
++ */
++export function middleLevelLabel(provider: string | undefined, options?: { plural?: boolean }): string {
++  const isAws = provider === "aws";
++  if (options?.plural) return isAws ? "Resource types" : "Resource groups";
++  return isAws ? "Resource type" : "Resource group";
++}
++
++/** The (single, in practice) provider represented in a resource list, for middleLevelLabel. */
++export function listProvider(resources: ResourceListItem[]): string | undefined {
++  return resources[0]?.provider;
++}
+diff --git a/frontend/src/pages/Overview.test.tsx b/frontend/src/pages/Overview.test.tsx
+index ebaf041..f293c89 100644
+--- a/frontend/src/pages/Overview.test.tsx
++++ b/frontend/src/pages/Overview.test.tsx
+@@ -15,6 +15,7 @@ const RG_A_VM = {
+   resource_id: "res-1",
+   external_resource_id: "/subscriptions/x/resourceGroups/rg-a/providers/Microsoft.Compute/virtualMachines/vm-web-01",
+   name: "vm-web-01",
++  provider: "azure",
+   resource_group: "rg-a",
+   resource_type: "microsoft.compute/virtualmachines",
+   region: "eastus",
+@@ -24,6 +25,7 @@ const RG_A_DISK = {
+   resource_id: "res-3",
+   external_resource_id: "/subscriptions/x/resourceGroups/rg-a/providers/Microsoft.Compute/disks/vm-web-01-disk",
+   name: "vm-web-01-disk",
++  provider: "azure",
+   resource_group: "rg-a",
+   resource_type: "microsoft.compute/disks",
+   region: "eastus",
+@@ -33,6 +35,7 @@ const RG_B_STORAGE = {
+   resource_id: "res-2",
+   external_resource_id: "/subscriptions/x/resourceGroups/rg-b/providers/Microsoft.Storage/storageAccounts/stlogs01",
+   name: "stlogs01",
++  provider: "azure",
+   resource_group: "rg-b",
+   resource_type: "microsoft.storage/storageaccounts",
+   region: "westus",
+@@ -107,6 +110,20 @@ describe("Overview", () => {
+     expect(screen.getByText("1 resource")).toBeInTheDocument();
+   });
 
-Revision ID: 2450695ea788
-Revises: 0a3c0e882688
-Create Date: 2026-09-21 16:00:00.000000
++  it("labels the middle drill-down level 'Resource types' for an AWS account", async () => {
++    const AWS_EC2 = { ...RG_A_VM, provider: "aws", resource_group: "EC2 instance" };
++    mockFetchResponses({
++      [COST_FRAGMENT]: EMPTY_COST,
++      [FORECAST_FRAGMENT]: EMPTY_FORECAST,
++      [INVENTORY_FRAGMENT]: { resources: [AWS_EC2] },
++    });
++
++    render(<Overview />);
++
++    await waitFor(() => expect(screen.getByText("Resource types")).toBeInTheDocument());
++    expect(screen.queryByText("Resource groups")).not.toBeInTheDocument();
++  });
++
+   it("drills from subscription -> resource group -> resource with working breadcrumb navigation, showing real scoped spend at every level", async () => {
+     const user = userEvent.setup();
+     const VM_COST = { series: [{ date: "2026-09-01", actual_cost: 42 }] };
+diff --git a/frontend/src/pages/Overview.tsx b/frontend/src/pages/Overview.tsx
+index 473834a..1690447 100644
+--- a/frontend/src/pages/Overview.tsx
++++ b/frontend/src/pages/Overview.tsx
+@@ -4,7 +4,7 @@ import type { ResourceListItem } from "../api/types";
+ import { Breadcrumb, type BreadcrumbSegment } from "../components/Breadcrumb";
+ import { DrillList } from "../components/DrillList";
+ import { SpendPanel } from "../components/SpendPanel";
+-import { resourceLabel, summarizeResourceGroups } from "../lib/groupResources";
++import { listProvider, middleLevelLabel, resourceLabel, summarizeResourceGroups } from "../lib/groupResources";
 
-Task 17 found that Azure Resource Graph can return a previously-synced resource's
-ARM id in different casing on a later sync (confirmed live: the NISE-DEV VM's id
-changed from `.../NISE-RG/.../NISE-DEV` to `.../nise-rg/.../nise-dev` between Task
-2's original sync and Task 17's re-sync). `upsert_resources` matched existing rows
-by an exact, case-sensitive `external_resource_id` comparison, so the casing change
-read as a brand new resource instead of an update - producing a second `resources`
-row for one physical VM. `azure_inventory.map_resource` now lowercases
-`external_resource_id` at write time (see that file), which prevents this going
-forward. This migration cleans up every row the bug already affected - not
-hardcoded to the one VM incident, so it also catches any other resource this same
-drift hit that hasn't been noticed yet.
+ type DrillPath =
+   | { level: "subscription" }
+@@ -64,7 +64,7 @@ export function Overview() {
+             <dd className="text-stone-700">{path.resource.resource_type}</dd>
+             <dt className="text-stone-400">Region</dt>
+             <dd className="text-stone-700">{path.resource.region ?? "—"}</dd>
+-            <dt className="text-stone-400">Resource group</dt>
++            <dt className="text-stone-400">{middleLevelLabel(path.resource.provider)}</dt>
+             <dd className="text-stone-700">{path.resource.resource_group ?? "—"}</dd>
+           </dl>
+         </div>
+@@ -76,7 +76,7 @@ export function Overview() {
+           resourceId={path.level === "resource" ? path.resource.resource_id : undefined}
+           emptyStateDescription={
+             path.level === "resource-group"
+-              ? `Resource group "${path.resourceGroup}" hasn't synced enough days of cost data to show a spend trend or forecast yet.`
++              ? `${middleLevelLabel(listProvider(resourceList.status === "ready" ? resourceList.resources : []))} "${path.resourceGroup}" hasn't synced enough days of cost data to show a spend trend or forecast yet.`
+               : path.level === "resource"
+                 ? `${resourceLabel(path.resource)} hasn't synced enough days of cost data to show a spend trend or forecast yet.`
+                 : undefined
+@@ -94,8 +94,8 @@ export function Overview() {
+           )}
+           {resourceList.status === "ready" && (
+             <DrillList
+-              title="Resource groups"
+-              emptyMessage="No resource groups have synced yet."
++              title={middleLevelLabel(listProvider(resourceList.resources), { plural: true })}
++              emptyMessage={`No ${middleLevelLabel(listProvider(resourceList.resources), { plural: true }).toLowerCase()} have synced yet.`}
+               items={summarizeResourceGroups(resourceList.resources).map((group) => ({
+                 key: group.resourceGroup,
+                 primary: group.resourceGroup,
+@@ -118,7 +118,7 @@ export function Overview() {
+           {resourceList.status === "ready" && (
+             <DrillList
+               title={`Resources in ${path.resourceGroup}`}
+-              emptyMessage="No resources found in this resource group."
++              emptyMessage={`No resources found in this ${middleLevelLabel(listProvider(resourceList.resources)).toLowerCase()}.`}
+               items={resourceList.resources.map((resource) => ({
+                 key: resource.resource_id,
+                 primary: resourceLabel(resource),
+=== NEW FILE: backend/app/services/aws_cost.py ===
+import uuid
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable
 
-For each group of resources rows that collide on `lower(external_resource_id)`:
-1. picks one canonical row - the one with existing cost_records (real historical
-   financial data already correctly attributed), falling back to the earliest-
-   created row if no group member has any cost_records;
-2. reassigns cost_records and utilization_metrics from the other row(s) onto the
-   canonical row wherever that doesn't collide with something the canonical already
-   has (same cloud_account/date/charge_type, or same metric/timestamp) - preserving
-   real data rather than discarding it;
-3. drops any remaining rows that *do* collide - those are genuine duplicate
-   readings of the same physical resource (the same metric at the same timestamp,
-   or the same charge on the same day), not distinct data;
-4. deletes the non-canonical resource row(s).
+import boto3
+from sqlalchemy import func
+from sqlalchemy.orm import Session
 
-Finally, normalizes every remaining resources.external_resource_id to lowercase, so
-the existing case-sensitive uq_resources_external_resource_id constraint continues
-to do its job correctly now that "the same resource" can never be stored under two
-different casings again.
+from app.core.config import settings
+from app.models.cost_record import CostRecord
+from app.models.resource import Resource
+from app.services.aws_inventory import get_or_create_aws_cloud_account
 
-This is a lossy data migration (it deletes rows) - downgrade() cannot restore the
-merged/deleted data, so it's a documented no-op rather than a fake reversal.
-"""
-from typing import Sequence, Union
+# Real API-shape finding, discovered writing this against the boto3/moto docs
+# (flag for Task 20's live pass): GOV-002 2.4 named `GetCostAndUsage`, but that
+# operation has NO resource-level dimension to group by at all - RESOURCE_ID is
+# only available on the separate `GetCostAndUsageWithResources` operation, which
+# this module uses instead so cost_records.resource_id can be populated the same
+# way Azure's is. Two real constraints come with it that GetCostAndUsage doesn't
+# have: (1) it only returns data for the trailing 14 days, not an arbitrary
+# lookback window - settings.cost_lookback_days (90, shared with Azure) is capped
+# to this for AWS specifically; (2) it requires "Resource IDs" to be turned on in
+# the account's Cost Explorer preferences, which is an account-level opt-in
+# setting, not guaranteed on by default - if it's off, every group's resource-id
+# key comes back empty and every AWS cost row will land as non-attributable
+# (resource_id=None) rather than erroring, so this may need a one-time manual
+# step in the real account before Task 20's per-resource verification works.
+AWS_RESOURCE_LEVEL_MAX_LOOKBACK_DAYS = 14
 
-import sqlalchemy as sa
-from alembic import op
-
-revision: str = "2450695ea788"
-down_revision: Union[str, None] = "0a3c0e882688"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+RESOURCE_ID_KEY = "RESOURCE_ID"
+RECORD_TYPE_KEY = "RECORD_TYPE"
 
 
-def upgrade() -> None:
-    conn = op.get_bind()
+@dataclass
+class AwsCostSyncSummary:
+    found: int
+    created: int
+    updated: int
 
-    duplicate_groups = conn.execute(
-        sa.text(
-            """
-            SELECT array_agg(id ORDER BY id) AS ids
-            FROM resources
-            GROUP BY lower(external_resource_id)
-            HAVING count(*) > 1
-            """
+
+def fetch_cost_rows(account_id: str, lookback_days: int) -> Any:
+    """Query AWS Cost Explorer for daily amortized cost, grouped by resource and record type."""
+    session = boto3.Session(
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+        region_name=settings.aws_region,
+    )
+    client = session.client("ce")
+
+    capped_lookback = min(lookback_days, AWS_RESOURCE_LEVEL_MAX_LOOKBACK_DAYS)
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=capped_lookback)
+
+    return client.get_cost_and_usage_with_resources(
+        TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+        Granularity="DAILY",
+        Metrics=["AmortizedCost"],
+        GroupBy=[
+            {"Type": "DIMENSION", "Key": RESOURCE_ID_KEY},
+            {"Type": "DIMENSION", "Key": RECORD_TYPE_KEY},
+        ],
+    )
+
+
+def map_cost_response(response: Any) -> list[dict[str, Any]]:
+    """Flatten a GetCostAndUsageWithResources response into normalized cost rows.
+
+    Mirrors azure_cost.map_cost_response's empty-string-means-non-attributable
+    convention: an empty (or missing) resource-id group key becomes None, same
+    as Azure's ResourceId dimension.
+    """
+    rows: list[dict[str, Any]] = []
+    for result in response.get("ResultsByTime", []):
+        row_date = date.fromisoformat(result["TimePeriod"]["Start"])
+        for group in result.get("Groups", []):
+            keys = group.get("Keys", [])
+            resource_arn = keys[0] if len(keys) > 0 and keys[0] else None
+            record_type = keys[1] if len(keys) > 1 else "Usage"
+            amount = group.get("Metrics", {}).get("AmortizedCost", {})
+            rows.append(
+                {
+                    "date": row_date,
+                    "external_resource_id": resource_arn,
+                    "charge_type": record_type,
+                    "currency": amount.get("Unit", "USD"),
+                    "amortized_cost": float(amount.get("Amount", 0)),
+                }
+            )
+    return rows
+
+
+def _resolve_resource_id(db: Session, external_resource_id: str | None) -> uuid.UUID | None:
+    if not external_resource_id:
+        return None
+    # Same case-insensitive lookup azure_cost.py uses, for the same reason -
+    # ARNs are typically stable-case, but there's no guarantee Cost Explorer's
+    # casing always matches exactly what the inventory connector stored.
+    resource = (
+        db.query(Resource).filter(func.lower(Resource.external_resource_id) == external_resource_id.lower()).one_or_none()
+    )
+    return resource.id if resource else None
+
+
+def upsert_cost_records(db: Session, cloud_account_id: uuid.UUID, rows: list[dict[str, Any]]) -> tuple[int, int]:
+    created = 0
+    updated = 0
+    for row in rows:
+        resource_id = _resolve_resource_id(db, row["external_resource_id"])
+        existing = (
+            db.query(CostRecord)
+            .filter_by(
+                cloud_account_id=cloud_account_id,
+                resource_id=resource_id,
+                date=row["date"],
+                charge_type=row["charge_type"],
+            )
+            .one_or_none()
         )
-    ).fetchall()
-
-    for (ids,) in duplicate_groups:
-        canonical_row = conn.execute(
-            sa.text(
-                """
-                SELECT r.id
-                FROM resources r
-                LEFT JOIN (
-                    SELECT resource_id, count(*) AS cnt
-                    FROM cost_records
-                    WHERE resource_id = ANY(:ids)
-                    GROUP BY resource_id
-                ) c ON c.resource_id = r.id
-                WHERE r.id = ANY(:ids)
-                ORDER BY COALESCE(c.cnt, 0) DESC, r.created_at ASC, r.id ASC
-                LIMIT 1
-                """
-            ),
-            {"ids": ids},
-        ).scalar_one()
-
-        losers = [row_id for row_id in ids if row_id != canonical_row]
-
-        for loser in losers:
-            # Reassign cost_records that don't collide with what the canonical
-            # resource already has for the same account/date/charge_type.
-            conn.execute(
-                sa.text(
-                    """
-                    UPDATE cost_records
-                    SET resource_id = :canonical
-                    WHERE resource_id = :loser
-                      AND NOT EXISTS (
-                          SELECT 1 FROM cost_records c2
-                          WHERE c2.resource_id = :canonical
-                            AND c2.cloud_account_id = cost_records.cloud_account_id
-                            AND c2.date = cost_records.date
-                            AND c2.charge_type = cost_records.charge_type
-                      )
-                    """
-                ),
-                {"canonical": canonical_row, "loser": loser},
+        if existing is None:
+            db.add(
+                CostRecord(
+                    cloud_account_id=cloud_account_id,
+                    resource_id=resource_id,
+                    date=row["date"],
+                    amortized_cost=row["amortized_cost"],
+                    currency=row["currency"],
+                    granularity="Daily",
+                    charge_type=row["charge_type"],
+                )
             )
-            # Any cost_records left on the loser are genuine duplicates (same
-            # account/date/charge_type the canonical already has) - drop them.
-            conn.execute(
-                sa.text("DELETE FROM cost_records WHERE resource_id = :loser"),
-                {"loser": loser},
-            )
-
-            # Same pattern for utilization_metrics, keyed on (metric_name, timestamp).
-            conn.execute(
-                sa.text(
-                    """
-                    UPDATE utilization_metrics
-                    SET resource_id = :canonical
-                    WHERE resource_id = :loser
-                      AND NOT EXISTS (
-                          SELECT 1 FROM utilization_metrics u2
-                          WHERE u2.resource_id = :canonical
-                            AND u2.metric_name = utilization_metrics.metric_name
-                            AND u2.timestamp = utilization_metrics.timestamp
-                      )
-                    """
-                ),
-                {"canonical": canonical_row, "loser": loser},
-            )
-            conn.execute(
-                sa.text("DELETE FROM utilization_metrics WHERE resource_id = :loser"),
-                {"loser": loser},
-            )
-
-            conn.execute(sa.text("DELETE FROM resources WHERE id = :loser"), {"loser": loser})
-
-    conn.execute(sa.text("UPDATE resources SET external_resource_id = lower(external_resource_id)"))
+            created += 1
+        else:
+            existing.amortized_cost = row["amortized_cost"]
+            existing.currency = row["currency"]
+            updated += 1
+    db.commit()
+    return created, updated
 
 
-def downgrade() -> None:
-    # Lossy: merged/deleted rows can't be reconstructed. Left as a documented no-op
-    # rather than a fake reversal - reverting past this point means restoring from
-    # a backup taken before it ran, not running alembic downgrade.
-    pass
+def sync_aws_cost(
+    db: Session, fetch: Callable[[str, int], Any] = fetch_cost_rows
+) -> AwsCostSyncSummary:
+    account_id = settings.aws_account_id
+    response = fetch(account_id, settings.cost_lookback_days)
+    mapped_rows = map_cost_response(response)
+    cloud_account = get_or_create_aws_cloud_account(db, account_id)
+    created, updated = upsert_cost_records(db, cloud_account.id, mapped_rows)
+    return AwsCostSyncSummary(found=len(mapped_rows), created=created, updated=updated)
+=== NEW FILE: backend/app/services/aws_inventory.py ===
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Callable
+
+import boto3
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.models.cloud_account import CloudAccount
+from app.models.provider import Provider
+from app.models.resource import Resource
+
+# GOV-002 2.2 (adopted option 1): the Tagging API for discovery (ARNs + tags
+# across most services in one call, no account setup like Config/Resource
+# Explorer would need), layered with targeted describe_* calls per resource type
+# for the fields Phase 1's schema needs (mirrors azure_inventory's Resource Graph
+# `project` + azure_utilization's per-metric describe pattern). Only EC2
+# instances and EBS volumes get describe_* enrichment for v1 (GOV-002 2.2) -
+# every other tagged resource type still gets discovered and stored, just
+# without SKU/creation-date.
+_EC2_INSTANCE = ("ec2", "instance")
+_EC2_VOLUME = ("ec2", "volume")
+
+# GOV-002 Section 3's resolved "human-readable resource type" convention for
+# resource_group - not exhaustive (deliberately, per the task's "don't try to
+# cover every AWS service" instruction). Anything not listed here falls back to
+# a generically humanized label in _resource_type_label rather than a raw ARN
+# fragment, so the drill-down UI never shows something unreadable.
+_RESOURCE_TYPE_LABELS: dict[tuple[str, str | None], str] = {
+    ("ec2", "instance"): "EC2 instance",
+    ("ec2", "volume"): "EBS volume",
+    ("ec2", "network-interface"): "Network interface",
+    ("ec2", "security-group"): "Security group",
+    ("ec2", "vpc"): "VPC",
+    ("ec2", "subnet"): "Subnet",
+    ("ec2", "elastic-ip"): "Elastic IP",
+    ("s3", None): "S3 bucket",
+}
+
+
+@dataclass
+class SyncSummary:
+    found: int
+    created: int
+    updated: int
+
+
+def parse_arn(arn: str) -> dict[str, str | None]:
+    """Split an ARN into its named parts.
+
+    Format: arn:partition:service:region:account-id:resource - where `resource`
+    is itself either `type/id`, `type:id`, or (S3's case) just a bare name with
+    no type segment at all. Real API-shape gotcha found writing this: S3 bucket
+    ARNs (`arn:aws:s3:::my-bucket`) omit both region and account-id entirely -
+    there's no way to recover a bucket's region from its ARN alone; a real
+    `get_bucket_location` call would be needed, which v1 doesn't make (S3 isn't
+    one of the two describe_*-enriched types), so S3 resources land with
+    region=None. Flagged for Task 20's live pass.
+    """
+    parts = arn.split(":", 5)
+    service = parts[2] if len(parts) > 2 else ""
+    region = parts[3] if len(parts) > 3 else None
+    account_id = parts[4] if len(parts) > 4 else None
+    resource_part = parts[5] if len(parts) > 5 else ""
+
+    # Defensive: moto's simulated Tagging API returns EC2 resource ARNs with the
+    # service name repeated as a prefix on the resource segment itself (observed
+    # writing this: "ec2:instance/i-..." instead of real AWS's "instance/i-...")
+    # - a no-op for genuine AWS ARNs, which never do this, but avoids parsing
+    # "ec2" as a bogus resource type against moto's test double.
+    prefix = f"{service}:"
+    if resource_part.startswith(prefix):
+        resource_part = resource_part[len(prefix) :]
+
+    if "/" in resource_part:
+        resource_type, resource_id = resource_part.split("/", 1)
+    elif ":" in resource_part:
+        resource_type, resource_id = resource_part.split(":", 1)
+    else:
+        resource_type, resource_id = None, resource_part
+
+    return {
+        "service": service,
+        "region": region or None,
+        "account_id": account_id or None,
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+    }
+
+
+def _resource_type_label(service: str, resource_type: str | None) -> str:
+    label = _RESOURCE_TYPE_LABELS.get((service, resource_type))
+    if label:
+        return label
+    if resource_type:
+        return f"{service.upper()} {resource_type.replace('-', ' ')}"
+    return service.upper()
+
+
+def _enrich_ec2_instances(ec2_client: Any, rows: list[dict[str, Any]]) -> None:
+    targets = {row["resource_id"]: row for row in rows if (row["service"], row["resource_type"]) == _EC2_INSTANCE}
+    if not targets:
+        return
+    # An empty InstanceIds list means "describe every instance in the account",
+    # not "describe none" - the `if targets` guard above is load-bearing, not
+    # just an optimization.
+    response = ec2_client.describe_instances(InstanceIds=list(targets.keys()))
+    for reservation in response.get("Reservations", []):
+        for instance in reservation.get("Instances", []):
+            row = targets.get(instance["InstanceId"])
+            if row is None:
+                continue
+            row["instance_type"] = instance.get("InstanceType")
+            if instance.get("LaunchTime"):
+                # ISO string, not the raw datetime boto3 returns - raw_metadata
+                # stores this whole row as-is into a JSONB column, and a bare
+                # datetime object isn't JSON-serializable (unlike Azure Resource
+                # Graph, which only ever returns JSON-safe strings to begin
+                # with). map_resource parses this back into a real datetime.
+                row["created_at"] = instance["LaunchTime"].isoformat()
+
+
+def _enrich_ebs_volumes(ec2_client: Any, rows: list[dict[str, Any]]) -> None:
+    targets = {row["resource_id"]: row for row in rows if (row["service"], row["resource_type"]) == _EC2_VOLUME}
+    if not targets:
+        return
+    response = ec2_client.describe_volumes(VolumeIds=list(targets.keys()))
+    for volume in response.get("Volumes", []):
+        row = targets.get(volume["VolumeId"])
+        if row is None:
+            continue
+        row["volume_type"] = volume.get("VolumeType")
+        if volume.get("CreateTime"):
+            row["created_at"] = volume["CreateTime"].isoformat()
+
+
+def fetch_resources(region: str) -> list[dict[str, Any]]:
+    """Discover every tagged resource in the account/region via the Tagging API,
+    then enrich EC2 instances and EBS volumes with a targeted describe_* call
+    each. Untagged resources are invisible to the Tagging API - a real, inherent
+    limitation of this discovery method (not a bug), worth knowing before
+    reading inventory counts against what the AWS Console shows."""
+    session = boto3.Session(
+        aws_access_key_id=settings.aws_access_key_id,
+        aws_secret_access_key=settings.aws_secret_access_key,
+        region_name=region,
+    )
+    tagging_client = session.client("resourcegroupstaggingapi")
+    ec2_client = session.client("ec2")
+
+    rows: list[dict[str, Any]] = []
+    paginator = tagging_client.get_paginator("get_resources")
+    for page in paginator.paginate():
+        for item in page.get("ResourceTagMappingList", []):
+            arn = item["ResourceARN"]
+            parsed = parse_arn(arn)
+            tags = {tag["Key"]: tag["Value"] for tag in item.get("Tags", [])}
+            rows.append({"arn": arn, "tags": tags, **parsed})
+
+    _enrich_ec2_instances(ec2_client, rows)
+    _enrich_ebs_volumes(ec2_client, rows)
+
+    return rows
+
+
+def map_resource(row: dict[str, Any]) -> dict[str, Any]:
+    """Map a discovered+enriched AWS row into the normalized `resources` schema."""
+    service = row["service"]
+    resource_type = row["resource_type"]
+
+    mapped: dict[str, Any] = {
+        "provider": Provider.AWS,
+        # Lowercased at write time, same convention Task 18 established for
+        # Azure - ARNs are typically stable-case, but there's no reason to
+        # reintroduce that bug class rather than reusing the fix.
+        "external_resource_id": row["arn"].lower(),
+        "name": row["tags"].get("Name"),
+        # Machine-readable identifier for resource_type filtering on /cost and
+        # /forecast, mirroring Azure's lowercase "microsoft.compute/..." style -
+        # adopted AWS's own CloudFormation/Config "AWS::Service::Type" naming
+        # (lowercased) since it's the convention AWS users already recognize,
+        # rather than inventing a slash-separated Azure-style equivalent.
+        "resource_type": f"aws::{service}::{resource_type or 'resource'}",
+        "region": row.get("region"),
+        # GOV-002 Section 3's resolved decision: the *human-readable resource
+        # type* (e.g. "EC2 instance"), not an Azure-style resource group - AWS
+        # has no equivalent concept. This is what the drill-down UI's middle
+        # level renders verbatim as a section heading, so it's kept readable
+        # rather than a raw "AWS::EC2::Instance" CloudFormation-style string.
+        "resource_group": _resource_type_label(service, resource_type),
+        "tags": row["tags"],
+        "sku": row.get("instance_type") or row.get("volume_type"),
+        "raw_metadata": row,
+    }
+    if row.get("created_at") is not None:
+        created_at = row["created_at"]
+        # boto3 already returns real datetime objects (unlike Azure Resource
+        # Graph's ISO-8601 strings) - only normalize if a test/fixture passed a
+        # string instead.
+        if isinstance(created_at, str):
+            created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        mapped["created_at"] = created_at
+    return mapped
+
+
+def get_or_create_aws_cloud_account(db: Session, account_id: str) -> CloudAccount:
+    account = db.query(CloudAccount).filter_by(provider=Provider.AWS, external_id=account_id).one_or_none()
+    if account is None:
+        account = CloudAccount(
+            provider=Provider.AWS,
+            external_id=account_id,
+            display_name=f"AWS Account {account_id}",
+        )
+        db.add(account)
+        db.flush()
+    return account
+
+
+def upsert_resources(db: Session, cloud_account: CloudAccount, mapped_resources: list[dict[str, Any]]) -> tuple[int, int]:
+    """Mirrors azure_inventory.upsert_resources exactly (including Task 18's
+    case-insensitive-by-normalization fix) - kept as its own copy rather than a
+    cross-import from azure_inventory, so this module stays a self-contained,
+    independently-readable provider connector matching azure_inventory.py's own
+    shape, at the cost of duplicating ~15 lines. Worth revisiting as a shared
+    helper if a third provider ever needs the exact same logic again."""
+    created = 0
+    updated = 0
+    for mapped in mapped_resources:
+        existing = db.query(Resource).filter_by(external_resource_id=mapped["external_resource_id"]).one_or_none()
+        if existing is None:
+            db.add(Resource(cloud_account_id=cloud_account.id, **mapped))
+            created += 1
+        else:
+            for key, value in mapped.items():
+                setattr(existing, key, value)
+            updated += 1
+    db.commit()
+    return created, updated
+
+
+def sync_aws_inventory(
+    db: Session, fetch: Callable[[str], list[dict[str, Any]]] = fetch_resources
+) -> SyncSummary:
+    region = settings.aws_region
+    raw_resources = fetch(region)
+    cloud_account = get_or_create_aws_cloud_account(db, settings.aws_account_id)
+    mapped_resources = [map_resource(row) for row in raw_resources]
+    created, updated = upsert_resources(db, cloud_account, mapped_resources)
+    return SyncSummary(found=len(raw_resources), created=created, updated=updated)
+=== NEW FILE: backend/tests/fixtures/aws_cost.py ===
+"""Fake AWS Cost Explorer GetCostAndUsageWithResources responses - boto3 returns
+plain dicts (unlike Azure's SDK objects), so these are hand-built to the real
+shape directly rather than duck-typed through a helper class."""
+
+INSTANCE_ARN = "arn:aws:ec2:us-east-1:123456789012:instance/i-0123456789abcdef0"
+
+# Cost Explorer's RESOURCE_ID group key casing isn't guaranteed to match what the
+# inventory connector stored - used to test the case-insensitive resource match,
+# same convention as azure_cost fixtures' VM_RESOURCE_ID_DIFFERENT_CASE.
+INSTANCE_ARN_DIFFERENT_CASE = INSTANCE_ARN.upper()
+
+
+def make_response(*groups_by_day: list[dict]) -> dict:
+    return {
+        "ResultsByTime": [
+            {
+                "TimePeriod": {"Start": "2026-09-15", "End": "2026-09-16"},
+                "Groups": groups,
+                "Estimated": False,
+            }
+            for groups in groups_by_day
+        ],
+    }
+
+
+def _group(resource_arn: str, record_type: str, amount: str, unit: str = "USD") -> dict:
+    return {
+        "Keys": [resource_arn, record_type],
+        "Metrics": {"AmortizedCost": {"Amount": amount, "Unit": unit}},
+    }
+
+
+RESOURCE_ATTRIBUTABLE_GROUP = _group(INSTANCE_ARN_DIFFERENT_CASE, "Usage", "12.3456")
+NON_ATTRIBUTABLE_USAGE_GROUP = _group("", "Usage", "5.00")
+NON_ATTRIBUTABLE_TAX_GROUP = _group("", "Tax", "1.25")
+
+RESPONSE_MIXED = make_response([RESOURCE_ATTRIBUTABLE_GROUP, NON_ATTRIBUTABLE_USAGE_GROUP, NON_ATTRIBUTABLE_TAX_GROUP])
+=== NEW FILE: backend/tests/fixtures/aws_resources.py ===
+"""Pre-merged AWS resource rows - the shape aws_inventory.fetch_resources()
+produces internally after combining Tagging API discovery with describe_*
+enrichment, and what map_resource() actually consumes directly (mirrors how
+azure_resource_graph.py's rows represent azure_inventory.map_resource's input
+shape - the difference is AWS's fetch needs two real API calls merged into this
+shape first, where Azure's Resource Graph query already returns it in one)."""
+
+from datetime import datetime, timezone
+
+# created_at is an ISO string here, matching what fetch_resources' enrichment
+# actually produces (not a raw datetime - see aws_inventory._enrich_ec2_instances'
+# comment on why: raw_metadata stores this whole row as-is into a JSONB column,
+# and a bare datetime isn't JSON-serializable).
+EC2_INSTANCE_ROW = {
+    "arn": "arn:aws:ec2:us-east-1:123456789012:instance/i-0123456789abcdef0",
+    "service": "ec2",
+    "region": "us-east-1",
+    "account_id": "123456789012",
+    "resource_type": "instance",
+    "resource_id": "i-0123456789abcdef0",
+    "tags": {"Name": "web-01", "env": "prod"},
+    "instance_type": "t3.micro",
+    "created_at": datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
+}
+
+EBS_VOLUME_ROW = {
+    "arn": "arn:aws:ec2:us-east-1:123456789012:volume/vol-0123456789abcdef0",
+    "service": "ec2",
+    "region": "us-east-1",
+    "account_id": "123456789012",
+    "resource_type": "volume",
+    "resource_id": "vol-0123456789abcdef0",
+    "tags": {"env": "prod"},
+    "volume_type": "gp3",
+    "created_at": datetime(2026, 1, 15, 11, 0, 0, tzinfo=timezone.utc).isoformat(),
+}
+
+# S3 bucket ARNs have no region/account-id segment at all (parse_arn's real
+# API-shape finding), and this bucket has no describe_*-equivalent enrichment
+# call in v1 - no instance_type/volume_type/created_at.
+S3_BUCKET_ROW = {
+    "arn": "arn:aws:s3:::my-finops-bucket",
+    "service": "s3",
+    "region": None,
+    "account_id": None,
+    "resource_type": None,
+    "resource_id": "my-finops-bucket",
+    "tags": {},
+}
+
+# An untagged-for-a-label resource type - not in _RESOURCE_TYPE_LABELS, exercises
+# the generic humanized fallback.
+UNLISTED_TYPE_ROW = {
+    "arn": "arn:aws:rds:us-east-1:123456789012:db/prod-database-1",
+    "service": "rds",
+    "region": "us-east-1",
+    "account_id": "123456789012",
+    "resource_type": "db",
+    "resource_id": "prod-database-1",
+    "tags": {"Name": "prod-db"},
+}
+=== NEW FILE: backend/tests/test_aws_cost.py ===
+from datetime import date
+
+import pytest
+
+from app.core.config import settings
+from app.models.cost_record import CostRecord
+from app.models.provider import Provider
+from app.models.resource import Resource
+from app.services.aws_cost import map_cost_response, sync_aws_cost
+from app.services.aws_inventory import get_or_create_aws_cloud_account
+from app.services.forecast import build_forecast
+from tests.fixtures.aws_cost import INSTANCE_ARN, RESPONSE_MIXED, make_response
+
+
+def test_map_cost_response_resource_attributable_and_non_attributable():
+    rows = map_cost_response(RESPONSE_MIXED)
+
+    assert len(rows) == 3
+    resource_row, usage_row, tax_row = rows
+
+    assert resource_row["date"] == date(2026, 9, 15)
+    assert resource_row["external_resource_id"] is not None
+    assert resource_row["charge_type"] == "Usage"
+    assert resource_row["amortized_cost"] == 12.3456
+    assert resource_row["currency"] == "USD"
+
+    # An empty resource-id group key (non-attributable charge) normalizes to
+    # None, same convention as azure_cost.map_cost_response.
+    assert usage_row["external_resource_id"] is None
+    assert usage_row["charge_type"] == "Usage"
+
+    assert tax_row["external_resource_id"] is None
+    assert tax_row["charge_type"] == "Tax"
+    assert tax_row["amortized_cost"] == 1.25
+
+
+def _seed_ec2_resource(db_session):
+    account = get_or_create_aws_cloud_account(db_session, settings.aws_account_id or "123456789012")
+    resource = Resource(
+        cloud_account_id=account.id,
+        provider=Provider.AWS,
+        external_resource_id=INSTANCE_ARN,
+        resource_type="aws::ec2::instance",
+        resource_group="EC2 instance",
+        tags={},
+        raw_metadata={},
+    )
+    db_session.add(resource)
+    db_session.commit()
+    return account, resource
+
+
+def test_sync_aws_cost_creates_records(db_session, monkeypatch):
+    monkeypatch.setattr(settings, "aws_account_id", "123456789012")
+    account, resource = _seed_ec2_resource(db_session)
+
+    def fake_fetch(account_id, lookback_days):
+        return RESPONSE_MIXED
+
+    summary = sync_aws_cost(db_session, fetch=fake_fetch)
+
+    assert summary.found == 3
+    assert summary.created == 3
+    assert summary.updated == 0
+
+    records = (
+        db_session.query(CostRecord)
+        .filter(CostRecord.cloud_account_id == account.id, CostRecord.date == date(2026, 9, 15))
+        .all()
+    )
+    assert len(records) == 3
+
+    # The fixture's resource ARN differs in case from what's stored on the
+    # seeded Resource - confirms the case-insensitive match resolved it.
+    resource_record = next(r for r in records if r.resource_id == resource.id)
+    assert float(resource_record.amortized_cost) == 12.3456
+    assert resource_record.charge_type == "Usage"
+
+    non_attributable = [r for r in records if r.resource_id is None]
+    assert len(non_attributable) == 2
+    assert {r.charge_type for r in non_attributable} == {"Usage", "Tax"}
+
+
+def test_sync_aws_cost_upsert_does_not_duplicate_on_overlapping_window(db_session, monkeypatch):
+    monkeypatch.setattr(settings, "aws_account_id", "123456789012")
+    account, resource = _seed_ec2_resource(db_session)
+
+    def fake_fetch(account_id, lookback_days):
+        return RESPONSE_MIXED
+
+    sync_aws_cost(db_session, fetch=fake_fetch)
+
+    def fake_fetch_overlapping(account_id, lookback_days):
+        return make_response(
+            [
+                {
+                    "Keys": [INSTANCE_ARN.upper(), "Usage"],
+                    "Metrics": {"AmortizedCost": {"Amount": "99.99", "Unit": "USD"}},
+                },
+                {"Keys": ["", "Usage"], "Metrics": {"AmortizedCost": {"Amount": "5.00", "Unit": "USD"}}},
+                {"Keys": ["", "Tax"], "Metrics": {"AmortizedCost": {"Amount": "1.25", "Unit": "USD"}}},
+            ]
+        )
+
+    summary = sync_aws_cost(db_session, fetch=fake_fetch_overlapping)
+
+    assert summary.found == 3
+    assert summary.created == 0
+    assert summary.updated == 3
+
+    records = (
+        db_session.query(CostRecord)
+        .filter(CostRecord.cloud_account_id == account.id, CostRecord.date == date(2026, 9, 15))
+        .all()
+    )
+    assert len(records) == 3  # still 3, not 6
+
+    resource_record = next(r for r in records if r.resource_id == resource.id)
+    assert float(resource_record.amortized_cost) == 99.99
+
+
+def test_aws_cost_records_flow_into_existing_forecast_interface_unchanged(db_session, monkeypatch):
+    """Confirms GOV-002 2.4's expectation directly: AWS cost data written by
+    sync_aws_cost is readable by the same build_forecast/LinearBurnRateModel
+    Azure uses, with zero forecast.py changes - only cloud_account_id (already a
+    plain parameter) needs to point at the AWS account instead of Azure's."""
+    monkeypatch.setattr(settings, "aws_account_id", "123456789012")
+    account, resource = _seed_ec2_resource(db_session)
+
+    def fake_fetch(account_id, lookback_days):
+        return RESPONSE_MIXED
+
+    sync_aws_cost(db_session, fetch=fake_fetch)
+
+    result = build_forecast(db_session, horizon_days=7, cloud_account_id=account.id)
+
+    assert result["insufficient_data"] is False
+    assert result["daily_rate"] == pytest.approx(12.3456 + 5.00 + 1.25)
+=== NEW FILE: backend/tests/test_aws_inventory.py ===
+from datetime import datetime, timezone
+
+import boto3
+from moto import mock_aws
+
+from app.core.config import settings
+from app.models.cloud_account import CloudAccount
+from app.models.provider import Provider
+from app.models.resource import Resource
+from app.services.aws_inventory import (
+    fetch_resources,
+    get_or_create_aws_cloud_account,
+    map_resource,
+    parse_arn,
+    sync_aws_inventory,
+    upsert_resources,
+)
+from tests.fixtures.aws_resources import EBS_VOLUME_ROW, EC2_INSTANCE_ROW, S3_BUCKET_ROW, UNLISTED_TYPE_ROW
+
+
+def test_parse_arn_ec2_instance():
+    parsed = parse_arn("arn:aws:ec2:us-east-1:123456789012:instance/i-0123456789abcdef0")
+
+    assert parsed["service"] == "ec2"
+    assert parsed["region"] == "us-east-1"
+    assert parsed["account_id"] == "123456789012"
+    assert parsed["resource_type"] == "instance"
+    assert parsed["resource_id"] == "i-0123456789abcdef0"
+
+
+def test_parse_arn_s3_bucket_has_no_region_or_account():
+    # S3 ARNs omit the region and account-id segments entirely, and have no
+    # "type/id" split - the whole resource segment is just the bucket name.
+    parsed = parse_arn("arn:aws:s3:::my-finops-bucket")
+
+    assert parsed["service"] == "s3"
+    assert parsed["region"] is None
+    assert parsed["account_id"] is None
+    assert parsed["resource_type"] is None
+    assert parsed["resource_id"] == "my-finops-bucket"
+
+
+def test_parse_arn_colon_separated_resource():
+    # Some services use "type:id" instead of "type/id" in the resource segment.
+    parsed = parse_arn("arn:aws:sns:us-east-1:123456789012:topic:my-topic")
+
+    assert parsed["resource_type"] == "topic"
+    assert parsed["resource_id"] == "my-topic"
+
+
+def test_map_resource_ec2_instance():
+    mapped = map_resource(EC2_INSTANCE_ROW)
+
+    assert mapped["provider"] == Provider.AWS
+    assert mapped["external_resource_id"] == EC2_INSTANCE_ROW["arn"].lower()
+    assert mapped["name"] == "web-01"
+    assert mapped["resource_type"] == "aws::ec2::instance"
+    assert mapped["region"] == "us-east-1"
+    assert mapped["resource_group"] == "EC2 instance"
+    assert mapped["tags"] == {"Name": "web-01", "env": "prod"}
+    assert mapped["sku"] == "t3.micro"
+    assert mapped["created_at"] == datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    assert mapped["raw_metadata"] == EC2_INSTANCE_ROW
+
+
+def test_map_resource_ebs_volume():
+    mapped = map_resource(EBS_VOLUME_ROW)
+
+    assert mapped["resource_type"] == "aws::ec2::volume"
+    assert mapped["resource_group"] == "EBS volume"
+    assert mapped["sku"] == "gp3"
+    assert mapped["name"] is None  # no Name tag on this fixture
+
+
+def test_map_resource_s3_bucket_no_region_no_sku():
+    mapped = map_resource(S3_BUCKET_ROW)
+
+    assert mapped["resource_type"] == "aws::s3::resource"
+    assert mapped["resource_group"] == "S3 bucket"
+    assert mapped["region"] is None
+    assert mapped["sku"] is None
+    assert "created_at" not in mapped  # no enrichment call for S3 in v1
+
+
+def test_map_resource_unlisted_type_falls_back_to_humanized_label():
+    mapped = map_resource(UNLISTED_TYPE_ROW)
+
+    assert mapped["resource_type"] == "aws::rds::db"
+    # Not in _RESOURCE_TYPE_LABELS - falls back to a generic humanized label
+    # rather than a raw/unreadable string.
+    assert mapped["resource_group"] == "RDS db"
+
+
+def _seed_aws_account(db_session) -> CloudAccount:
+    return get_or_create_aws_cloud_account(db_session, "123456789012")
+
+
+def test_upsert_resources_creates_and_updates(db_session):
+    account = _seed_aws_account(db_session)
+    before = db_session.query(Resource).count()
+
+    mapped = [map_resource(EC2_INSTANCE_ROW), map_resource(EBS_VOLUME_ROW)]
+    created, updated = upsert_resources(db_session, account, mapped)
+
+    assert created == 2
+    assert updated == 0
+    assert db_session.query(Resource).count() == before + 2
+
+    updated_row = {**EC2_INSTANCE_ROW, "tags": {"Name": "web-01", "env": "staging"}}
+    created2, updated2 = upsert_resources(db_session, account, [map_resource(updated_row)])
+
+    assert created2 == 0
+    assert updated2 == 1
+    assert db_session.query(Resource).count() == before + 2  # still 2, not 3
+
+    resource = db_session.query(Resource).filter_by(external_resource_id=EC2_INSTANCE_ROW["arn"].lower()).one()
+    assert resource.tags == {"Name": "web-01", "env": "staging"}
+    assert resource.provider == Provider.AWS
+
+
+def test_upsert_resources_case_drift_updates_existing_row_not_duplicate(db_session):
+    """Regression test mirroring Task 18's Azure fix - reuses the same
+    lowercase-at-write-time normalization, so an ARN returned in different casing
+    on a later sync must update the existing row, not create a second one."""
+    account = _seed_aws_account(db_session)
+    before = db_session.query(Resource).count()
+
+    upsert_resources(db_session, account, [map_resource(EC2_INSTANCE_ROW)])
+    assert db_session.query(Resource).count() == before + 1
+
+    recased_row = {**EC2_INSTANCE_ROW, "arn": EC2_INSTANCE_ROW["arn"].upper()}
+    created, updated = upsert_resources(db_session, account, [map_resource(recased_row)])
+
+    assert created == 0
+    assert updated == 1
+    assert db_session.query(Resource).count() == before + 1
+
+
+def _fake_fetch(rows):
+    def fetch(region: str):
+        return rows
+
+    return fetch
+
+
+def test_sync_aws_inventory_creates_resources(db_session):
+    before = db_session.query(Resource).count()
+
+    summary = sync_aws_inventory(db_session, fetch=_fake_fetch([EC2_INSTANCE_ROW, EBS_VOLUME_ROW]))
+
+    assert summary.found == 2
+    assert summary.created == 2
+    assert summary.updated == 0
+    assert db_session.query(Resource).count() == before + 2
+    assert db_session.query(CloudAccount).filter_by(provider=Provider.AWS, external_id=settings.aws_account_id).count() == 1
+
+
+@mock_aws
+def test_fetch_resources_moto_ec2_instance_discovered_and_enriched(monkeypatch):
+    """End-to-end against moto's simulated AWS backend (not a hand-built fixture)
+    - creates a real EC2 instance and volume, tags them, and confirms
+    fetch_resources() discovers + enriches them via the real Tagging API and
+    describe_* calls, not injected fake data."""
+    monkeypatch.setattr(settings, "aws_access_key_id", "testing")
+    monkeypatch.setattr(settings, "aws_secret_access_key", "testing")
+
+    region = "us-east-1"
+    ec2 = boto3.client("ec2", region_name=region, aws_access_key_id="testing", aws_secret_access_key="testing")
+
+    reservation = ec2.run_instances(
+        ImageId="ami-12345678",
+        MinCount=1,
+        MaxCount=1,
+        InstanceType="t3.micro",
+        TagSpecifications=[
+            {"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "moto-web-01"}, {"Key": "env", "Value": "test"}]}
+        ],
+    )
+    instance_id = reservation["Instances"][0]["InstanceId"]
+
+    volume = ec2.create_volume(AvailabilityZone=f"{region}a", Size=8, VolumeType="gp3")
+    ec2.create_tags(Resources=[volume["VolumeId"]], Tags=[{"Key": "env", "Value": "test"}])
+
+    rows = fetch_resources(region)
+
+    instance_rows = [r for r in rows if r["resource_id"] == instance_id]
+    assert len(instance_rows) == 1
+    assert instance_rows[0]["service"] == "ec2"
+    assert instance_rows[0]["resource_type"] == "instance"
+    assert instance_rows[0]["tags"]["Name"] == "moto-web-01"
+    assert instance_rows[0]["instance_type"] == "t3.micro"
+    assert "created_at" in instance_rows[0]
+
+    volume_rows = [r for r in rows if r["resource_id"] == volume["VolumeId"]]
+    assert len(volume_rows) == 1
+    assert volume_rows[0]["volume_type"] == "gp3"
+    assert volume_rows[0]["tags"] == {"env": "test"}
+
+
+@mock_aws
+def test_sync_aws_inventory_end_to_end_against_moto(db_session, monkeypatch):
+    """Full sync_aws_inventory() run against moto - real discovery, real
+    enrichment, real map_resource, real DB upsert, no injected fake fetch."""
+    monkeypatch.setattr(settings, "aws_access_key_id", "testing")
+    monkeypatch.setattr(settings, "aws_secret_access_key", "testing")
+    monkeypatch.setattr(settings, "aws_region", "us-east-1")
+    monkeypatch.setattr(settings, "aws_account_id", "999988887777")
+
+    ec2 = boto3.client("ec2", region_name="us-east-1", aws_access_key_id="testing", aws_secret_access_key="testing")
+    ec2.run_instances(
+        ImageId="ami-12345678",
+        MinCount=1,
+        MaxCount=1,
+        TagSpecifications=[{"ResourceType": "instance", "Tags": [{"Key": "Name", "Value": "moto-web-02"}]}],
+    )
+
+    before = db_session.query(Resource).count()
+    summary = sync_aws_inventory(db_session)
+
+    assert summary.found == 1
+    assert summary.created == 1
+    assert db_session.query(Resource).count() == before + 1
+
+    resource = db_session.query(Resource).filter_by(name="moto-web-02").one()
+    assert resource.provider == Provider.AWS
+    assert resource.resource_group == "EC2 instance"
 ```

@@ -25,3 +25,21 @@ export function summarizeResourceGroups(resources: ResourceListItem[]): Resource
 export function resourceLabel(resource: ResourceListItem): string {
   return resource.name ?? resource.external_resource_id ?? resource.resource_id;
 }
+
+/**
+ * The drill-down's middle level means something different per provider (Azure's
+ * resource_group vs. AWS's resource_type, per GOV-002 Section 3) - this derives
+ * the right copy from a resource's provider rather than hardcoding "resource
+ * group" everywhere. Defaults to Azure's wording for an empty/unknown provider,
+ * since that's every account this app has ever actually shown data for so far.
+ */
+export function middleLevelLabel(provider: string | undefined, options?: { plural?: boolean }): string {
+  const isAws = provider === "aws";
+  if (options?.plural) return isAws ? "Resource types" : "Resource groups";
+  return isAws ? "Resource type" : "Resource group";
+}
+
+/** The (single, in practice) provider represented in a resource list, for middleLevelLabel. */
+export function listProvider(resources: ResourceListItem[]): string | undefined {
+  return resources[0]?.provider;
+}

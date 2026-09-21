@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { ResourceListItem } from "../api/types";
-import { resourceLabel, summarizeResourceGroups } from "./groupResources";
+import { listProvider, middleLevelLabel, resourceLabel, summarizeResourceGroups } from "./groupResources";
 
 function makeResource(overrides: Partial<ResourceListItem>): ResourceListItem {
   return {
     resource_id: "id-1",
     external_resource_id: "/subscriptions/x/resourceGroups/rg-a/providers/Microsoft.Compute/virtualMachines/vm-1",
     name: "vm-1",
+    provider: "azure",
     resource_group: "rg-a",
     resource_type: "microsoft.compute/virtualmachines",
     region: "eastus",
@@ -52,5 +53,32 @@ describe("resourceLabel", () => {
   it("falls back to internal resource_id when both are missing", () => {
     const resource = makeResource({ name: null, external_resource_id: null, resource_id: "internal-id" });
     expect(resourceLabel(resource)).toBe("internal-id");
+  });
+});
+
+describe("middleLevelLabel", () => {
+  it("uses Azure wording by default", () => {
+    expect(middleLevelLabel("azure")).toBe("Resource group");
+    expect(middleLevelLabel("azure", { plural: true })).toBe("Resource groups");
+  });
+
+  it("uses AWS wording for an aws provider", () => {
+    expect(middleLevelLabel("aws")).toBe("Resource type");
+    expect(middleLevelLabel("aws", { plural: true })).toBe("Resource types");
+  });
+
+  it("defaults to Azure wording for an unknown/undefined provider", () => {
+    expect(middleLevelLabel(undefined)).toBe("Resource group");
+    expect(middleLevelLabel("gcp")).toBe("Resource group");
+  });
+});
+
+describe("listProvider", () => {
+  it("returns the first resource's provider", () => {
+    expect(listProvider([makeResource({ provider: "aws" }), makeResource({ provider: "azure" })])).toBe("aws");
+  });
+
+  it("returns undefined for an empty list", () => {
+    expect(listProvider([])).toBeUndefined();
   });
 });
