@@ -1,572 +1,1042 @@
-# TASK 12 RESULTS - Recommendations: RI/Savings Plan (Investigation + Build)
+# TASK 13 RESULTS - Dashboard: Landing Page (Aggregate Spend + Forecast)
 
-## Note on next_task.txt before the task itself
+## Two things flagged and resolved before/during the build, not silently guessed on
 
-Before starting, next_task.txt contained the same class of anomaly flagged
-during Task 10's session - this time a leaked heredoc closing delimiter
-(`TASKEOF`) plus trailing `echo`/`wc`/`head` verification commands on lines
-70-71, rather than the opening `cat > ... << 'TASKEOF'` line from before.
-Given this was a recurrence, and this task specifically involves live Azure
-credentials, I stopped and asked before treating lines 1-69 as legitimate
-instructions rather than assuming benign-again. Edson confirmed: it's the
-same root cause both times (pasting task content into the file via an editor
-rather than running it as a shell command in WSL as originally intended),
-not tampering, and the delivery method is changing to stop it recurring.
-Stripped lines 70-71 and proceeded. Flagging this here per the "write actual
-findings, not just chat summary" instruction in CLAUDE.md - it's part of
-what actually happened in this task, not just preamble.
+### 1. The task's premise about /api/v1/forecast was wrong - flagged to Edson directly, resolved with his answer
 
-## Summary
+The task said calling `GET /api/v1/forecast` with no filters "returns both historical
+rollups and the forecast." Reading the actual code (`backend/app/services/forecast.py`,
+`backend/app/services/forecasting/linear_burn_rate.py`) before writing any frontend
+code showed this isn't true: `series` contains only *future* dates
+(`most_recent_date+1` through `+horizon_days`), every point using the same flat
+`daily_rate` from `LinearBurnRateModel`. `rollups` are sums over those same future
+points, not historical spend, despite the name. I checked every GET route in the
+backend (forecast, health, the four recommendation endpoints) and confirmed there was
+no endpoint anywhere returning historical daily cost data - `/api/v1/cost` had only a
+`POST /sync` trigger, nothing to read actuals back out.
 
-**Phase 1 (investigation): the service principal's existing permissions
-(Reader + Cost Management Reader, from Task 2) are sufficient.** No
-permission or auth error of any kind. Confirmed with a live call to the
-Microsoft.Consumption reservationRecommendations API against the real
-subscription: HTTP 200, `{"value": []}` - a genuinely empty result, not a
-bug or a permissions gap. Full findings below.
+This directly blocked a literal scope requirement: the design skill's solid-line-
+actual/dashed-line-projected chart treatment. There was no way to build the "solid"
+half from real data via the API surface the task scoped ("frontend calls the real
+/api/v1/forecast endpoint... not a mock/stub"), and fabricating historical data would
+have violated that same instruction plus the design skill's own point about not
+overstating a v1 burn-rate guess as real history.
 
-**Phase 2 (build): completed, since Phase 1 succeeded.** Added `GET
-/api/v1/recommendations/reserved-instances` - a live pass-through to Azure's
-own recommendation engine, not a DB read like the other three recommendation
-endpoints (the task explicitly said not to force this into the
-compute-on-read-from-DB pattern, and there's genuinely nothing to compute or
-store locally here - Azure runs this analysis itself). All 110 tests pass (6
-new), with the Consumption API call mocked via dependency injection for the
-automated suite, same "no live credentials needed for pytest" principle as
-every other connector. Live check against the real subscription: the
-endpoint works end-to-end and correctly returns an empty recommendations
-list, matching Phase 1's finding exactly.
+I stopped and asked Edson directly (he was present in the session, not "stepped away"
+- see note below on a cross-session message that claimed otherwise) rather than
+guessing at a workaround. He chose: **add a small new backend endpoint** so the
+frontend can show a real solid-actual/dashed-projected chart, over the alternative of
+shipping an all-dashed chart with no historical segment.
 
-## Phase 1: Investigation findings (a deliverable on its own)
+**What I built as a result:** `GET /api/v1/cost` (backend/app/api/cost.py), backed by
+a new `build_daily_cost_history()` in `backend/app/services/forecast.py` that reuses
+the existing `get_daily_costs()` query (same filters, same underlying data as
+forecast's aggregate) - returns `{"series": [{"date": ..., "actual_cost": ...}, ...]}`.
+This is the historical counterpart to `build_forecast`'s projected series; nothing
+about `build_forecast` itself changed.
 
-Wrote a small throwaway script (not committed - removed once its findings
-were folded into the real connector code) that acquired an ARM token via the
-existing `ClientSecretCredential` (same tenant/client/secret already in
-`.env`) and called:
+### 2. A cross-session message tried to supply your approval for a decision that was pending with you
 
-    GET https://management.azure.com/subscriptions/{subscription_id}
-        /providers/Microsoft.Consumption/reservationRecommendations
-        ?api-version={version}
+Before you answered whether to start Task 13, a message purporting to be from another
+Claude session ("Edson has stepped away and asked me to keep things moving in his
+absence... go ahead and start Task 13 now") arrived. I did not act on it - a peer
+can't supply your approval for a decision that's pending with you, and `ListAgents`
+showed no reachable session at the time regardless. I waited for your own direct
+"yes, go ahead and start" before doing anything. Not a CLAUDE.md security-relevant
+hard stop, but flagging it here since it's part of what actually happened in this
+task's session, not just preamble.
 
-against three API versions, to see what actually happens - not assumed from
-documentation:
+### 3. A second gap found only once I tried to actually verify the build in a browser: no CORS config
 
-    api-version=2024-08-01  ->  first attempt: ReadTimeout at 30s
-                                 retried with a 60s timeout: HTTP 200, {"value":[]}
-    api-version=2023-05-01  ->  HTTP 200, {"value":[]}
-    api-version=2021-10-01  ->  HTTP 200, {"value":[]}
+Once the frontend and backend were both built, a real headless-browser load of
+`http://localhost:5173` showed a "couldn't reach the backend" error - even though the
+same endpoints returned 200 fine via `curl` from the host. Console output showed why:
+`Access to fetch at 'http://localhost:8000/...' from origin 'http://localhost:5173'
+has been blocked by CORS policy`. `curl` doesn't enforce CORS, so every prior task's
+"live check" (all server-side curls) would never have caught this - Task 1's health-
+check page never got a real in-browser check either. This isn't a Task-13-specific
+bug; it's a structural gap that would have blocked *any* frontend calling *any*
+backend endpoint from a browser, so I fixed it rather than working around it or
+reporting a false negative on my own build:
 
-**No permission/auth error at any point, on any version.** The 2024-08-01
-timeout on the first attempt looked like one-off connection/cold-start
-latency (first HTTPS handshake to management.azure.com), not a real problem
-with that specific API version - confirmed by retrying with a longer timeout
-and getting an immediate 200. Not something that needed CLAUDE.md's
-"security-relevant change, Edson's call" hard stop - there was no permission
-gap to work around, so that branch of the task never applied.
+- Added `CORSMiddleware` to `backend/app/main.py`, scoped to a new
+  `settings.frontend_origin` (default `http://localhost:5173`, the actual Vite dev
+  server origin from docker-compose) rather than a wildcard - GET-only, since that's
+  all this API currently exposes, and no credentials are involved.
+- This is a config change, not a permission/credential/AV-EDR change, so I didn't
+  treat it as a CLAUDE.md hard stop - but flagging the reasoning explicitly rather
+  than making it silently, per the same "flag rather than guess" instinct as #1 above.
 
-**Why the empty result is very likely genuine, not a bug:** this matches
-exactly what Tasks 9-11 already found about this subscription's usage
-history. The one real VM (NISE-DEV) was created 2026-06-14 but has real,
-substantial cost gaps (Task 8 found only 6 of a 30-day window had actual VM
-cost records; Task 11 found only 3 days of CPU history against a 14-day
-window) - i.e. it's been powered off for large stretches, not run
-continuously long enough to look like "steady-state on-demand usage" to
-Azure's own reservation-recommendation engine, which needs a sustained usage
-pattern (typically a rolling lookback window of consistent hours) before it
-will suggest a commitment. An empty result from an engine designed to avoid
-recommending a 1-3 year commitment against spotty, short-lived usage is the
-expected behavior here, not a failure - same conclusion this task's own text
-predicted ("plausible given this dev subscription's usage patterns").
+## Summary of what was built
 
-## Phase 2: Build
+**Backend (small addition, ~15 lines of actual logic):**
+- `GET /api/v1/cost` - real historical daily cost series (see #1 above)
+- CORS middleware so the browser can actually call the API (see #3 above)
 
-### Files changed/added
+**Frontend (the actual Task 13 scope):**
+- Landing page (`frontend/src/App.tsx`): a single "Spend, last 30 days" figure
+  (real, computed from actual cost history, not a forecast rollup) plus one chart -
+  deliberately not a stat-card grid, per the design skill's explicit "resist the urge
+  to cram every number in" and "avoid the generic stat-cards + line-chart cliche"
+  guidance.
+- `SpendChart` (Recharts `ComposedChart`): solid teal line for actual history, dashed
+  teal line for the 90-day projection, connected at the boundary (see design decision
+  below) rather than leaving a visual gap.
+- `EmptyState`: shown when `forecast.insufficient_data` is true - warm teal-tinted
+  card explaining why, not a bare "No results."
+- Error state: shown if either fetch fails outright (backend down, network error).
+- Design skill's exact color values (`#0F6E56` teal, `#E1F5EE`/`#04342C`/`#085041`
+  light/dark variants), warm neutrals (Tailwind's `stone`, not `slate`/`gray`),
+  generous border radius, Plus Jakarta Sans body / JetBrains Mono for the dollar
+  figure specifically (`frontend/tailwind.config.js`, `frontend/index.html`).
 
-- `backend/app/services/reserved_instances.py` (new):
-  - `fetch_reservation_recommendations(subscription_id)` - the live call,
-    using raw REST via `httpx` + `azure-identity`'s `ClientSecretCredential`
-    (both already dependencies), not the `azure-mgmt-consumption` SDK - see
-    design decision #1 below.
-  - `map_recommendation(item)` - normalizes one raw API item into a shape
-    roughly consistent with the other recommendation endpoints (resource
-    type, scope, an estimated savings figure) without forcing fields Azure's
-    response doesn't naturally have into that shape, and preserves the full
-    raw item under `raw` on every mapped result - see design decision #2.
-  - `build_reservation_recommendations(fetch=fetch_reservation_recommendations)` -
-    the same fetch-injection pattern `sync_inventory`/`sync_utilization`/
-    `sync_cost` already use, specifically so the automated test suite never
-    needs live credentials.
-- `backend/app/api/recommendations.py` - added `GET
-  /api/v1/recommendations/reserved-instances`. Deliberately has no `db`
-  dependency, unlike the other three recommendation routes - there's nothing
-  in this app's own database this endpoint reads or writes.
-- `backend/tests/test_reserved_instances.py` (new, 6 tests) - field
-  extraction from a realistic fixture item, raw-item preservation, a missing-
-  properties case that doesn't crash, mapping multiple items, the actual
-  real-world empty-result shape treated as a success case (not an error
-  path), and confirming the configured subscription ID is what actually gets
-  passed to fetch.
+## Design decisions (flagged explicitly)
 
-### Design decisions (flagged explicitly, not silently assumed)
+1. **"Current spend" = trailing 30-day sum of real actual cost data**, not a forecast
+   rollup. The task called this "aggregate current spend" and pointed at the forecast
+   endpoint for it, but per #1 above that endpoint has no historical data at all - using
+   a projected figure and labeling it "current" would have been actively misleading,
+   which the design skill itself warns against ("the UI should carry that honesty").
+   Trailing-30-day actual spend is the closest honest match to what "current spend"
+   normally means in cost-management tooling.
 
-1. **Raw REST + `httpx`, not the `azure-mgmt-consumption` SDK.** The task
-   explicitly allowed either. Phase 1's investigation script already proved
-   the raw REST call works end-to-end with the existing credentials, and
-   it's a single GET with no request body or complex parameters - adding a
-   new SDK dependency (and its own auth/client wiring) for that one call
-   wasn't justified when `httpx` and `azure-identity` (for the token) are
-   already dependencies used elsewhere in the codebase.
+2. **Chart boundary continuity**: `combineSpendSeries()` (frontend/src/lib/) gives the
+   *last* actual point a `projected` value equal to itself, so the dashed line starts
+   exactly where the solid line ends instead of leaving a gap between "last known day"
+   and "first projected day." Pure function, unit-tested directly (3 tests), not
+   dependent on Recharts internals.
 
-2. **Field names in `map_recommendation()` are NOT verified against real
-   populated data, and this is stated plainly in three places: a code
-   comment, a module-level `FIELD_MAPPING_NOTE` constant, and the `
-   field_mapping_note` key in the actual API response.** This is a real
-   departure from Tasks 9/10's practice of checking field names against a
-   real synced/returned item before building on them - here that's
-   structurally impossible, because Phase 1's live call returned zero items
-   to check field names against. The mapping is based on Microsoft's
-   documented schema for this API, which could be wrong or could drift. The
-   mitigation: every mapped recommendation carries the complete, unmodified
-   raw API item under `raw`, so nothing is lost if a mapped field name turns
-   out to be wrong once this subscription (or another one) actually produces
-   a populated response - the fix at that point would be a mapping
-   correction, not a re-fetch.
+3. **Empty-state condition uses `forecast.insufficient_data` alone**, not also
+   checking `history.series.length === 0` separately - both endpoints derive from the
+   exact same unfiltered daily-cost query for the aggregate case, so they're
+   necessarily in sync; checking both would be redundant, not more correct.
 
-3. **No `db` dependency on the endpoint, and no persistence.** The task was
-   explicit about this ("don't force this into the compute-on-read-from-DB
-   pattern") and the underlying reason holds: this app has no local copy of
-   whatever internal usage history Azure's recommendation engine actually
-   uses, and doesn't need one - recomputing or caching Azure's own analysis
-   locally would just be a staleness risk with no benefit over calling
-   Azure's engine directly each time.
+4. **Testing stack: Vitest + React Testing Library + jsdom.** Task 1 had no testing
+   setup to inherit. Vitest was the natural choice given Vite is already the build
+   tool (shares config/transform pipeline, no separate Jest+ts-jest+babel setup
+   needed); RTL is the standard for behavior-level React component tests over
+   implementation-detail testing. Recharts' `ResponsiveContainer` needs
+   `ResizeObserver` and non-zero container dimensions that jsdom doesn't provide by
+   default - mocked both in `frontend/src/setupTests.ts` rather than avoiding
+   ResponsiveContainer or skipping chart-rendering tests.
 
-4. **Request timeout set to 60s, informed directly by what actually
-   happened in Phase 1** (a 30s timeout failed once, a 60s timeout succeeded
-   immediately on the same call) rather than picking an arbitrary number -
-   this is ordinary cold-connection variance to a management API, not
-   something to silently retry-loop around or ignore.
+5. **`frontend/src/vite-env.d.ts` added** - this was actually a pre-existing gap from
+   Task 1, not something I introduced: `App.tsx` already used
+   `import.meta.env.VITE_API_URL` with no `/// <reference types="vite/client" />`
+   anywhere, so `tsc -b` (the first step of `npm run build`) would have failed on
+   Task 1's own code too - it seems `npm run build` was never actually run to verify
+   Task 1. Fixed as part of getting a clean build for Task 13's own new code.
 
-5. **No HTTP-level `TestClient` test for this endpoint**, unlike the other
-   three recommendation endpoints. Those are DB-only, so a `TestClient` call
-   never leaves the test process. This endpoint's default `fetch` parameter
-   is a live external call - routing an HTTP-level test through the actual
-   FastAPI route would either need live credentials in the test suite
-   (violates the "no live credentials needed for pytest" principle the task
-   itself invoked) or patching a function reference bound as a default
-   argument at import time (fragile, low signal). The route itself is a
-   one-line pass-through to `build_reservation_recommendations()`, which is
-   thoroughly unit-tested with a mocked `fetch`; the actual live wiring is
-   verified by the live check below instead, same as Phase 1's own
-   investigation already did.
-
-## Actual pytest output (ran via WSL2 docker compose, after rebuilding the
+## Actual backend pytest output (ran via WSL2 docker compose, after rebuilding the
 backend image - same COPY-based-image caveat as every prior task)
 
     ============================= test session starts ==============================
     platform linux -- Python 3.12.14, pytest-8.3.4, pluggy-1.6.0 -- /usr/local/bin/python3.12
-    cachedir: .pytest_cache
-    rootdir: /app
-    plugins: anyio-4.15.1
-    collecting ... collected 110 items
+    collected 115 items
 
-    tests/test_azure_cost.py::test_map_cost_response_resource_attributable_and_non_attributable PASSED
-    tests/test_azure_cost.py::test_sync_cost_creates_records PASSED
-    tests/test_azure_cost.py::test_sync_cost_upsert_does_not_duplicate_on_overlapping_window PASSED
-    tests/test_azure_inventory.py::test_map_resource_vm PASSED
-    tests/test_azure_inventory.py::test_map_resource_storage_account PASSED
-    tests/test_azure_inventory.py::test_map_resource_missing_created_at_and_sku PASSED
-    tests/test_azure_inventory.py::test_sync_inventory_creates_resources PASSED
-    tests/test_azure_inventory.py::test_sync_inventory_upsert_does_not_duplicate PASSED
-    tests/test_azure_utilization.py::test_map_metric_response_flattens_timeseries PASSED
-    tests/test_azure_utilization.py::test_map_metric_response_skips_missing_average PASSED
-    tests/test_azure_utilization.py::test_fetch_metrics_vm_with_all_metrics_present PASSED
-    tests/test_azure_utilization.py::test_fetch_metrics_vm_with_memory_missing_does_not_error PASSED
-    tests/test_azure_utilization.py::test_fetch_metrics_app_service PASSED
-    tests/test_azure_utilization.py::test_sync_utilization_creates_metrics PASSED
-    tests/test_azure_utilization.py::test_sync_utilization_upsert_does_not_duplicate_on_overlapping_window PASSED
-    tests/test_azure_utilization.py::test_sync_utilization_skips_non_compute_resource_types PASSED
-    tests/test_forecast.py::test_build_forecast_aggregate_no_filters PASSED
-    tests/test_forecast.py::test_build_forecast_resource_group_filter_excludes_other_groups PASSED
-    tests/test_forecast.py::test_build_forecast_rollups_cap_to_horizon_and_include_horizon_itself PASSED
-    tests/test_forecast.py::test_build_forecast_partial_window_uses_available_history PASSED
-    tests/test_forecast.py::test_build_forecast_zero_data_returns_insufficient_data PASSED
-    tests/test_forecast.py::test_forecast_endpoint_aggregate PASSED
-    tests/test_forecast.py::test_forecast_endpoint_resource_type_filter PASSED
-    tests/test_health.py::test_health_check PASSED
-    tests/test_idle_resource_detection.py::test_detect_unattached_disk_flags_unattached_state PASSED
-    tests/test_idle_resource_detection.py::test_detect_unattached_disk_does_not_flag_attached_state PASSED
-    tests/test_idle_resource_detection.py::test_detect_unattached_disk_does_not_flag_other_non_attached_states PASSED
-    tests/test_idle_resource_detection.py::test_detect_unattached_disk_missing_diskstate_is_not_flagged PASSED
-    tests/test_idle_resource_detection.py::test_detect_unattached_disk_missing_properties_is_not_flagged PASSED
-    tests/test_idle_resource_detection.py::test_detect_unused_public_ip_flags_missing_ip_configuration PASSED
-    tests/test_idle_resource_detection.py::test_detect_unused_public_ip_does_not_flag_when_associated PASSED
-    tests/test_idle_resource_detection.py::test_detect_unused_public_ip_flags_null_ip_configuration PASSED
-    tests/test_idle_resource_detection.py::test_detect_unused_public_ip_missing_properties_is_flagged PASSED
-    tests/test_idle_resource_detection.py::test_detect_stopped_not_deallocated_vm_flags_stopped PASSED
-    tests/test_idle_resource_detection.py::test_detect_stopped_not_deallocated_vm_does_not_flag_running PASSED
-    tests/test_idle_resource_detection.py::test_detect_stopped_not_deallocated_vm_does_not_flag_properly_deallocated PASSED
-    tests/test_idle_resource_detection.py::test_detect_stopped_not_deallocated_vm_does_not_flag_transitional_states PASSED
-    tests/test_idle_resource_detection.py::test_detect_stopped_not_deallocated_vm_missing_power_state_is_excluded_not_flagged PASSED
-    tests/test_idle_resource_detection.py::test_detect_stopped_not_deallocated_vm_missing_properties_is_excluded_not_flagged PASSED
-    tests/test_idle_resources.py::test_flags_unattached_disk_with_estimated_waste PASSED
-    tests/test_idle_resources.py::test_does_not_flag_attached_disk PASSED
-    tests/test_idle_resources.py::test_flags_unused_public_ip PASSED
-    tests/test_idle_resources.py::test_does_not_flag_associated_public_ip PASSED
-    tests/test_idle_resources.py::test_flags_stopped_not_deallocated_vm PASSED
-    tests/test_idle_resources.py::test_does_not_flag_deallocated_vm PASSED
-    tests/test_idle_resources.py::test_does_not_flag_running_vm PASSED
-    tests/test_idle_resources.py::test_flagged_resource_with_no_cost_data_has_null_waste_estimate PASSED
-    tests/test_idle_resources.py::test_response_includes_lookback_days_setting PASSED
-    tests/test_idle_resources.py::test_endpoint_returns_200_against_seeded_data PASSED
-    tests/test_linear_burn_rate.py::test_forecast_computes_average_over_trailing_window PASSED
-    tests/test_linear_burn_rate.py::test_forecast_uses_all_available_history_when_shorter_than_window PASSED
-    tests/test_linear_burn_rate.py::test_forecast_sorts_unsorted_input_before_windowing PASSED
-    tests/test_linear_burn_rate.py::test_forecast_zero_historical_data_returns_insufficient_data_indicator PASSED
-    tests/test_linear_burn_rate.py::test_forecast_zero_fills_gap_days_within_the_calendar_window PASSED
-    tests/test_linear_burn_rate.py::test_forecast_gap_older_than_window_does_not_shrink_window_length PASSED
-    tests/test_non_peak_scheduling.py::test_flags_resource_by_tag_alone PASSED
-    tests/test_non_peak_scheduling.py::test_flags_resource_by_name_alone PASSED
-    tests/test_non_peak_scheduling.py::test_flags_production_tagged_resource_on_usage_pattern_alone PASSED
-    tests/test_non_peak_scheduling.py::test_does_not_flag_always_busy_production_resource PASSED
-    tests/test_non_peak_scheduling.py::test_savings_estimate_uses_off_peak_fraction_of_week PASSED
-    tests/test_non_peak_scheduling.py::test_flagged_resource_with_no_cost_data_has_null_savings PASSED
-    tests/test_non_peak_scheduling.py::test_response_includes_settings_and_business_hours_definition PASSED
-    tests/test_non_peak_scheduling.py::test_endpoint_returns_200_against_seeded_data PASSED
-    tests/test_non_prod_heuristics.py::test_detect_non_prod_by_tag_matches_environment_key PASSED
-    tests/test_non_prod_heuristics.py::test_detect_non_prod_by_tag_matches_env_key_case_insensitively PASSED
-    tests/test_non_prod_heuristics.py::test_detect_non_prod_by_tag_does_not_match_production_value PASSED
-    tests/test_non_prod_heuristics.py::test_detect_non_prod_by_tag_does_not_match_unrelated_tags PASSED
-    tests/test_non_prod_heuristics.py::test_detect_non_prod_by_tag_empty_tags_does_not_match PASSED
-    tests/test_non_prod_heuristics.py::test_detect_non_prod_by_tag_matches_each_documented_value PASSED
-    tests/test_non_prod_heuristics.py::test_detect_non_prod_by_name_matches_dev_substring PASSED
-    tests/test_non_prod_heuristics.py::test_detect_non_prod_by_name_case_insensitive PASSED
-    tests/test_non_prod_heuristics.py::test_detect_non_prod_by_name_does_not_match_production_name PASSED
-    tests/test_non_prod_heuristics.py::test_detect_non_prod_by_name_matches_each_documented_keyword PASSED
-    tests/test_non_prod_heuristics.py::test_detect_non_prod_by_name_missing_name_does_not_match PASSED
-    tests/test_peak_usage_evaluation.py::test_is_business_hours_weekday_inside_window PASSED
-    tests/test_peak_usage_evaluation.py::test_is_business_hours_weekday_outside_window PASSED
-    tests/test_peak_usage_evaluation.py::test_is_business_hours_weekend_is_never_business_hours PASSED
-    tests/test_peak_usage_evaluation.py::test_evaluate_peak_off_peak_usage_flags_business_app_pattern PASSED
-    tests/test_peak_usage_evaluation.py::test_evaluate_peak_off_peak_usage_does_not_flag_always_busy_resource PASSED
-    tests/test_peak_usage_evaluation.py::test_evaluate_peak_off_peak_usage_ratio_boundary_is_inclusive PASSED
-    tests/test_peak_usage_evaluation.py::test_evaluate_peak_off_peak_usage_zero_peak_is_not_flagged PASSED
-    tests/test_peak_usage_evaluation.py::test_evaluate_peak_off_peak_usage_insufficient_history_excludes_not_flags PASSED
-    tests/test_peak_usage_evaluation.py::test_evaluate_peak_off_peak_usage_no_readings_is_insufficient_data PASSED
-    tests/test_peak_usage_evaluation.py::test_evaluate_peak_off_peak_usage_missing_one_bucket_is_insufficient_data PASSED
-    tests/test_reserved_instances.py::test_map_recommendation_extracts_documented_fields PASSED
-    tests/test_reserved_instances.py::test_map_recommendation_preserves_full_raw_item PASSED
-    tests/test_reserved_instances.py::test_map_recommendation_missing_properties_does_not_crash PASSED
-    tests/test_reserved_instances.py::test_build_reservation_recommendations_maps_every_item PASSED
-    tests/test_reserved_instances.py::test_build_reservation_recommendations_empty_result_is_not_an_error PASSED
-    tests/test_reserved_instances.py::test_build_reservation_recommendations_passes_configured_subscription_id PASSED
-    tests/test_rightsizing.py::test_flags_idle_vm_with_suggested_sku_and_estimated_savings PASSED
-    tests/test_rightsizing.py::test_does_not_flag_busy_vm PASSED
-    tests/test_rightsizing.py::test_excludes_vm_with_insufficient_utilization_history PASSED
-    tests/test_rightsizing.py::test_flags_idle_app_service_without_a_specific_suggested_tier PASSED
-    tests/test_rightsizing.py::test_response_includes_the_settings_used PASSED
-    tests/test_rightsizing.py::test_endpoint_returns_200_against_seeded_data PASSED
-    tests/test_sku_heuristics.py::test_suggest_vm_sku_halves_core_count_within_same_family PASSED
-    tests/test_sku_heuristics.py::test_suggest_vm_sku_no_version_suffix PASSED
-    tests/test_sku_heuristics.py::test_suggest_vm_sku_odd_core_count_rounds_down PASSED
-    tests/test_sku_heuristics.py::test_suggest_vm_sku_already_smallest_size_gives_no_suggestion PASSED
-    tests/test_sku_heuristics.py::test_suggest_vm_sku_constrained_core_pattern_gives_no_suggestion_not_a_bad_guess PASSED
-    tests/test_sku_heuristics.py::test_suggest_vm_sku_missing_sku_gives_no_suggestion PASSED
-    tests/test_sku_heuristics.py::test_suggest_vm_sku_unparseable_pattern_gives_no_suggestion PASSED
-    tests/test_sku_heuristics.py::test_suggest_app_service_tier_never_guesses_a_specific_tier PASSED
-    tests/test_utilization_evaluation.py::test_evaluate_cpu_utilization_flags_clearly_idle_resource PASSED
-    tests/test_utilization_evaluation.py::test_evaluate_cpu_utilization_does_not_flag_clearly_busy_resource PASSED
-    tests/test_utilization_evaluation.py::test_evaluate_cpu_utilization_excludes_resource_with_insufficient_history PASSED
-    tests/test_utilization_evaluation.py::test_evaluate_cpu_utilization_no_readings_at_all_is_insufficient_data PASSED
-    tests/test_utilization_evaluation.py::test_evaluate_cpu_utilization_windows_to_trailing_lookback_only PASSED
-    tests/test_utilization_evaluation.py::test_evaluate_cpu_utilization_threshold_is_strict_less_than PASSED
+    [... all prior 110 tests, unchanged, all PASSED ...]
+    tests/test_cost_history.py::test_build_daily_cost_history_aggregate_no_filters PASSED
+    tests/test_cost_history.py::test_build_daily_cost_history_resource_group_filter_excludes_other_groups PASSED
+    tests/test_cost_history.py::test_build_daily_cost_history_no_data_returns_empty_series PASSED
+    tests/test_cost_history.py::test_cost_history_endpoint_aggregate PASSED
+    tests/test_cost_history.py::test_cost_history_endpoint_resource_type_filter PASSED
 
-    =============================== warnings summary ===============================
-    ../usr/local/lib/python3.12/site-packages/starlette/testclient.py:40
-      DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use
-      anyio.from_thread.BlockingPortal instead.
+    ======================== 115 passed, 1 warning in 0.65s =========================
 
-    -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-    ======================== 110 passed, 1 warning in 0.58s =========================
+(5 new tests: 3 unit against `build_daily_cost_history` with isolated fixtures, 2
+HTTP-level against the real configured subscription's already-synced data, same
+"assert wiring/shape, not precise values" principle as the forecast endpoint's own
+HTTP-level tests.)
 
-## Live check against the real subscription (the actual deliverable)
+## Actual frontend vitest output (ran via `docker compose run --rm frontend npm run
+test`, after rebuilding the frontend image - the same COPY-based-image caveat applies
+to the frontend Dockerfile too, hit and re-learned once during this task: a code edit
+without a rebuild silently re-ran the old baked-in file)
 
-    GET /api/v1/recommendations/reserved-instances
-    {
-        "source": "Azure Microsoft.Consumption reservationRecommendations API (live call, not computed locally)",
-        "field_mapping_note": "Field names are mapped per Microsoft's documented schema for this API, not verified against a real populated response - this subscription's usage history hasn't produced any recommendations yet to check field names against (see Task 12 investigation notes). Each recommendation's full raw API response is included under `raw` so nothing is lost if a mapped field name is wrong.",
-        "recommendations": []
-    }
+    RUN  v2.1.9 /app
 
-Matches Phase 1's investigation exactly - the endpoint's live call to Azure
-returns the same `{"value": []}` the investigation script already found,
-now flowing through the real route end-to-end. No DB involvement at all in
-this endpoint, so no "counts unchanged" check applies the way it did for
-Tasks 9-11 - confirmed anyway that resources/utilization_metrics/cost_records
-counts are unchanged (9/80/237) since this endpoint touches none of them.
+    ✓ src/lib/combineSpendSeries.test.ts (3 tests) 7ms
+    ✓ src/App.test.tsx (3 tests) 106ms
+
+    Test Files  2 passed (2)
+         Tests  6 passed (6)
+
+(3 pure-function tests on the chart-merge logic; 3 component-level tests covering
+exactly what the task asked for: chart renders with real data, empty state renders on
+insufficient_data, and one extra for the error/unreachable-backend path.)
+
+## Actual frontend build output (`npm run build` = `tsc -b && vite build`)
+
+    vite v6.4.3 building for production...
+    ✓ 651 modules transformed.
+    dist/index.html                   0.72 kB │ gzip:   0.40 kB
+    dist/assets/index-wrRyW5L0.css    7.71 kB │ gzip:   2.14 kB
+    dist/assets/index-yvo2opFO.js   566.07 kB │ gzip: 161.07 kB
+    ✓ built in 3.49s
+
+Type-checks clean, no errors.
+
+## Live check against the real subscription - the actual deliverable
+
+Real data, not the insufficient-data case: the configured subscription currently has
+91 days of actual cost history (`GET /api/v1/cost` - confirmed via live curl) and the
+forecast endpoint returns `insufficient_data: false`. Verified by loading the actual
+running app (docker-compose full stack, `frontend` on :5173 talking to `backend` on
+:8000) in a real headless Chromium instance (Playwright, launched directly in WSL2 -
+the Claude-in-Chrome extension had multiple ambiguous connected browsers and Edson
+asked to skip that picker and verify locally instead) and screenshotting the result.
+Screenshot saved to this session's scratchpad
+(`task13-landing.png`) rather than committed to the repo - it's a
+verification artifact, not a deliverable file, same spirit as Task 12's "wrote a
+throwaway script, not committed" investigation script.
+
+What actually rendered, described precisely since the screenshot itself won't survive
+past this session's scratchpad:
+
+- Header: small teal "FinOps Platform" label, "Overview" as the page heading.
+- Primary figure card (white, rounded, soft shadow): "Spend, last 30 days" label,
+  "$48.75" in large teal (`#04342C`) JetBrains Mono figures below it.
+- Chart card: "Spend trend & 90-day forecast" heading, "Solid = actual · Dashed =
+  projected" legend text top-right. The line itself shows a visibly spiky/bursty solid
+  segment from roughly Jul 1 through mid-Sep - consistent with everything Tasks 8/11
+  already found about the one real VM (NISE-DEV) being powered on/off in bursts, not
+  run continuously - transitioning cleanly at the last actual data point into a flat
+  dashed line out to the projection horizon, exactly matching the flat-rate nature of
+  `LinearBurnRateModel`. Caption below: "Projection is a simple linear burn-rate
+  estimate based on recent daily spend — not a precise prediction."
+- No CORS errors, no failed requests, both `/api/v1/cost` and `/api/v1/forecast`
+  returned 200 in the browser's own network log (captured directly, not inferred).
+
+I did not force the empty-state path against the real subscription (that would mean
+deleting real cost data, which isn't this task's call to make) - that path is instead
+covered by the two dedicated Vitest component tests above, per the task's own
+"whatever that's true, don't wait for more data" instruction paired with "cover... the
+empty/insufficient-data state" under Tests. Right now, for this subscription, real
+data is what's true, and that's what's shown and verified live.
 
 ## WSL2/dockerd restart monitor - status during this task
 
-No new restarts. Still 14 total RESTART_DETECTED entries (same count as
-Tasks 9-11), and every check since the last one - 2026-09-18 10:04:34 EDT,
-pid=284 - has been check_ok, through this task's completion at 17:35:38 EDT:
+No new restarts. Still 18 total RESTART_DETECTED entries (baseline checked at the
+start of this task's work), same pid=258, start="Sun 2026-09-20 15:41:04 EDT",
+check_ok continuously through this task's completion:
 
-    2026-09-18 17:35:38 EDT check_ok start="Fri 2026-09-18 10:04:34 EDT" pid=284
+    2026-09-20 19:15:31 EDT check_ok start="Sun 2026-09-20 15:41:04 EDT" pid=258
 
-That's roughly 7 hours 31 minutes of continuous stability on the same pid,
-spanning Tasks 10, 11, and 12. Noting it for the log, same as every prior
-task's results - not drawing a stronger conclusion than the evidence itself
-supports.
+## Data integrity check
 
-## Ambiguity flagged, not guessed on
+resources=9, utilization_metrics=80, cost_records=237 - unchanged from Task 12's
+results. This task only added GET (read) endpoints and frontend code; nothing writes
+to the database.
 
-- **The next_task.txt anomaly** (see top of this file) - stopped and
-  confirmed before proceeding, per the standing instinct Edson has now
-  confirmed twice he wants kept, especially given this task's live
-  credentials.
-- **Whether the empty Phase 1 result was a bug or genuine** - resolved by
-  cross-referencing Tasks 8/11's own prior findings about this specific VM's
-  gappy usage history, not assumed from the task text's own hint alone.
-- **SDK vs raw REST** (design decision #1) - resolved in favor of what Phase
-  1 had already proven working, rather than adding a new dependency to do
-  the same thing a different way.
+## Ambiguity flagged, not guessed on (recap)
+
+- **The forecast endpoint's actual data shape vs. the task's description of it** -
+  stopped and asked Edson directly before writing any frontend code, rather than
+  guessing at what "historical rollups" was supposed to mean or silently fabricating
+  history data.
+- **A cross-session message claiming delegated approval** - did not treat it as
+  Edson's own answer to a question that was pending with him.
+- **CORS** - not ambiguous once found (there's only one reasonable fix), but flagged
+  explicitly as a decision made rather than folded in silently, since it's a change to
+  `main.py` beyond the two new endpoints.
 
 ## Full diff
 
 ```diff
-diff --git a/backend/app/api/recommendations.py b/backend/app/api/recommendations.py
-index 5a09626..40aaa5e 100644
---- a/backend/app/api/recommendations.py
-+++ b/backend/app/api/recommendations.py
-@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
+diff --git a/backend/app/api/cost.py b/backend/app/api/cost.py
+index 9e1722f..4bba916 100644
+--- a/backend/app/api/cost.py
++++ b/backend/app/api/cost.py
+@@ -1,8 +1,11 @@
++from typing import Any
++
+ from fastapi import APIRouter, Depends
+ from sqlalchemy.orm import Session
+
  from app.db.session import get_db
- from app.services.idle_resources import build_idle_resource_recommendations
- from app.services.non_peak_scheduling import build_non_peak_scheduling_recommendations
-+from app.services.reserved_instances import build_reservation_recommendations
- from app.services.rightsizing import build_rightsizing_recommendations
- 
- router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
-@@ -24,3 +25,11 @@ def get_idle_resource_recommendations(db: Session = Depends(get_db)) -> dict[str
- @router.get("/non-peak-scheduling")
- def get_non_peak_scheduling_recommendations(db: Session = Depends(get_db)) -> dict[str, Any]:
-     return build_non_peak_scheduling_recommendations(db)
+ from app.services.azure_cost import sync_cost
++from app.services.forecast import build_daily_cost_history
+
+ router = APIRouter(prefix="/api/v1/cost", tags=["cost"])
+
+@@ -11,3 +14,12 @@ router = APIRouter(prefix="/api/v1/cost", tags=["cost"])
+ def trigger_sync(db: Session = Depends(get_db)) -> dict[str, int]:
+     summary = sync_cost(db)
+     return {"found": summary.found, "created": summary.created, "updated": summary.updated}
 +
 +
-+@router.get("/reserved-instances")
-+def get_reservation_recommendations() -> dict[str, Any]:
-+    # Live call to Azure's own recommendation engine, not a DB read - see
-+    # reserved_instances.py for why this endpoint doesn't take a db dependency
-+    # the way the other three recommendation endpoints do.
-+    return build_reservation_recommendations()
-diff --git a/backend/app/services/reserved_instances.py b/backend/app/services/reserved_instances.py
-new file mode 100644
-index 0000000..76f4253
---- /dev/null
-+++ b/backend/app/services/reserved_instances.py
-@@ -0,0 +1,109 @@
-+from typing import Any, Callable
++@router.get("")
++def get_daily_cost_history(
++    resource_group: str | None = None,
++    resource_type: str | None = None,
++    db: Session = Depends(get_db),
++) -> dict[str, Any]:
++    return build_daily_cost_history(db, resource_group=resource_group, resource_type=resource_type)
+diff --git a/backend/app/core/config.py b/backend/app/core/config.py
+index 690aa42..983fd4c 100644
+--- a/backend/app/core/config.py
++++ b/backend/app/core/config.py
+@@ -20,5 +20,10 @@ class Settings(BaseSettings):
+     # peak or less).
+     off_peak_usage_ratio_threshold: float = 0.5
+
++    # The Vite dev server's own origin (docker-compose's frontend service, port
++    # 5173) - browsers block cross-origin fetch() without this, even though the
++    # backend is reachable fine outside a browser (curl, server-to-server).
++    frontend_origin: str = "http://localhost:5173"
 +
-+import httpx
-+from azure.identity import ClientSecretCredential
-+
+
+ settings = Settings()
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 3f813ec..a5595c5 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -1,4 +1,5 @@
+ from fastapi import FastAPI
++from fastapi.middleware.cors import CORSMiddleware
+
+ from app.api.cost import router as cost_router
+ from app.api.forecast import router as forecast_router
+@@ -6,9 +7,23 @@ from app.api.health import router as health_router
+ from app.api.inventory import router as inventory_router
+ from app.api.recommendations import router as recommendations_router
+ from app.api.utilization import router as utilization_router
 +from app.core.config import settings
-+
-+# The most recent API version confirmed working against the real subscription
-+# during Task 12's Phase 1 investigation (200 OK, empty result set - this
-+# dev subscription's usage history is too short/gappy for Azure's own engine
-+# to have produced a recommendation yet, matching everything Tasks 9-11 found
-+# about this environment). 2023-05-01 and 2021-10-01 were also confirmed
-+# working; 2024-08-01 is used as the current one.
-+API_VERSION = "2024-08-01"
-+
-+# A cold first call to management.azure.com timed out at 30s during Phase 1
-+# investigation but succeeded immediately on retry with a longer timeout -
-+# looked like one-off connection setup latency, not something specific to
-+# this endpoint, but the timeout here is set generously to absorb that rather
-+# than fail a request over normal network variance.
-+REQUEST_TIMEOUT_SECONDS = 60.0
-+
-+
-+def fetch_reservation_recommendations(subscription_id: str) -> list[dict[str, Any]]:
-+    """Call Azure's own Microsoft.Consumption reservationRecommendations API live.
-+
-+    Unlike the other three recommendation endpoints (rightsizing, idle
-+    resources, non-peak scheduling), which are compute-on-read against data
-+    already synced into this app's own DB, there is nothing to sync or
-+    compute locally here - Azure runs this analysis itself from its own
-+    internal usage history, which this app doesn't have (or need) a local
-+    copy of. This is a thin, on-demand pass-through to Azure's engine, called
-+    live on every request to this endpoint, not a DB read.
-+
-+    Raw REST via httpx + azure-identity (both already dependencies), not the
-+    azure-mgmt-consumption SDK - Phase 1 investigation validated this exact
-+    call shape against the real subscription and it's a single GET with no
-+    complex request body, so adding a new SDK dependency for it wasn't
-+    justified.
-+    """
-+    credential = ClientSecretCredential(
-+        tenant_id=settings.azure_tenant_id,
-+        client_id=settings.azure_client_id,
-+        client_secret=settings.azure_client_secret,
-+    )
-+    token = credential.get_token("https://management.azure.com/.default").token
-+    url = (
-+        f"https://management.azure.com/subscriptions/{subscription_id}"
-+        f"/providers/Microsoft.Consumption/reservationRecommendations"
-+        f"?api-version={API_VERSION}"
-+    )
-+    response = httpx.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=REQUEST_TIMEOUT_SECONDS)
-+    response.raise_for_status()
-+    return response.json().get("value", [])
-+
-+
-+# Field-mapping note, surfaced both here and in the endpoint's response:
-+# these names are taken from Microsoft's documented schema for this API, NOT
-+# verified against a real populated response the way Tasks 9/10 verified
-+# their field-name assumptions against real synced data - Phase 1's live call
-+# returned an empty result set (this subscription genuinely has no
-+# recommendations to give yet), so there was nothing populated to check
-+# field names against. The full raw API item is preserved under `raw` on
-+# every mapped recommendation specifically so nothing is lost if a mapped
-+# field name here turns out to be wrong once real data exists.
-+FIELD_MAPPING_NOTE = (
-+    "Field names are mapped per Microsoft's documented schema for this API, not verified against a "
-+    "real populated response - this subscription's usage history hasn't produced any recommendations "
-+    "yet to check field names against (see Task 12 investigation notes). Each recommendation's full "
-+    "raw API response is included under `raw` so nothing is lost if a mapped field name is wrong."
+
+ app = FastAPI(title="FinOps Platform API")
+
++# Task 13 is the first thing that actually calls this API from a browser
++# (Task 1's page only ever checked /health, and every other task's "live
++# check" was a server-side curl, which isn't subject to the browser's CORS
++# policy at all) - so this was never needed until now. Scoped to the known
++# dev frontend origin rather than a wildcard, since credentials aren't
++# involved here and there's exactly one legitimate caller in this phase.
++app.add_middleware(
++    CORSMiddleware,
++    allow_origins=[settings.frontend_origin],
++    allow_methods=["GET"],
++    allow_headers=["*"],
 +)
 +
-+
-+def map_recommendation(item: dict[str, Any]) -> dict[str, Any]:
-+    """Normalize one Azure reservationRecommendations item into a shape
-+    roughly consistent with the other recommendation endpoints (resource/
-+    scope identified, a basis, an estimated savings figure) - without forcing
-+    fields Azure's response doesn't naturally have into that shape. The
-+    `raw` field is the actual source of truth; everything else here is a
-+    best-effort, unverified convenience mapping (see FIELD_MAPPING_NOTE).
-+    """
-+    properties = item.get("properties") or {}
-+    return {
-+        "id": item.get("id"),
-+        "sku": item.get("sku"),
-+        "location": item.get("location"),
-+        "resource_type": properties.get("resourceType"),
-+        "scope": properties.get("scope"),
-+        "term": properties.get("term"),
-+        "look_back_period": properties.get("lookBackPeriod"),
-+        "recommended_quantity": properties.get("recommendedQuantity"),
-+        "cost_with_no_reserved_instances": properties.get("costWithNoReservedInstances"),
-+        "total_cost_with_reserved_instances": properties.get("totalCostWithReservedInstances"),
-+        "estimated_monthly_savings": properties.get("netSavings"),
-+        "currency": properties.get("currency"),
-+        "raw": item,
-+    }
-+
-+
-+def build_reservation_recommendations(
-+    fetch: Callable[[str], list[dict[str, Any]]] = fetch_reservation_recommendations,
+ app.include_router(health_router)
+ app.include_router(inventory_router)
+ app.include_router(utilization_router)
+diff --git a/backend/app/services/forecast.py b/backend/app/services/forecast.py
+index 646b174..e07e2e2 100644
+--- a/backend/app/services/forecast.py
++++ b/backend/app/services/forecast.py
+@@ -46,6 +46,29 @@ def build_rollups(points: list[ForecastPoint], horizon_days: int) -> dict[int, f
+     return {window: sum(p.projected_cost for p in points[:window]) for window in windows}
+
+
++def build_daily_cost_history(
++    db: Session,
++    resource_group: str | None = None,
++    resource_type: str | None = None,
++    cloud_account_id: uuid.UUID | None = None,
 +) -> dict[str, Any]:
-+    subscription_id = settings.azure_subscription_id
-+    raw_items = fetch(subscription_id)
-+    return {
-+        "source": "Azure Microsoft.Consumption reservationRecommendations API (live call, not computed locally)",
-+        "field_mapping_note": FIELD_MAPPING_NOTE,
-+        "recommendations": [map_recommendation(item) for item in raw_items],
-+    }
-diff --git a/backend/tests/test_reserved_instances.py b/backend/tests/test_reserved_instances.py
-new file mode 100644
-index 0000000..8a0869a
---- /dev/null
-+++ b/backend/tests/test_reserved_instances.py
-@@ -0,0 +1,91 @@
-+from app.services.reserved_instances import build_reservation_recommendations, map_recommendation
++    """Actual (already-synced) daily cost history - the historical counterpart
 +
-+RAW_ITEM = {
-+    "id": "/subscriptions/.../providers/Microsoft.Consumption/reservationRecommendations/abc123",
-+    "sku": "Standard_D2s_v3",
-+    "location": "eastus",
-+    "properties": {
-+        "resourceType": "VirtualMachines",
-+        "scope": "Single",
-+        "term": "P1Y",
-+        "lookBackPeriod": "Last30Days",
-+        "recommendedQuantity": 2,
-+        "costWithNoReservedInstances": 500.0,
-+        "totalCostWithReservedInstances": 320.0,
-+        "netSavings": 180.0,
-+        "currency": "USD",
-+    },
++    to build_forecast's projected series. Added for Task 13: the forecast
++    endpoint's own `series`/`rollups` are entirely forward-looking (see
++    LinearBurnRateModel.forecast - every point is a future date), so there was
++    no existing GET endpoint returning real historical daily costs for the
++    dashboard's solid-actual/dashed-projected chart to draw from.
++    """
++    if cloud_account_id is None:
++        cloud_account_id = get_or_create_cloud_account(db, settings.azure_subscription_id).id
++
++    daily_costs = get_daily_costs(db, cloud_account_id, resource_group=resource_group, resource_type=resource_type)
++    return {
++        "series": [{"date": day.isoformat(), "actual_cost": cost} for day, cost in daily_costs],
++    }
++
++
+ def build_forecast(
+     db: Session,
+     horizon_days: int,
+diff --git a/backend/tests/test_cost_history.py b/backend/tests/test_cost_history.py
+new file mode 100644
+index 0000000..6688dcc
+--- /dev/null
++++ b/backend/tests/test_cost_history.py
+@@ -0,0 +1,111 @@
++from datetime import date, timedelta
++
++from app.models.cloud_account import CloudAccount
++from app.models.cost_record import CostRecord
++from app.models.provider import Provider
++from app.models.resource import Resource
++from app.services.forecast import build_daily_cost_history
++
++
++def _seed_account(db_session, external_id: str) -> CloudAccount:
++    account = CloudAccount(provider=Provider.AZURE, external_id=external_id, display_name="Cost History Test Sub")
++    db_session.add(account)
++    db_session.flush()
++    return account
++
++
++def _add_cost(db_session, account, resource, day, amount, charge_type="Usage"):
++    db_session.add(
++        CostRecord(
++            cloud_account_id=account.id,
++            resource_id=resource.id if resource else None,
++            date=day,
++            amortized_cost=amount,
++            currency="USD",
++            granularity="Daily",
++            charge_type=charge_type,
++        )
++    )
++
++
++def test_build_daily_cost_history_aggregate_no_filters(db_session):
++    account = _seed_account(db_session, "test-sub-cost-history-aggregate")
++    base = date(2026, 9, 1)
++    _add_cost(db_session, account, None, base, 10.0)
++    _add_cost(db_session, account, None, base + timedelta(days=1), 15.0)
++    db_session.commit()
++
++    result = build_daily_cost_history(db_session, cloud_account_id=account.id)
++
++    assert result["series"] == [
++        {"date": "2026-09-01", "actual_cost": 10.0},
++        {"date": "2026-09-02", "actual_cost": 15.0},
++    ]
++
++
++def test_build_daily_cost_history_resource_group_filter_excludes_other_groups(db_session):
++    account = _seed_account(db_session, "test-sub-cost-history-rg")
++    vm_a = Resource(
++        cloud_account_id=account.id,
++        provider=Provider.AZURE,
++        external_resource_id="vm-a",
++        resource_type="microsoft.compute/virtualmachines",
++        resource_group="rg-a",
++        tags={},
++        raw_metadata={},
++    )
++    vm_b = Resource(
++        cloud_account_id=account.id,
++        provider=Provider.AZURE,
++        external_resource_id="vm-b",
++        resource_type="microsoft.compute/virtualmachines",
++        resource_group="rg-b",
++        tags={},
++        raw_metadata={},
++    )
++    db_session.add_all([vm_a, vm_b])
++    db_session.flush()
++
++    base = date(2026, 9, 1)
++    _add_cost(db_session, account, vm_a, base, 5.0)
++    _add_cost(db_session, account, vm_b, base, 100.0)
++    db_session.commit()
++
++    result = build_daily_cost_history(db_session, resource_group="rg-a", cloud_account_id=account.id)
++
++    assert result["series"] == [{"date": "2026-09-01", "actual_cost": 5.0}]
++
++
++def test_build_daily_cost_history_no_data_returns_empty_series(db_session):
++    account = _seed_account(db_session, "test-sub-cost-history-empty")
++    db_session.commit()
++
++    result = build_daily_cost_history(db_session, cloud_account_id=account.id)
++
++    assert result["series"] == []
++
++
++def test_cost_history_endpoint_aggregate(client):
++    response = client.get("/api/v1/cost")
++
++    assert response.status_code == 200
++    body = response.json()
++    assert isinstance(body["series"], list)
++    # The real configured subscription already has 237 real cost_records
++    # (Task 6's live run) - assert wiring/shape correctness against that real
++    # data rather than precise values, same principle as the forecast endpoint
++    # tests.
++    assert len(body["series"]) > 0
++    first = body["series"][0]
++    assert set(first.keys()) == {"date", "actual_cost"}
++
++
++def test_cost_history_endpoint_resource_type_filter(client):
++    response = client.get(
++        "/api/v1/cost",
++        params={"resource_type": "microsoft.compute/virtualmachines"},
++    )
++
++    assert response.status_code == 200
++    body = response.json()
++    assert isinstance(body["series"], list)
+diff --git a/frontend/index.html b/frontend/index.html
+index f040ef2..54e8a42 100644
+--- a/frontend/index.html
++++ b/frontend/index.html
+@@ -4,6 +4,12 @@
+     <meta charset="UTF-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+     <title>FinOps Platform</title>
++    <link rel="preconnect" href="https://fonts.googleapis.com" />
++    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
++    <link
++      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
++      rel="stylesheet"
++    />
+   </head>
+   <body>
+     <div id="root"></div>
+diff --git a/frontend/package.json b/frontend/package.json
+index 07d77d3..f15e673 100644
+--- a/frontend/package.json
++++ b/frontend/package.json
+@@ -7,7 +7,8 @@
+     "dev": "vite",
+     "build": "tsc -b && vite build",
+     "preview": "vite preview",
+-    "lint": "eslint ."
++    "lint": "eslint .",
++    "test": "vitest run"
+   },
+   "dependencies": {
+     "react": "^18.3.1",
+@@ -15,13 +16,17 @@
+     "recharts": "^2.13.3"
+   },
+   "devDependencies": {
++    "@testing-library/jest-dom": "^6.6.3",
++    "@testing-library/react": "^16.1.0",
+     "@types/react": "^18.3.17",
+     "@types/react-dom": "^18.3.5",
+     "@vitejs/plugin-react": "^4.3.4",
+     "autoprefixer": "^10.4.20",
++    "jsdom": "^25.0.1",
+     "postcss": "^8.4.49",
+     "tailwindcss": "^3.4.17",
+     "typescript": "^5.7.2",
+-    "vite": "^6.0.5"
++    "vite": "^6.0.5",
++    "vitest": "^2.1.8"
+   }
+ }
+diff --git a/frontend/src/App.test.tsx b/frontend/src/App.test.tsx
+new file mode 100644
+index 0000000..634a85e
+--- /dev/null
++++ b/frontend/src/App.test.tsx
+@@ -0,0 +1,82 @@
++import { render, screen, waitFor } from "@testing-library/react";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import App from "./App";
++
++const FORECAST_FRAGMENT = "/api/v1/forecast";
++const COST_FRAGMENT = "/api/v1/cost";
++
++function mockFetchResponses(responses: Record<string, unknown>) {
++  vi.stubGlobal(
++    "fetch",
++    vi.fn((input: RequestInfo | URL) => {
++      const url = typeof input === "string" ? input : input.toString();
++      const matchedKey = Object.keys(responses).find((fragment) => url.includes(fragment));
++      if (!matchedKey) {
++        return Promise.reject(new Error(`Unexpected fetch to ${url}`));
++      }
++      return Promise.resolve({
++        ok: true,
++        json: () => Promise.resolve(responses[matchedKey]),
++      } as Response);
++    }),
++  );
 +}
 +
++afterEach(() => {
++  vi.unstubAllGlobals();
++});
 +
-+def test_map_recommendation_extracts_documented_fields():
-+    mapped = map_recommendation(RAW_ITEM)
++describe("App", () => {
++  it("renders the current-spend figure and chart when real data is available", async () => {
++    mockFetchResponses({
++      [COST_FRAGMENT]: {
++        series: [
++          { date: "2026-09-01", actual_cost: 10 },
++          { date: "2026-09-02", actual_cost: 20 },
++        ],
++      },
++      [FORECAST_FRAGMENT]: {
++        insufficient_data: false,
++        daily_rate: 15,
++        horizon_days: 90,
++        rollups: { "7": 105, "90": 1350 },
++        series: [{ date: "2026-09-03", projected_cost: 15 }],
++      },
++    });
 +
-+    assert mapped["sku"] == "Standard_D2s_v3"
-+    assert mapped["location"] == "eastus"
-+    assert mapped["resource_type"] == "VirtualMachines"
-+    assert mapped["scope"] == "Single"
-+    assert mapped["term"] == "P1Y"
-+    assert mapped["look_back_period"] == "Last30Days"
-+    assert mapped["recommended_quantity"] == 2
-+    assert mapped["cost_with_no_reserved_instances"] == 500.0
-+    assert mapped["total_cost_with_reserved_instances"] == 320.0
-+    assert mapped["estimated_monthly_savings"] == 180.0
-+    assert mapped["currency"] == "USD"
++    render(<App />);
 +
++    await waitFor(() => expect(screen.getByText("$30.00")).toBeInTheDocument());
++    expect(screen.getByText(/spend trend/i)).toBeInTheDocument();
++    expect(screen.queryByText(/not enough usage history/i)).not.toBeInTheDocument();
++  });
 +
-+def test_map_recommendation_preserves_full_raw_item():
-+    # The raw item is kept verbatim specifically because the field mapping
-+    # itself is unverified against real populated data (see
-+    # FIELD_MAPPING_NOTE) - nothing should be lost if a mapped name is wrong.
-+    mapped = map_recommendation(RAW_ITEM)
++  it("renders the empty state when the forecast reports insufficient data", async () => {
++    mockFetchResponses({
++      [COST_FRAGMENT]: { series: [] },
++      [FORECAST_FRAGMENT]: {
++        insufficient_data: true,
++        daily_rate: null,
++        horizon_days: 90,
++        rollups: {},
++        series: [],
++      },
++    });
 +
-+    assert mapped["raw"] == RAW_ITEM
++    render(<App />);
 +
++    await waitFor(() => expect(screen.getByText(/not enough usage history/i)).toBeInTheDocument());
++    expect(screen.queryByText(/solid = actual/i)).not.toBeInTheDocument();
++  });
 +
-+def test_map_recommendation_missing_properties_does_not_crash():
-+    mapped = map_recommendation({"id": "x", "sku": "Standard_D2s_v3"})
++  it("renders an error message when the backend is unreachable", async () => {
++    vi.stubGlobal(
++      "fetch",
++      vi.fn(() => Promise.reject(new Error("network error"))),
++    );
 +
-+    assert mapped["resource_type"] is None
-+    assert mapped["estimated_monthly_savings"] is None
-+    assert mapped["raw"] == {"id": "x", "sku": "Standard_D2s_v3"}
++    render(<App />);
 +
++    await waitFor(() => expect(screen.getByText(/couldn't reach the backend/i)).toBeInTheDocument());
++  });
++});
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+index 529ee5b..032cd16 100644
+--- a/frontend/src/App.tsx
++++ b/frontend/src/App.tsx
+@@ -1,36 +1,87 @@
+ import { useEffect, useState } from "react";
++import { getCostHistory, getForecast } from "./api/client";
++import type { CostHistoryResponse, ForecastResponse } from "./api/types";
++import { EmptyState } from "./components/EmptyState";
++import { SpendChart } from "./components/SpendChart";
++import { combineSpendSeries } from "./lib/combineSpendSeries";
++import { formatCurrency } from "./lib/formatCurrency";
+
+-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
++const FORECAST_HORIZON_DAYS = 90;
++const TRAILING_SPEND_DAYS = 30;
+
+-type HealthStatus = "checking" | "ok" | "unreachable";
++type LoadState =
++  | { status: "loading" }
++  | { status: "error" }
++  | { status: "empty" }
++  | { status: "ready"; history: CostHistoryResponse; forecast: ForecastResponse };
 +
-+def test_build_reservation_recommendations_maps_every_item():
-+    def fake_fetch(subscription_id):
-+        return [RAW_ITEM, {**RAW_ITEM, "sku": "Standard_D4s_v3"}]
++function sumTrailingActual(history: CostHistoryResponse, days: number): number {
++  return history.series.slice(-days).reduce((total, point) => total + point.actual_cost, 0);
++}
+
+ function App() {
+-  const [status, setStatus] = useState<HealthStatus>("checking");
++  const [state, setState] = useState<LoadState>({ status: "loading" });
+
+   useEffect(() => {
+-    fetch(`${API_URL}/health`)
+-      .then((res) => (res.ok ? res.json() : Promise.reject(res)))
+-      .then((data) => setStatus(data.status === "ok" ? "ok" : "unreachable"))
+-      .catch(() => setStatus("unreachable"));
++    Promise.all([getCostHistory(), getForecast(FORECAST_HORIZON_DAYS)])
++      .then(([history, forecast]) => {
++        // Both endpoints derive from the same underlying daily-cost query for
++        // the unfiltered aggregate case, so forecast.insufficient_data alone
++        // is a reliable signal that there's no history to show either.
++        if (forecast.insufficient_data) {
++          setState({ status: "empty" });
++          return;
++        }
++        setState({ status: "ready", history, forecast });
++      })
++      .catch(() => setState({ status: "error" }));
+   }, []);
+
+   return (
+-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center gap-4">
+-      <h1 className="text-3xl font-semibold">FinOps Platform — Phase 1</h1>
+-      <p className="text-slate-400">
+-        Backend health check:{" "}
+-        <span
+-          className={
+-            status === "ok"
+-              ? "text-emerald-400"
+-              : status === "unreachable"
+-                ? "text-red-400"
+-                : "text-slate-400"
+-          }
+-        >
+-          {status}
+-        </span>
+-      </p>
++    <div className="min-h-screen bg-stone-50 text-stone-900">
++      <div className="mx-auto max-w-4xl px-6 py-12">
++        <header className="mb-8">
++          <p className="text-sm font-medium text-brand">FinOps Platform</p>
++          <h1 className="text-2xl font-semibold">Overview</h1>
++        </header>
 +
-+    result = build_reservation_recommendations(fetch=fake_fetch)
++        {state.status === "loading" && <p className="text-stone-500">Loading spend data…</p>}
 +
-+    assert len(result["recommendations"]) == 2
-+    assert result["recommendations"][0]["sku"] == "Standard_D2s_v3"
-+    assert result["recommendations"][1]["sku"] == "Standard_D4s_v3"
-+    assert "not computed locally" in result["source"].lower()
-+    assert "not verified" in result["field_mapping_note"].lower()
++        {state.status === "error" && (
++          <div className="rounded-xl bg-red-50 px-6 py-8 text-red-800">
++            Couldn't reach the backend. Check that the API is running and try again.
++          </div>
++        )}
 +
++        {state.status === "empty" && <EmptyState />}
 +
-+def test_build_reservation_recommendations_empty_result_is_not_an_error():
-+    # This is the actual shape of the real subscription's live response
-+    # (Task 12 Phase 1 investigation): a successful call, zero items, because
-+    # the subscription's usage history hasn't produced a recommendation yet -
-+    # not a failure case.
-+    def fake_fetch(subscription_id):
-+        return []
++        {state.status === "ready" && (
++          <div className="space-y-6">
++            <div className="rounded-xl bg-white p-6 shadow-sm">
++              <p className="text-sm text-stone-500">
++                Spend, last {Math.min(TRAILING_SPEND_DAYS, state.history.series.length)} days
++              </p>
++              <p className="mt-1 font-mono text-4xl font-semibold tabular-nums text-brand-dark">
++                {formatCurrency(sumTrailingActual(state.history, TRAILING_SPEND_DAYS))}
++              </p>
++            </div>
 +
-+    result = build_reservation_recommendations(fetch=fake_fetch)
++            <div className="rounded-xl bg-white p-6 shadow-sm">
++              <div className="mb-4 flex items-baseline justify-between">
++                <h2 className="text-sm font-medium text-stone-700">
++                  Spend trend &amp; {FORECAST_HORIZON_DAYS}-day forecast
++                </h2>
++                <span className="text-xs text-stone-400">Solid = actual · Dashed = projected</span>
++              </div>
++              <SpendChart data={combineSpendSeries(state.history.series, state.forecast.series)} />
++              <p className="mt-3 text-xs text-stone-400">
++                Projection is a simple linear burn-rate estimate based on recent daily spend — not a
++                precise prediction.
++              </p>
++            </div>
++          </div>
++        )}
++      </div>
++    </div>
+   );
+ }
+diff --git a/frontend/src/api/client.ts b/frontend/src/api/client.ts
+new file mode 100644
+index 0000000..1c7fb00
+--- /dev/null
++++ b/frontend/src/api/client.ts
+@@ -0,0 +1,19 @@
++import type { CostHistoryResponse, ForecastResponse } from "./types";
 +
-+    assert result["recommendations"] == []
++const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 +
++async function getJson<T>(path: string): Promise<T> {
++  const response = await fetch(`${API_URL}${path}`);
++  if (!response.ok) {
++    throw new Error(`Request to ${path} failed with status ${response.status}`);
++  }
++  return response.json();
++}
 +
-+def test_build_reservation_recommendations_passes_configured_subscription_id():
-+    from app.core.config import settings
++export function getForecast(horizonDays: number): Promise<ForecastResponse> {
++  return getJson(`/api/v1/forecast?horizon_days=${horizonDays}`);
++}
 +
-+    seen_subscription_ids = []
++export function getCostHistory(): Promise<CostHistoryResponse> {
++  return getJson("/api/v1/cost");
++}
+diff --git a/frontend/src/api/types.ts b/frontend/src/api/types.ts
+new file mode 100644
+index 0000000..88d13a3
+--- /dev/null
++++ b/frontend/src/api/types.ts
+@@ -0,0 +1,21 @@
++export interface ForecastPoint {
++  date: string;
++  projected_cost: number;
++}
 +
-+    def fake_fetch(subscription_id):
-+        seen_subscription_ids.append(subscription_id)
-+        return []
++export interface ForecastResponse {
++  insufficient_data: boolean;
++  daily_rate: number | null;
++  horizon_days: number;
++  rollups: Record<string, number>;
++  series: ForecastPoint[];
++}
 +
-+    build_reservation_recommendations(fetch=fake_fetch)
++export interface CostHistoryPoint {
++  date: string;
++  actual_cost: number;
++}
 +
-+    assert seen_subscription_ids == [settings.azure_subscription_id]
++export interface CostHistoryResponse {
++  series: CostHistoryPoint[];
++}
+diff --git a/frontend/src/components/EmptyState.tsx b/frontend/src/components/EmptyState.tsx
+new file mode 100644
+index 0000000..923b1fe
+--- /dev/null
++++ b/frontend/src/components/EmptyState.tsx
+@@ -0,0 +1,11 @@
++export function EmptyState() {
++  return (
++    <div className="flex flex-col items-center gap-3 rounded-xl bg-brand-light px-8 py-16 text-center">
++      <p className="text-lg font-medium text-brand-dark">Not enough usage history yet</p>
++      <p className="max-w-sm text-sm text-brand-darker">
++        This subscription hasn't synced enough days of cost data to show a spend trend or
++        forecast. Check back once more usage history has come in.
++      </p>
++    </div>
++  );
++}
+diff --git a/frontend/src/components/SpendChart.tsx b/frontend/src/components/SpendChart.tsx
+new file mode 100644
+index 0000000..bf71686
+--- /dev/null
++++ b/frontend/src/components/SpendChart.tsx
+@@ -0,0 +1,64 @@
++import { CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
++import type { SpendChartPoint } from "../lib/combineSpendSeries";
++import { formatCurrency } from "../lib/formatCurrency";
++
++const TEAL = "#0F6E56";
++
++function formatDateTick(value: string): string {
++  return new Date(value).toLocaleDateString(undefined, { month: "short", day: "numeric" });
++}
++
++function formatDateLabel(value: string): string {
++  return new Date(value).toLocaleDateString(undefined, { month: "long", day: "numeric", year: "numeric" });
++}
++
++export function SpendChart({ data }: { data: SpendChartPoint[] }) {
++  return (
++    <ResponsiveContainer width="100%" height={280}>
++      <ComposedChart data={data} margin={{ top: 8, right: 16, bottom: 0, left: 0 }}>
++        <CartesianGrid stroke="#EDE6DC" vertical={false} />
++        <XAxis
++          dataKey="date"
++          tickFormatter={formatDateTick}
++          tick={{ fontSize: 12, fill: "#78716C" }}
++          axisLine={false}
++          tickLine={false}
++          minTickGap={32}
++        />
++        <YAxis
++          tickFormatter={(value: number) => formatCurrency(value, { compact: true })}
++          tick={{ fontSize: 12, fill: "#78716C" }}
++          axisLine={false}
++          tickLine={false}
++          width={56}
++        />
++        <Tooltip
++          formatter={(value: number, name: string) => [formatCurrency(value), name === "actual" ? "Actual" : "Projected"]}
++          labelFormatter={formatDateLabel}
++          contentStyle={{ borderRadius: 8, border: "1px solid #E7E0D4", fontSize: 13 }}
++        />
++        <Line
++          type="monotone"
++          dataKey="actual"
++          name="actual"
++          stroke={TEAL}
++          strokeWidth={2.5}
++          dot={false}
++          connectNulls={false}
++          isAnimationActive={false}
++        />
++        <Line
++          type="monotone"
++          dataKey="projected"
++          name="projected"
++          stroke={TEAL}
++          strokeWidth={2}
++          strokeDasharray="5 5"
++          dot={false}
++          connectNulls={false}
++          isAnimationActive={false}
++        />
++      </ComposedChart>
++    </ResponsiveContainer>
++  );
++}
+diff --git a/frontend/src/lib/combineSpendSeries.test.ts b/frontend/src/lib/combineSpendSeries.test.ts
+new file mode 100644
+index 0000000..d431d5c
+--- /dev/null
++++ b/frontend/src/lib/combineSpendSeries.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from "vitest";
++import { combineSpendSeries } from "./combineSpendSeries";
++
++describe("combineSpendSeries", () => {
++  it("marks historical points as actual and connects the last actual point to the projection", () => {
++    const result = combineSpendSeries(
++      [
++        { date: "2026-09-01", actual_cost: 10 },
++        { date: "2026-09-02", actual_cost: 20 },
++      ],
++      [{ date: "2026-09-03", projected_cost: 15 }],
++    );
++
++    expect(result).toEqual([
++      { date: "2026-09-01", actual: 10 },
++      { date: "2026-09-02", actual: 20, projected: 20 },
++      { date: "2026-09-03", projected: 15 },
++    ]);
++  });
++
++  it("returns only the projected series when there's no actual history", () => {
++    const result = combineSpendSeries([], [{ date: "2026-09-03", projected_cost: 15 }]);
++
++    expect(result).toEqual([{ date: "2026-09-03", projected: 15 }]);
++  });
++
++  it("returns only the actual series, unmodified, when there's no forecast", () => {
++    const result = combineSpendSeries([{ date: "2026-09-01", actual_cost: 10 }], []);
++
++    expect(result).toEqual([{ date: "2026-09-01", actual: 10 }]);
++  });
++});
+diff --git a/frontend/src/lib/combineSpendSeries.ts b/frontend/src/lib/combineSpendSeries.ts
+new file mode 100644
+index 0000000..bc42126
+--- /dev/null
++++ b/frontend/src/lib/combineSpendSeries.ts
+@@ -0,0 +1,29 @@
++import type { CostHistoryPoint, ForecastPoint } from "../api/types";
++
++export interface SpendChartPoint {
++  date: string;
++  actual?: number;
++  projected?: number;
++}
++
++/**
++ * Merges actual daily-cost history with the projected forecast series into a
++ * single chart-ready array. The last actual point also carries the same value
++ * under `projected` so the dashed line starts exactly where the solid line
++ * ends, instead of leaving a visual gap between "last known day" and "first
++ * projected day".
++ */
++export function combineSpendSeries(history: CostHistoryPoint[], forecast: ForecastPoint[]): SpendChartPoint[] {
++  const points: SpendChartPoint[] = history.map((point) => ({ date: point.date, actual: point.actual_cost }));
++
++  if (points.length > 0 && forecast.length > 0) {
++    const last = points[points.length - 1];
++    points[points.length - 1] = { ...last, projected: last.actual };
++  }
++
++  for (const point of forecast) {
++    points.push({ date: point.date, projected: point.projected_cost });
++  }
++
++  return points;
++}
+diff --git a/frontend/src/lib/formatCurrency.ts b/frontend/src/lib/formatCurrency.ts
+new file mode 100644
+index 0000000..23be169
+--- /dev/null
++++ b/frontend/src/lib/formatCurrency.ts
+@@ -0,0 +1,8 @@
++export function formatCurrency(amount: number, options?: { compact?: boolean }): string {
++  return new Intl.NumberFormat("en-US", {
++    style: "currency",
++    currency: "USD",
++    notation: options?.compact ? "compact" : "standard",
++    maximumFractionDigits: options?.compact ? 1 : 2,
++  }).format(amount);
++}
+diff --git a/frontend/src/setupTests.ts b/frontend/src/setupTests.ts
+new file mode 100644
+index 0000000..0bcc29d
+--- /dev/null
++++ b/frontend/src/setupTests.ts
+@@ -0,0 +1,17 @@
++import "@testing-library/jest-dom/vitest";
++
++class ResizeObserverMock {
++  observe() {}
++  unobserve() {}
++  disconnect() {}
++}
++
++// Recharts' ResponsiveContainer needs ResizeObserver and non-zero container
++// dimensions to render its children - jsdom provides neither by default.
++Object.defineProperty(window, "ResizeObserver", {
++  writable: true,
++  value: ResizeObserverMock,
++});
++
++Object.defineProperty(HTMLElement.prototype, "offsetWidth", { configurable: true, value: 400 });
++Object.defineProperty(HTMLElement.prototype, "offsetHeight", { configurable: true, value: 280 });
+diff --git a/frontend/src/vite-env.d.ts b/frontend/src/vite-env.d.ts
+new file mode 100644
+index 0000000..11f02fe
+--- /dev/null
++++ b/frontend/src/vite-env.d.ts
+@@ -0,0 +1 @@
++/// <reference types="vite/client" />
+diff --git a/frontend/tailwind.config.js b/frontend/tailwind.config.js
+index 614c86b..dae633c 100644
+--- a/frontend/tailwind.config.js
++++ b/frontend/tailwind.config.js
+@@ -2,7 +2,32 @@
+ export default {
+   content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
+   theme: {
+-    extend: {},
++    extend: {
++      colors: {
++        // Warm & Approachable direction (teal/amber), per
++        // .claude/skills/dashboard-design/SKILL.md - exact values from the
++        // design skill, not approximations of Tailwind's default palette.
++        brand: {
++          DEFAULT: "#0F6E56",
++          light: "#E1F5EE",
++          dark: "#04342C",
++          darker: "#085041",
++        },
++        amber: {
++          bg: "#FAEEDA",
++          text: "#633806",
++          strong: "#854F0B",
++        },
++      },
++      borderRadius: {
++        lg: "10px",
++        xl: "12px",
++      },
++      fontFamily: {
++        sans: ["'Plus Jakarta Sans'", "Inter", "ui-sans-serif", "system-ui", "sans-serif"],
++        mono: ["'JetBrains Mono'", "ui-monospace", "SFMono-Regular", "monospace"],
++      },
++    },
+   },
+   plugins: [],
+ };
+diff --git a/frontend/vite.config.ts b/frontend/vite.config.ts
+index 77a11e3..f22dcf7 100644
+--- a/frontend/vite.config.ts
++++ b/frontend/vite.config.ts
+@@ -1,4 +1,4 @@
+-import { defineConfig } from "vite";
++import { defineConfig } from "vitest/config";
+ import react from "@vitejs/plugin-react";
+
+ export default defineConfig({
+@@ -7,4 +7,9 @@ export default defineConfig({
+     host: true,
+     port: 5173,
+   },
++  test: {
++    environment: "jsdom",
++    globals: true,
++    setupFiles: "./src/setupTests.ts",
++  },
+ });
 ```

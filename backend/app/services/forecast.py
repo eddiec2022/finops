@@ -46,6 +46,29 @@ def build_rollups(points: list[ForecastPoint], horizon_days: int) -> dict[int, f
     return {window: sum(p.projected_cost for p in points[:window]) for window in windows}
 
 
+def build_daily_cost_history(
+    db: Session,
+    resource_group: str | None = None,
+    resource_type: str | None = None,
+    cloud_account_id: uuid.UUID | None = None,
+) -> dict[str, Any]:
+    """Actual (already-synced) daily cost history - the historical counterpart
+
+    to build_forecast's projected series. Added for Task 13: the forecast
+    endpoint's own `series`/`rollups` are entirely forward-looking (see
+    LinearBurnRateModel.forecast - every point is a future date), so there was
+    no existing GET endpoint returning real historical daily costs for the
+    dashboard's solid-actual/dashed-projected chart to draw from.
+    """
+    if cloud_account_id is None:
+        cloud_account_id = get_or_create_cloud_account(db, settings.azure_subscription_id).id
+
+    daily_costs = get_daily_costs(db, cloud_account_id, resource_group=resource_group, resource_type=resource_type)
+    return {
+        "series": [{"date": day.isoformat(), "actual_cost": cost} for day, cost in daily_costs],
+    }
+
+
 def build_forecast(
     db: Session,
     horizon_days: int,
