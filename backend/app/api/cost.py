@@ -1,3 +1,4 @@
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -20,6 +21,9 @@ def trigger_sync(db: Session = Depends(get_db)) -> dict[str, int]:
 def get_daily_cost_history(
     resource_group: str | None = None,
     resource_type: str | None = None,
+    resource_id: uuid.UUID | None = None,
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    return build_daily_cost_history(db, resource_group=resource_group, resource_type=resource_type)
+    return build_daily_cost_history(
+        db, resource_group=resource_group, resource_type=resource_type, resource_id=resource_id
+    )

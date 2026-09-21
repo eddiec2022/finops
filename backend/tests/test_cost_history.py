@@ -76,6 +76,39 @@ def test_build_daily_cost_history_resource_group_filter_excludes_other_groups(db
     assert result["series"] == [{"date": "2026-09-01", "actual_cost": 5.0}]
 
 
+def test_build_daily_cost_history_resource_id_filter_excludes_other_resources(db_session):
+    account = _seed_account(db_session, "test-sub-cost-history-resource-id")
+    vm_a = Resource(
+        cloud_account_id=account.id,
+        provider=Provider.AZURE,
+        external_resource_id="vm-a",
+        resource_type="microsoft.compute/virtualmachines",
+        resource_group="rg-a",
+        tags={},
+        raw_metadata={},
+    )
+    vm_b = Resource(
+        cloud_account_id=account.id,
+        provider=Provider.AZURE,
+        external_resource_id="vm-b",
+        resource_type="microsoft.compute/virtualmachines",
+        resource_group="rg-a",
+        tags={},
+        raw_metadata={},
+    )
+    db_session.add_all([vm_a, vm_b])
+    db_session.flush()
+
+    base = date(2026, 9, 1)
+    _add_cost(db_session, account, vm_a, base, 5.0)
+    _add_cost(db_session, account, vm_b, base, 100.0)
+    db_session.commit()
+
+    result = build_daily_cost_history(db_session, resource_id=vm_a.id, cloud_account_id=account.id)
+
+    assert result["series"] == [{"date": "2026-09-01", "actual_cost": 5.0}]
+
+
 def test_build_daily_cost_history_no_data_returns_empty_series(db_session):
     account = _seed_account(db_session, "test-sub-cost-history-empty")
     db_session.commit()
@@ -109,3 +142,19 @@ def test_cost_history_endpoint_resource_type_filter(client):
     assert response.status_code == 200
     body = response.json()
     assert isinstance(body["series"], list)
+
+
+def test_cost_history_endpoint_resource_id_filter(client):
+    resources = client.get("/api/v1/inventory", params={"resource_group": "nise-rg"}).json()["resources"]
+    vm = next(r for r in resources if r["resource_type"] == "microsoft.compute/virtualmachines")
+
+    response = client.get("/api/v1/cost", params={"resource_id": vm["resource_id"]})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["series"]) > 0
+    total_for_vm = sum(point["actual_cost"] for point in body["series"])
+
+    aggregate = client.get("/api/v1/cost").json()
+    total_aggregate = sum(point["actual_cost"] for point in aggregate["series"])
+    assert total_for_vm <= total_aggregate

@@ -96,6 +96,39 @@ def test_build_forecast_resource_group_filter_excludes_other_groups(db_session):
     assert result["daily_rate"] == 5.0
 
 
+def test_build_forecast_resource_id_filter_excludes_other_resources(db_session):
+    account = _seed_account(db_session, "test-sub-forecast-resource-id")
+    vm_a = Resource(
+        cloud_account_id=account.id,
+        provider=Provider.AZURE,
+        external_resource_id="vm-a",
+        resource_type="microsoft.compute/virtualmachines",
+        resource_group="rg-a",
+        tags={},
+        raw_metadata={},
+    )
+    vm_b = Resource(
+        cloud_account_id=account.id,
+        provider=Provider.AZURE,
+        external_resource_id="vm-b",
+        resource_type="microsoft.compute/virtualmachines",
+        resource_group="rg-a",  # same group as vm_a - resource_id must narrow further than resource_group alone
+        tags={},
+        raw_metadata={},
+    )
+    db_session.add_all([vm_a, vm_b])
+    db_session.flush()
+
+    base = date(2026, 9, 1)
+    _add_cost(db_session, account, vm_a, base, 5.0)
+    _add_cost(db_session, account, vm_b, base, 100.0)
+    db_session.commit()
+
+    result = build_forecast(db_session, horizon_days=1, resource_id=vm_a.id, cloud_account_id=account.id)
+
+    assert result["daily_rate"] == 5.0
+
+
 def test_build_forecast_rollups_cap_to_horizon_and_include_horizon_itself(db_session):
     account = _seed_account(db_session, "test-sub-forecast-rollups")
     base = date(2026, 9, 1)
@@ -164,3 +197,37 @@ def test_forecast_endpoint_resource_type_filter(client):
     body = response.json()
     assert body["insufficient_data"] is False
     assert body["daily_rate"] > 0
+
+
+def test_forecast_endpoint_resource_id_filter(client):
+    # nise-rg's VM (nise-dev) is a real resource with real cost history in the
+    # live subscription (Task 15's own findings) - use its actual resource_id
+    # from the inventory endpoint rather than hardcoding one.
+    resources = client.get("/api/v1/inventory", params={"resource_group": "nise-rg"}).json()["resources"]
+    vm = next(r for r in resources if r["resource_type"] == "microsoft.compute/virtualmachines")
+
+    response = client.get(
+        "/api/v1/forecast",
+        params={"horizon_days": 7, "resource_id": vm["resource_id"]},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["insufficient_data"] is False
+    assert body["daily_rate"] > 0
+
+    # A resource_id filter must narrow strictly further than an unfiltered
+    # forecast - the VM alone shouldn't out-earn the whole subscription's rate.
+    aggregate = client.get("/api/v1/forecast", params={"horizon_days": 7}).json()
+    assert body["daily_rate"] <= aggregate["daily_rate"]
+
+
+def test_forecast_endpoint_unknown_resource_id_returns_insufficient_data(client):
+    response = client.get(
+        "/api/v1/forecast",
+        params={"horizon_days": 7, "resource_id": "00000000-0000-0000-0000-000000000000"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["insufficient_data"] is True

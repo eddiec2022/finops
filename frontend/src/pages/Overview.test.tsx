@@ -107,11 +107,24 @@ describe("Overview", () => {
     expect(screen.getByText("1 resource")).toBeInTheDocument();
   });
 
-  it("drills from subscription -> resource group -> resource with working breadcrumb navigation", async () => {
+  it("drills from subscription -> resource group -> resource with working breadcrumb navigation, showing real scoped spend at every level", async () => {
     const user = userEvent.setup();
+    const VM_COST = { series: [{ date: "2026-09-01", actual_cost: 42 }] };
+    const VM_FORECAST = {
+      insufficient_data: false,
+      daily_rate: 42,
+      horizon_days: 90,
+      rollups: { "7": 294, "90": 3780 },
+      series: [{ date: "2026-09-02", projected_cost: 42 }],
+    };
+
     mockFetchResponses({
-      [COST_FRAGMENT]: EMPTY_COST,
-      [FORECAST_FRAGMENT]: EMPTY_FORECAST,
+      // Aggregate/resource-group level stay "insufficient data"; the
+      // resource-scoped request (resource_id=res-1) returns real data, so
+      // the test can confirm SpendPanel is actually switching scope, not
+      // just re-rendering the same response.
+      [COST_FRAGMENT]: (url: string) => (url.includes("resource_id=res-1") ? VM_COST : EMPTY_COST),
+      [FORECAST_FRAGMENT]: (url: string) => (url.includes("resource_id=res-1") ? VM_FORECAST : EMPTY_FORECAST),
       // The real /api/v1/inventory endpoint filters by resource_group server-side
       // (see backend/app/services/inventory_listing.py) - mirror that here so the
       // resource-group-level fetch only returns rg-a's own resources.
@@ -131,10 +144,12 @@ describe("Overview", () => {
 
     await user.click(screen.getByText("vm-web-01"));
 
-    // Resource level: identity detail + explicit gap note, no fabricated scoped chart.
+    // Resource level: identity detail + a real spend figure/chart scoped to
+    // just this resource (Task 16 closes the gap Task 15 flagged here).
     await waitFor(() => expect(screen.getByText("microsoft.compute/virtualmachines")).toBeInTheDocument());
-    expect(screen.getByText(/per-resource spend and forecast aren't wired up yet/i)).toBeInTheDocument();
-    expect(screen.queryByText(/spend trend/i)).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("$42.00")).toBeInTheDocument());
+    expect(screen.getByText(/spend trend/i)).toBeInTheDocument();
+    expect(screen.queryByText(/wired up yet/i)).not.toBeInTheDocument();
 
     // Breadcrumb back-navigation: rg-a -> Overview.
     await user.click(screen.getByRole("button", { name: "rg-a" }));
@@ -159,5 +174,24 @@ describe("Overview", () => {
     await user.click(screen.getByText("rg-a"));
 
     await waitFor(() => expect(screen.getByText(/resource group "rg-a" hasn't synced/i)).toBeInTheDocument());
+  });
+
+  it("shows a scoped empty state when a resource has no cost history", async () => {
+    const user = userEvent.setup();
+    mockFetchResponses({
+      [COST_FRAGMENT]: EMPTY_COST,
+      [FORECAST_FRAGMENT]: EMPTY_FORECAST,
+      [INVENTORY_FRAGMENT]: (url: string) =>
+        url.includes("resource_group=rg-a") ? { resources: [RG_A_VM] } : { resources: [RG_A_VM] },
+    });
+
+    render(<Overview />);
+
+    await waitFor(() => expect(screen.getByText("rg-a")).toBeInTheDocument());
+    await user.click(screen.getByText("rg-a"));
+    await waitFor(() => expect(screen.getByText("vm-web-01")).toBeInTheDocument());
+    await user.click(screen.getByText("vm-web-01"));
+
+    await waitFor(() => expect(screen.getByText(/vm-web-01 hasn't synced/i)).toBeInTheDocument());
   });
 });

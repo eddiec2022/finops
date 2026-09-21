@@ -23,6 +23,7 @@ def get_daily_costs(
     cloud_account_id: uuid.UUID,
     resource_group: str | None = None,
     resource_type: str | None = None,
+    resource_id: uuid.UUID | None = None,
 ) -> list[tuple[date, float]]:
     query = db.query(CostRecord.date, func.sum(CostRecord.amortized_cost)).filter(
         CostRecord.cloud_account_id == cloud_account_id
@@ -37,6 +38,12 @@ def get_daily_costs(
             query = query.filter(Resource.resource_group == resource_group)
         if resource_type:
             query = query.filter(Resource.resource_type == resource_type)
+    if resource_id:
+        # resource_id is CostRecord's own FK column (see cost_lookup.py's
+        # get_resource_daily_costs, the same filter rightsizing.py already
+        # uses) - no join needed, unlike resource_group/resource_type which
+        # live on Resource.
+        query = query.filter(CostRecord.resource_id == resource_id)
     query = query.group_by(CostRecord.date).order_by(CostRecord.date)
     return [(row_date, float(total)) for row_date, total in query.all()]
 
@@ -50,6 +57,7 @@ def build_daily_cost_history(
     db: Session,
     resource_group: str | None = None,
     resource_type: str | None = None,
+    resource_id: uuid.UUID | None = None,
     cloud_account_id: uuid.UUID | None = None,
 ) -> dict[str, Any]:
     """Actual (already-synced) daily cost history - the historical counterpart
@@ -63,7 +71,9 @@ def build_daily_cost_history(
     if cloud_account_id is None:
         cloud_account_id = get_or_create_cloud_account(db, settings.azure_subscription_id).id
 
-    daily_costs = get_daily_costs(db, cloud_account_id, resource_group=resource_group, resource_type=resource_type)
+    daily_costs = get_daily_costs(
+        db, cloud_account_id, resource_group=resource_group, resource_type=resource_type, resource_id=resource_id
+    )
     return {
         "series": [{"date": day.isoformat(), "actual_cost": cost} for day, cost in daily_costs],
     }
@@ -74,6 +84,7 @@ def build_forecast(
     horizon_days: int,
     resource_group: str | None = None,
     resource_type: str | None = None,
+    resource_id: uuid.UUID | None = None,
     cloud_account_id: uuid.UUID | None = None,
     model: ForecastModel | None = None,
 ) -> dict[str, Any]:
@@ -85,7 +96,9 @@ def build_forecast(
         # this keeps the seam explicit rather than leaving it unscoped.
         cloud_account_id = get_or_create_cloud_account(db, settings.azure_subscription_id).id
 
-    daily_costs = get_daily_costs(db, cloud_account_id, resource_group=resource_group, resource_type=resource_type)
+    daily_costs = get_daily_costs(
+        db, cloud_account_id, resource_group=resource_group, resource_type=resource_type, resource_id=resource_id
+    )
     result = model.forecast(daily_costs, horizon_days)
 
     if result.insufficient_data:

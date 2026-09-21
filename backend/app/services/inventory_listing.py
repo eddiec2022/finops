@@ -33,9 +33,7 @@ def build_resource_list(
             {
                 "resource_id": str(resource.id),
                 "external_resource_id": resource.external_resource_id,
-                # Not a dedicated column - only captured in raw_metadata (see
-                # RESOURCE_GRAPH_QUERY's `project ... name ...` in azure_inventory.py).
-                "name": resource.raw_metadata.get("name") if isinstance(resource.raw_metadata, dict) else None,
+                "name": resource.name,
                 "resource_group": resource.resource_group,
                 "resource_type": resource.resource_type,
                 "region": resource.region,

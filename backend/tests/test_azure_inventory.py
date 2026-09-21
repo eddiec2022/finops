@@ -13,6 +13,7 @@ def test_map_resource_vm():
 
     assert mapped["provider"] == Provider.AZURE
     assert mapped["external_resource_id"] == VM_ROW["id"]
+    assert mapped["name"] == "vm-web-01"
     assert mapped["resource_type"] == "microsoft.compute/virtualmachines"
     assert mapped["region"] == "eastus"
     assert mapped["resource_group"] == "rg-prod"
@@ -45,6 +46,7 @@ def test_map_resource_missing_created_at_and_sku():
     mapped = map_resource(row)
 
     assert mapped["sku"] is None
+    assert mapped["name"] is None
     assert "created_at" not in mapped
     assert mapped["tags"] == {}
 

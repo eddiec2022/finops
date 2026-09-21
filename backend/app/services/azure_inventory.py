@@ -84,6 +84,7 @@ def map_resource(row: dict[str, Any]) -> dict[str, Any]:
     mapped: dict[str, Any] = {
         "provider": Provider.AZURE,
         "external_resource_id": row["id"],
+        "name": row.get("name"),
         "resource_type": row.get("type", ""),
         "region": row.get("location"),
         "resource_group": row.get("resourceGroup"),

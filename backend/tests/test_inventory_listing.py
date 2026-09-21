@@ -16,6 +16,7 @@ def _add_resource(db_session, account, external_id, resource_group, resource_typ
         cloud_account_id=account.id,
         provider=Provider.AZURE,
         external_resource_id=external_id,
+        name=name,
         resource_type=resource_type,
         region=region,
         resource_group=resource_group,
@@ -62,12 +63,13 @@ def test_build_resource_list_no_resources_returns_empty_list(db_session):
     assert result["resources"] == []
 
 
-def test_build_resource_list_missing_name_in_raw_metadata_returns_none(db_session):
+def test_build_resource_list_missing_name_returns_none(db_session):
     account = _seed_account(db_session, "test-sub-inventory-listing-noname")
     resource = Resource(
         cloud_account_id=account.id,
         provider=Provider.AZURE,
         external_resource_id="vm-noname",
+        name=None,
         resource_type="microsoft.compute/virtualmachines",
         region="eastus",
         resource_group="rg-a",

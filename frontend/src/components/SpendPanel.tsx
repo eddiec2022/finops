@@ -22,20 +22,23 @@ function sumTrailingActual(history: CostHistoryResponse, days: number): number {
 interface SpendPanelProps {
   /** Scopes the underlying /cost and /forecast calls to one resource group. Omit for the aggregate view. */
   resourceGroup?: string;
+  /** Scopes to a single resource (takes precedence over resourceGroup if both are given). */
+  resourceId?: string;
   emptyStateDescription?: string;
 }
 
 /**
  * Current-spend figure + spend/forecast chart, extracted from Task 13's
- * Overview page so Task 15's drill-down levels (subscription, resource group)
- * can reuse the exact same pattern scoped to whatever's selected.
+ * Overview page so the drill-down levels (subscription, resource group,
+ * resource - Tasks 15/16) can reuse the exact same pattern scoped to
+ * whatever's selected.
  */
-export function SpendPanel({ resourceGroup, emptyStateDescription }: SpendPanelProps) {
+export function SpendPanel({ resourceGroup, resourceId, emptyStateDescription }: SpendPanelProps) {
   const [state, setState] = useState<LoadState>({ status: "loading" });
 
   useEffect(() => {
     setState({ status: "loading" });
-    const scope = resourceGroup ? { resourceGroup } : undefined;
+    const scope = resourceId ? { resourceId } : resourceGroup ? { resourceGroup } : undefined;
 
     Promise.all([getCostHistory(scope), getForecast(FORECAST_HORIZON_DAYS, scope)])
       .then(([history, forecast]) => {
@@ -49,7 +52,7 @@ export function SpendPanel({ resourceGroup, emptyStateDescription }: SpendPanelP
         setState({ status: "ready", history, forecast });
       })
       .catch(() => setState({ status: "error" }));
-  }, [resourceGroup]);
+  }, [resourceGroup, resourceId]);
 
   if (state.status === "loading") {
     return <p className="text-stone-500">Loading spend data…</p>;

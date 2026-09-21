@@ -55,18 +55,34 @@ export function Overview() {
       <h1 className="mb-2 text-2xl font-semibold">Overview</h1>
       <Breadcrumb segments={breadcrumbSegments} />
 
-      {path.level !== "resource" && (
-        <div className="mb-6">
-          <SpendPanel
-            resourceGroup={resourceGroupFilter}
-            emptyStateDescription={
-              path.level === "resource-group"
-                ? `Resource group "${path.resourceGroup}" hasn't synced enough days of cost data to show a spend trend or forecast yet.`
-                : undefined
-            }
-          />
+      {path.level === "resource" && (
+        <div className="mb-6 rounded-xl bg-white p-6 shadow-sm">
+          <p className="text-sm text-stone-500">Resource</p>
+          <p className="mt-1 text-lg font-semibold text-brand-dark">{resourceLabel(path.resource)}</p>
+          <dl className="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+            <dt className="text-stone-400">Type</dt>
+            <dd className="text-stone-700">{path.resource.resource_type}</dd>
+            <dt className="text-stone-400">Region</dt>
+            <dd className="text-stone-700">{path.resource.region ?? "—"}</dd>
+            <dt className="text-stone-400">Resource group</dt>
+            <dd className="text-stone-700">{path.resource.resource_group ?? "—"}</dd>
+          </dl>
         </div>
       )}
+
+      <div className="mb-6">
+        <SpendPanel
+          resourceGroup={path.level === "resource-group" ? path.resourceGroup : undefined}
+          resourceId={path.level === "resource" ? path.resource.resource_id : undefined}
+          emptyStateDescription={
+            path.level === "resource-group"
+              ? `Resource group "${path.resourceGroup}" hasn't synced enough days of cost data to show a spend trend or forecast yet.`
+              : path.level === "resource"
+                ? `${resourceLabel(path.resource)} hasn't synced enough days of cost data to show a spend trend or forecast yet.`
+                : undefined
+          }
+        />
+      </div>
 
       {path.level === "subscription" && (
         <>
@@ -112,29 +128,6 @@ export function Overview() {
             />
           )}
         </>
-      )}
-
-      {path.level === "resource" && (
-        <div className="space-y-6">
-          <div className="rounded-xl bg-white p-6 shadow-sm">
-            <p className="text-sm text-stone-500">Resource</p>
-            <p className="mt-1 text-lg font-semibold text-brand-dark">{resourceLabel(path.resource)}</p>
-            <dl className="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
-              <dt className="text-stone-400">Type</dt>
-              <dd className="text-stone-700">{path.resource.resource_type}</dd>
-              <dt className="text-stone-400">Region</dt>
-              <dd className="text-stone-700">{path.resource.region ?? "—"}</dd>
-              <dt className="text-stone-400">Resource group</dt>
-              <dd className="text-stone-700">{path.resource.resource_group ?? "—"}</dd>
-            </dl>
-          </div>
-
-          <div className="rounded-xl bg-amber-bg px-6 py-5 text-sm text-amber-text">
-            Per-resource spend and forecast aren't wired up yet — /api/v1/cost and
-            /api/v1/forecast currently filter by resource group or resource type, not by a
-            single resource. See this task's results.txt for the full writeup.
-          </div>
-        </div>
       )}
     </div>
   );

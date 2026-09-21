@@ -18,6 +18,7 @@ class Resource(Base):
     )
     provider: Mapped[Provider] = mapped_column(Enum(Provider, name="provider"), nullable=False)
     external_resource_id: Mapped[str] = mapped_column(String, nullable=False)
+    name: Mapped[str | None] = mapped_column(String, nullable=True)
     resource_type: Mapped[str] = mapped_column(String, nullable=False)
     region: Mapped[str | None] = mapped_column(String, nullable=True)
     resource_group: Mapped[str | None] = mapped_column(String, nullable=True)
