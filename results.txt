@@ -1,851 +1,354 @@
-# TASK 16 RESULTS - Backend: Resource-Scoped Cost & Forecast (closes Task 15's gap)
+# TASK 17 RESULTS - Full Phase 1 (Azure) Regression Pass
 
-## Summary
+## Headline finding
 
-Closes the gap Task 15 flagged: `/api/v1/cost` and `/api/v1/forecast` now accept a
-`resource_id` filter alongside the existing `resource_group`/`resource_type` filters,
-the `resources.name` column is now real (migrated + backfilled off `raw_metadata`,
-not read from it anymore), and the Overview page's resource-level drill-down now
-renders a real scoped `SpendPanel` (spend figure + chart, or an empty state) instead
-of the amber gap-note callout. All four scope items done; nothing pushed further out
-of scope. One new, real finding surfaced while verifying live data (see "Ambiguity
-flagged" below) - not fixed, since fixing it isn't in this task's scope.
+This audit found a critical, live, actively-reproducing bug: **Azure Resource
+Graph is now returning a different casing for the VM's ARM resource ID than it did
+when Task 2 first synced it**, and the inventory sync's upsert key
+(`external_resource_id`, matched case-sensitively) treats the new casing as a brand
+new resource instead of the same VM. Doing exactly what this task's own scope item 1
+asked ("trigger a fresh sync") created a duplicate resource row in the live dev
+database, and that duplicate then **completely breaks cost sync** (500 error, full
+traceback below) and **duplicates a recommendation** on the live Recommendations
+page. This is not a scenario I constructed to test with - it's what actually happened
+when I followed this task's own first instruction. Full detail in item 1 and the
+prioritized follow-up list below. Per this task's explicit scope, I have not fixed
+it, cleaned it up, or modified any code - only verified, reproduced, and documented
+it. **The live dev database currently contains this duplicate row as a direct,
+unavoidable result of following this task's instructions**, and cost sync is
+currently non-functional until a follow-up task addresses it.
 
-## Decision: resource_id vs external_resource_id (as asked - "your call, flag either way")
+No code was changed this task (`git status` clean except `next_task.txt`, which I
+didn't touch) - this is a pure verification/audit task, per its own scope.
 
-Used the internal `resource_id` (UUID) - `CostRecord.resource_id` is already the FK
-column cost rows join against (see `backend/app/models/cost_record.py`), and
-`cost_lookup.py`'s `get_resource_daily_costs` (used by `rightsizing.py`) already
-filters by this exact same column for exactly this purpose. Filtering by
-`resource_id` needs no join at all - `CostRecord.resource_id == resource_id` is a
-direct column comparison, whereas `resource_group`/`resource_type` need a join to
-`Resource` since those columns don't live on `CostRecord`. Filtering by
-`external_resource_id` (the full ARM path) would have required either joining to
-`Resource` just to filter or the frontend passing untrimmed URLs as a query param -
-strictly worse on both counts, with no offsetting benefit (the frontend already has
-each resource's internal `resource_id` from the inventory endpoint's own response,
-so there was never a reason to prefer the external id here). No real tradeoff - this
-was the obviously-correct option, not a coin flip.
+---
 
-## What was built
+## 1. Inventory
 
-**Backend filter** (`backend/app/services/forecast.py`): `get_daily_costs`,
-`build_daily_cost_history`, and `build_forecast` all take a new optional
-`resource_id: uuid.UUID | None` parameter. When given, it's applied as a direct
-`CostRecord.resource_id == resource_id` filter - independent of the
-`resource_group`/`resource_type` join logic, since it doesn't need that join. Wired
-into `/api/v1/cost` and `/api/v1/forecast` (`backend/app/api/cost.py`,
-`backend/app/api/forecast.py`) as a `resource_id: uuid.UUID | None` query param -
-FastAPI validates/parses the UUID automatically; an unknown or malformed UUID that
-matches no cost records naturally falls through to `insufficient_data: true`, not an
-error (added a test for this).
+**What I did:** Snapshotted the `resources` table before syncing (9 rows). Triggered
+`POST /api/v1/inventory/sync` (the task's own instruction). Independently queried
+Azure Resource Graph directly via a standalone script (same SDK, bypassing the app's
+own `azure_inventory.py` code entirely) to get Azure's actual current state, not
+just re-trusting the app's own sync logic. Compared all three: pre-sync DB, post-sync
+DB, and the independent live query.
 
-**Migration** (`backend/alembic/versions/0a3c0e882688_resources_name_column.py`):
-adds `resources.name` (nullable `String`, matching the other optional resource
-columns - region, resource_group, sku), then backfills every existing row via
-`UPDATE resources SET name = raw_metadata ->> 'name' WHERE raw_metadata ? 'name'`.
-`app/models/resource.py` gets the new `name` column, and
-`app/services/azure_inventory.py`'s `map_resource` now sets `"name": row.get("name")`
-directly instead of leaving it buried in `raw_metadata` only - so newly-synced
-resources get it as a real column going forward too, not just backfilled once.
+**Result: FAIL (data-integrity bug), with count reconciling correctly otherwise.**
 
-**`inventory_listing.py`**: `"name": resource.name` instead of
-`resource.raw_metadata.get("name")` - one-line change, now that the column exists.
+- Independent live Resource Graph query confirms Azure's subscription genuinely has
+  **9 resources** right now - matches the pre-sync DB count exactly. Full resource
+  list (name, type, resource group) from the independent query matches the DB's
+  pre-sync contents 1:1. This part is correct.
+- But: `POST /api/v1/inventory/sync` returned `{"found": 9, "created": 1, "updated":
+  8}` - it found 9 resources from Azure (correct), but created a **10th row** instead
+  of updating the existing VM row, because Azure Resource Graph now returns the VM's
+  `id` as
+  `/subscriptions/.../resourceGroups/nise-rg/providers/Microsoft.Compute/virtualMachines/nise-dev`
+  (all lowercase), while the original Task 2 sync stored it as
+  `/subscriptions/.../resourceGroups/NISE-RG/providers/Microsoft.Compute/virtualMachines/NISE-DEV`
+  (mixed case) - confirmed by re-running the independent Resource Graph query, which
+  right now returns the *disk*'s `id` still in the original uppercase
+  (`.../NISE-RG/.../disks/...`) while the *VM*'s `id` has changed to lowercase. Same
+  resource group, same sync, two different casings for two different resource types
+  - this is Azure's own indexing being inconsistent over time, not a one-off fluke.
+- `backend/app/services/azure_inventory.py`'s `upsert_resources` matches existing
+  rows via `.filter_by(external_resource_id=mapped["external_resource_id"])` - an
+  exact, case-sensitive string match. When Azure returns different casing than last
+  time, this doesn't match the existing row, so a new one gets created instead of
+  updated.
+- Notably, `backend/app/services/azure_cost.py`'s `_resolve_resource_id` *already*
+  has a code comment acknowledging this exact problem ("Azure resource IDs are
+  canonically case-insensitive, and Cost Management's ResourceId dimension doesn't
+  always match Resource Graph's casing... for the same resource") and does a
+  case-insensitive `func.lower(...)` comparison - but `upsert_resources`'s own
+  upsert key was never given the same treatment, so the exact case-sensitive gap that
+  cost-sync's own code was written to defend against is precisely what caused this.
+- Confirmed the two VM rows are the same physical Azure VM, not actually two VMs:
+  identical `created_at` (both `2026-06-14 20:38:10.731+00`, sourced from Azure's own
+  `timeCreated` property), identical `name` ("nise-dev"), identical `resource_group`
+  ("nise-rg" - only the `external_resource_id`/`id` field's casing differs).
+- `GET /api/v1/inventory` (Task 15's endpoint) correctly reflects the DB's actual
+  (now-duplicated) state - confirmed the endpoint layer itself is not the bug, it's
+  faithfully serving what's in the table. Also confirmed `resources.name` (Task 16's
+  migration) is populated correctly for the new row too (map_resource sets it
+  directly now, not just via backfill).
 
-**Frontend** (`frontend/src/pages/Overview.tsx`, `frontend/src/components/
-SpendPanel.tsx`, `frontend/src/api/client.ts`): `SpendPanel` takes a new optional
-`resourceId` prop (takes precedence over `resourceGroup` when both would apply,
-though in practice `Overview` only ever passes one or the other based on the current
-drill level). The resource level's `SpendPanel` now sits where the gap-note callout
-used to be, scoped to `path.resource.resource_id`, with its own resource-specific
-empty-state copy (`"${name} hasn't synced enough days of cost data..."`) matching
-the pattern already established for the resource-group level in Task 15. The
-resource identity card (type/region/resource group) stays - it's still useful
-context alongside the real chart now, not replaced by it. `DrillScope`
-(`client.ts`) gained a `resourceId?: string` field; `getForecast`/`getCostHistory`
-both go through the same `scopeParams` helper now (previously `getForecast` had its
-own separate inline param-building logic - a small cleanup while already touching
-this function, not a new abstraction).
+## 2. Utilization
 
-## Actual backend pytest output (`docker compose run --rm backend pytest -q`,
-after `docker compose build backend`)
+**What I did:** Triggered `POST /api/v1/utilization/sync`. Independently queried
+Azure Monitor directly (same SDK, bypassing `azure_utilization.py`) for the VM's
+"Percentage CPU" metric over the same 7-day window, and compared averages.
 
-    ........................................................................ [ 57%]
-    ......................................................                   [100%]
-    126 passed, 1 warning in 0.77s
+**Result: PASS on data correctness, with a compounding side-effect of the inventory bug.**
 
-(121 pre-existing + 5 new: 1 unit test on `build_forecast`'s `resource_id` filter
-using two resources in the *same* resource_group to prove `resource_id` narrows
-strictly further than `resource_group` alone would; 1 equivalent unit test on
-`build_daily_cost_history`; 2 endpoint tests against the real configured
-subscription - `resource_id` filter using nise-rg's actual VM (fetched from the live
-inventory endpoint, not hardcoded) and confirming an unknown/non-matching
-`resource_id` returns `insufficient_data: true` rather than erroring; 2 existing
-`test_map_resource_*` tests in `test_azure_inventory.py` extended with a `name`
-assertion rather than counted as new. Also updated `test_inventory_listing.py`'s
-resource-creation helper and its "missing name" test to set the `name` column
-directly instead of stuffing it into `raw_metadata`, matching the new schema.)
+- Independent Azure Monitor query: 49 data points over 7 days, average 3.18% CPU.
+- App's stored data for the real VM resource (`784c331d...`) after the same sync: 64
+  data points, average 3.50% CPU. Same order of magnitude, consistent with real VM
+  behavior sampled at slightly different windows (my independent query ran a few
+  minutes after the app's sync) - not garbage or obviously wrong numbers. **The
+  Azure Monitor connector is pulling genuinely correct data.**
+- Side effect of the inventory bug: `sync_utilization` queries *every* resource
+  matching `RESOURCE_TYPE_METRICS.keys()` with no dedup by physical resource, so it
+  queried Azure Monitor for **both** VM rows. Because Azure Monitor also resolves
+  resource URIs case-insensitively, **both rows got real utilization data** for what
+  is actually one physical VM (64 CPU readings on the original row, 48 on the
+  duplicate, averages 3.50% vs 2.88% - close but not identical, again consistent with
+  slightly different query timing between the two sequential per-resource calls, not
+  two different VMs). This means the duplicate doesn't stay obviously "empty" for
+  long - once utilization re-syncs, it looks like a second real resource with its own
+  real metrics, which would make it *harder*, not easier, for someone to notice the
+  duplicate later.
 
-## The migration itself - confirmed actually run and backfilled, not just written
+## 3. Cost & Forecast
 
-Pre-migration: `information_schema.columns` for `resources` had 11 columns, no `name`.
+**What I did:** Exercised all four filter combinations (unfiltered, resource_group,
+resource_type, resource_id) against real data for both `/api/v1/cost` and
+`/api/v1/forecast`. Sanity-checked for negative values and actual/forecast
+continuity. Attempted a fresh cost sync (the task's own scope item 3 instruction to
+exercise every filter combination against real data implies using current data,
+which I could - a fresh sync was not itself required by item 3, but I attempted one
+anyway as part of exercising the sync surface, which is how the duplicate's second,
+more severe consequence surfaced).
 
-Ran it for real: `docker compose run --rm backend alembic upgrade head` ->
-    INFO  [alembic.runtime.migration] Running upgrade d7e2b5f91a44 -> 0a3c0e882688,
-    resources name column, backfilled from raw_metadata
+**Result: PASS on filter correctness against existing data. FAIL - cost sync is currently broken.**
 
-Post-migration, checked the real data directly (not assumed from the migration code):
+Filter correctness (all against the existing, now-stale-but-intact data, last synced
+2026-09-17):
+| Filter | Result |
+|---|---|
+| unfiltered | 91 days, $511.85 total, no negative values |
+| `resource_group=nise-rg` | 91 days, $511.85 (100% of subscription cost - consistent with Task 15/16's own findings) |
+| `resource_group=networkwatcherrg` | 0 days (genuinely $0 attributed cost) |
+| `resource_type=microsoft.compute/virtualmachines` | 55 days, $442.72 - equals the real VM's own resource_id-filtered total, since the duplicate VM row has zero cost attributed to it |
+| `resource_id=<real VM>` | 55 days, $442.72 |
+| `resource_id=<duplicate VM>` | 0 days, correctly empty |
+| forecast unfiltered | `insufficient_data: false`, `daily_rate: 1.625`, all three rollup windows present, no negative projected values |
+| forecast continuity | last actual (2026-09-17): $1.10/day; first projected (2026-09-18): $1.625/day - close in magnitude, expected since the forecast is a burn-rate average over a trailing window, not a same-day continuation |
+| forecast `resource_id=<duplicate VM>` | correctly `insufficient_data: true`, not garbage |
 
-    select version_num from alembic_version;         -> 0a3c0e882688
-    select external_resource_id, name, raw_metadata->>'name' as raw_name
-    from resources order by resource_group, resource_type;
+**Cost sync is broken:** `POST /api/v1/cost/sync` now returns a 500. Full traceback
+(from `docker compose logs backend`):
 
-All 9 real resources in the live subscription: `name` matches
-`raw_metadata->>'name'` exactly, no nulls -
-`cortes3724-6482-resource`, `cortes3724-6482-resource/cortes3724-6482`,
-`NetworkWatcher_eastus`, `nise-dev_OsDisk_1_f33577075811429e9d8d7f0953402188`,
-`nise-dev`, `nise-dev374_z1`, `nise-dev-nsg`, `nise-dev-ip`, `nise-dev-vnet`.
+    File "/app/app/services/azure_cost.py", line 120, in upsert_cost_records
+        resource_id = _resolve_resource_id(db, row["external_resource_id"])
+    File "/app/app/services/azure_cost.py", line 111, in _resolve_resource_id
+        .one_or_none()
+    sqlalchemy.exc.MultipleResultsFound: Multiple rows were found when one or none was required
 
-Final check: `select count(*) from resources where name is null` -> `0`.
+`_resolve_resource_id`'s case-insensitive lookup (`func.lower(Resource.external_resource_id) == external_resource_id.lower()`)
+now matches *both* VM rows, and `.one_or_none()` requires 0 or 1. This is the
+inventory bug's most severe consequence: **the entire cost-sync endpoint is down
+for the whole subscription**, not just for the one affected VM, since the exception
+is unhandled and propagates out of the whole sync loop before any `db.commit()`.
+Confirmed no partial/corrupt writes resulted - `cost_records` count and latest date
+are unchanged from before the failed attempt (`get_db`'s session teardown has no
+explicit rollback, but `db.close()` with an uncommitted transaction and
+`autocommit=False` discards pending changes, which the unchanged row count confirms
+empirically). The practical effect is that cost data is now stuck at 2026-09-17 and
+cannot be refreshed until this is fixed - not a data-corruption risk, but a
+functionality outage.
 
-## Actual frontend vitest output (`docker compose run --rm frontend npm test`,
-after `docker compose build frontend`)
+## 4. Recommendations
 
-     ✓ src/lib/normalizeRecommendations.test.ts (6 tests) 14ms
-     ✓ src/pages/Recommendations.test.tsx (3 tests) 212ms
-     ✓ src/lib/groupResources.test.ts (6 tests) 28ms
-     ✓ src/pages/Overview.test.tsx (7 tests) 633ms
-     ✓ src/lib/combineSpendSeries.test.ts (3 tests) 13ms
-     ✓ src/App.test.tsx (1 test) 216ms
+**What I did:** Fetched all four category endpoints against live data, cross-checked
+each result (or lack of one) against the underlying utilization/cost data directly.
 
-     Test Files  6 passed (6)
-          Tests  26 passed (26)
+**Result: PASS on evaluation logic correctness, FAIL - duplicate resource produces a duplicate user-visible recommendation.**
 
-(25 pre-existing + 1 net new: the old "drills... with working breadcrumb navigation"
-test was rewritten rather than left alongside a duplicate - it now mocks the
-resource-scoped `/cost`/`/forecast` requests (matched by `resource_id=res-1` in the
-URL) to return real data distinct from the aggregate/resource-group mocks, and
-asserts the resource level actually renders `$42.00` + a "Spend trend" heading
-instead of the old gap-note text, proving `SpendPanel` really re-scopes rather than
-just re-rendering stale content. Added one new test for the resource-level empty
-state, mirroring the resource-group-level one Task 15 already had.)
+- **Rightsizing: empty.** Correct - the real VM's CPU history currently spans only 7
+  days (`2026-09-15` to `2026-09-21`), short of the 14-day `idle_lookback_days`
+  required by `evaluate_cpu_utilization`'s `span_days < lookback_days` check, so it's
+  excluded from evaluation entirely (by design - "insufficient data" is excluded, not
+  flagged/cleared on a partial average, per the function's own docstring). Consistent
+  with Task 14's own documented findings about this VM's short/gappy history, which
+  has grown (3 days -> 7 days) but still hasn't reached 14.
+- **Idle & Orphaned Resources: empty.** Consistent with the real resource list - the
+  disk is attached to the running VM (not orphaned), the public IP is attached to the
+  NIC, nothing is stopped-but-not-deallocated. Matches Task 9's own findings.
+- **Reserved Instances / Savings Plans: empty.** Matches Task 12's own investigation
+  - this subscription's usage history is still too short/gappy for Azure's own live
+  recommendation engine to have produced anything.
+- **Non-Peak Scheduling: two near-identical recommendations for the same physical
+  VM.** This is the inventory bug surfacing directly in a user-facing feature:
+  `build_non_peak_scheduling_recommendations` doesn't require the 14-day utilization
+  span the way rightsizing does (its naming/tag signals don't depend on utilization
+  history), so **both** VM rows get evaluated and both match the "resource name
+  contains 'dev'" naming signal. The result: "NISE-DEV" ($6.93/mo estimated savings,
+  the real resource with real cost data) and "nise-dev" ("Savings not available", the
+  duplicate with zero cost data) both appear as separate cards on the live
+  Recommendations page. Screenshot: `task17-4-recommendations.png`. A domain
+  reviewer looking at this page would reasonably wonder why the same VM is
+  recommended twice with different numbers.
 
-## Actual frontend build output (`npm run build` = `tsc -b && vite build`)
+## 5. Dashboard/UX
 
-    vite v6.4.3 building for production...
-    ✓ 659 modules transformed.
-    dist/index.html                   0.72 kB │ gzip:   0.41 kB
-    dist/assets/index-kRRYEKMj.css   10.37 kB │ gzip:   2.71 kB
-    dist/assets/index-BwZ8BfAX.js   576.92 kB │ gzip: 163.91 kB
-    ✓ built in 3.23s
+**What I did:** Walked the full drill-down (subscription -> resource group ->
+resource) via Playwright in WSL2 for every resource group and resource that actually
+exists right now (2 groups, 10 resources including the duplicate), confirmed
+breadcrumb navigation, confirmed empty vs. populated states, checked the
+Recommendations page, and monitored console/network errors throughout.
 
-Type-checks clean, no errors.
+**Result: PASS on rendering correctness of what the data says (breadcrumbs, empty
+states, filtering, navigation all work exactly as built); the duplicate resource
+shows up as a duplicate row, which is correct behavior for wrong underlying data,
+not a UI bug.**
 
-## Live check against the real subscription (nise-rg's VM, "nise-dev")
+- Subscription level: "Resource groups" list correctly shows `networkwatcherrg (3
+  resources)` and `nise-rg (7 resources)` - the 7 (was 6) directly reflects the
+  duplicate.
+- `nise-rg` resource-group level: resource list literally shows "nise-dev" twice
+  (screenshot: `task17-2-nise-rg-level.png`) - directly visible to anyone browsing
+  the dashboard, not just discoverable via API/DB inspection.
+- Drilled into every individual resource type present: the disk (steady daily cost,
+  gap-free 91-day series, real chart renders correctly, no gap note), the *real* VM
+  row (real $284.58/30-day figure, real chart), the *duplicate* VM row (correctly
+  shows the scoped empty state - "nise-dev hasn't synced enough days of cost data..."
+  - confirming the resource-level `SpendPanel` scoping logic itself, Task 16's work,
+  is functioning exactly as designed; the bug is entirely upstream in inventory sync,
+  not in the drill-down/filtering code built in Tasks 15-16), and
+  `NetworkWatcher_eastus` under `networkwatcherrg` (correctly shows the empty state
+  for a genuinely zero-cost resource).
+- Breadcrumb navigation confirmed working at every level tested (Overview -> group,
+  group -> Overview, resource -> group).
+- Recommendations page renders all four categories with the correct dollar-impact
+  formatting (JetBrains Mono, `/mo` suffix, primary-light teal treatment) per
+  GOV-001 3.6 - confirmed visually, not just via API response shape.
+- **Zero console errors and zero network errors (4xx/5xx)** across every page/flow
+  exercised through the actual UI (subscription level, both resource groups, five
+  individual resource drill-downs, Recommendations page). The cost-sync 500 found in
+  item 3 is not reachable through normal UI navigation - there's no sync trigger
+  button anywhere in the dashboard (sync is API/ops-only, per `App.tsx`'s nav having
+  only Overview/Recommendations tabs), so a reviewer clicking through the dashboard
+  itself would see the duplicate-name symptom but not a crash.
 
-Verified with Playwright in WSL2 (headless Chromium), same approach as Task 15,
-against the actual running stack rebuilt from current source.
+## 6. Revisiting the `sumTrailingActual` quirk (Task 16's finding)
 
-Confirmed via direct curl first (before checking the UI), to isolate backend
-correctness from frontend rendering:
-- VM's `resource_id`: `784c331d-5586-4cc8-9c97-54f89b44b140` (fetched from
-  `/api/v1/inventory?resource_group=nise-rg`, not hardcoded).
-- `/api/v1/forecast?horizon_days=7&resource_id=<vm>` -> `insufficient_data: false`,
-  real `daily_rate`/`series`/`rollups`.
-- `/api/v1/cost?resource_id=<vm>` -> 55 days, total $442.72 - real, non-zero, and
-  strictly less than the unfiltered aggregate's $511.85 over 91 days (the VM is one
-  of six resources in nise-rg; the remainder is attributable to its disk, NIC, NSG,
-  IP, and vnet).
+**What I did:** Checked whether the "last 30 series entries, not last 30 calendar
+days" quirk is visible anywhere beyond the single VM-scoped case Task 16 found, by
+checking date-gap coverage at every level/resource type currently in the system.
 
-Then confirmed the UI actually reflects this: drilled Overview -> nise-rg -> nise-dev
-(clicking the row with type `microsoft.compute/virtualmachines`, not the OS disk -
-Task 15's screenshot had already established the two resources' names both contain
-"nise-dev" as a substring, which caused a locator bug in Task 15's own verification
-script; this task's script matches on resource_type instead, which is unambiguous).
-The resource level now shows:
-- The same resource identity card as Task 15 (type, region, resource group), now
-  with `name` sourced from the real `name` column ("nise-dev" for the VM,
-  "NetworkWatcher_eastus" for the empty-state check below) rather than
-  `raw_metadata`.
-- A real "Spend, last 30 days" figure ($284.58) and a real "Spend trend & 90-day
-  forecast" chart, both scoped to just this resource.
-- No amber gap-note callout - confirmed absent by text search, not just visually.
+**Result: confirmed narrowly scoped - not urgent, but real and worth a follow-up.**
 
-Also verified the resource-level *empty* state against a real resource with
-genuinely zero attributed cost: `networkwatcherrg`'s Network Watcher resource
-(confirmed via curl: `/api/v1/cost?resource_group=networkwatcherrg` returns 0 days
-for the whole group, so every resource in it is a valid zero-cost case). Drilled
-Overview -> networkwatcherrg -> NetworkWatcher_eastus: identity card renders
-correctly, `SpendPanel` shows the warm `EmptyState` with resource-specific copy
-("NetworkWatcher_eastus hasn't synced enough days of cost data..."), no broken-
-looking blank panel, no "Spend trend" heading present.
+| Scope | Entries | Calendar days spanned | Gap-free? |
+|---|---|---|---|
+| Subscription (unfiltered) | 91 | 91 | Yes |
+| `nise-rg` (resource-group level) | 91 | 91 | Yes |
+| Disk resource (steady daily storage cost) | 91 | 91 | Yes |
+| **VM resource (intermittent compute cost)** | **55** | **83** | **No - 28 gap days** |
 
-Screenshots saved to this session's scratchpad (not committed, verification
-artifacts only, same convention as prior tasks): resource level with real spend
-data (nise-dev), resource level empty state (NetworkWatcher_eastus).
+The quirk is invisible at the subscription level, invisible at the resource-group
+level (because `nise-rg`'s disk carries cost on every single day, filling the
+group's series completely even on days the VM itself wasn't billed), and invisible
+for the disk resource specifically. It is **only** visible when drilling into a
+compute resource whose billing history has real gaps (VM stopped/deallocated some
+days) - i.e., exactly the one case Task 16 already found, and no broader than that
+in this subscription's current data. It would become visible for any other VM/App
+Service resource with a similarly gappy history, which is a realistic case for
+FinOps users generally (that's the whole point of tracking idle/stopped resources),
+so it's a real bug, not a curiosity.
+
+**My priority recommendation: low-to-medium priority, well-defined quick fix, not
+urgent.** Reasoning: it produces a misleading number, not a crash or blocked
+workflow (unlike the inventory-duplicate bug above); it only affects the one
+resource-level trailing-spend figure, not the chart itself (the chart plots real
+dated points either way, so a careful user could infer the gaps from the x-axis);
+and the fix is small and well-understood (filter `history.series` by
+`date >= mostRecentDate - 30d` instead of `slice(-30)` in
+`frontend/src/components/SpendPanel.tsx`'s `sumTrailingActual`). I'd bundle it with
+whatever follow-up task next touches `SpendPanel`, rather than a dedicated task on
+its own.
+
+## 7. General sweep
+
+Beyond what's captured in items 1-6: no other broken states, no other console/network
+errors, no other obviously-wrong data found in the areas exercised. The one other
+observation worth naming: `resources.region` and `sku` are consistently populated for
+every real resource checked (not a gap), and `resource_group` casing is consistently
+lowercase across every row regardless of the `external_resource_id` casing issue
+(only the `id`/`external_resource_id` field is affected, not `resourceGroup` -
+useful scoping detail for whoever fixes item 1, since it confirms `resource_group`-
+based filtering elsewhere in the app was never at risk from this).
+
+---
+
+## Prioritized follow-up list
+
+1. **[CRITICAL - fix immediately] Case-insensitive resource upsert key.**
+   `backend/app/services/azure_inventory.py`'s `upsert_resources` must match
+   existing rows case-insensitively (mirror the `func.lower(...)` pattern
+   `azure_cost.py`'s `_resolve_resource_id` already uses), not via exact
+   `external_resource_id` string equality. Without this, **cost sync stays broken**
+   for this subscription indefinitely (every future cost sync attempt will hit the
+   same `MultipleResultsFound` crash as long as both VM rows exist), and any other
+   resource whose ARM ID casing drifts in Azure's own indexing over time (this is
+   apparently an Azure Resource Graph behavior, not specific to this one VM) will
+   silently create more duplicates. **Must also include, as part of the same fix, a
+   one-time cleanup of the existing duplicate VM row in the live dev database** -
+   merging or removing the newer, cost-data-less row (`fa1f955c-5def-499b-b9a2-
+   b76766df5100`) - since the bug is now live, not hypothetical, and cost sync can't
+   function again until it's resolved. Consider whether `external_resource_id`
+   should be stored/compared in a normalized (lowercased) form generally, to close
+   this class of bug rather than just this one instance.
+2. **[HIGH] Utilization sync should dedupe by physical resource, not resource row.**
+   Even after (1) is fixed, `sync_utilization`'s per-`Resource`-row loop with no
+   awareness of "these two rows are the same physical resource" is a symptom of the
+   same underlying assumption (that DB rows and physical resources are 1:1) - worth
+   revisiting alongside (1) so a future case-insensitivity edge case (or any other
+   future duplicate-producing bug) doesn't silently double-count API calls and data
+   again.
+3. **[MEDIUM] `SpendPanel.sumTrailingActual` calendar-day quirk** (Task 16's
+   finding, re-confirmed and scoped precisely in item 6 above) - real, but narrow
+   impact and simple fix. Bundle with the next task touching `SpendPanel`.
+4. **[LOW] Recommendations page has no defense against the same physical resource
+   appearing twice** (as seen in item 4) - arguably not worth a dedicated fix once
+   (1) is resolved and duplicates can't occur, but if (1)'s fix is delayed, a
+   short-term mitigation (e.g., dedupe recommendations by `external_resource_id`
+   case-insensitively) could reduce visible confusion in the meantime. I'd defer
+   this entirely to (1) being fixed rather than treating it as its own task.
 
 ## WSL2/dockerd restart monitor - status during this task
 
-Checked at task start and again at task end. No new restarts either time - still
-pid 249, start time `Mon 2026-09-21 08:22:40 EDT` unchanged throughout (same
-baseline Task 15 captured), `docker-restart-monitor.timer` active, continuous
-`check_ok` entries, e.g. at task end:
+Checked at task start and end. No new restarts - same pid 249, start time
+`Mon 2026-09-21 08:22:40 EDT` unchanged throughout (same baseline as Tasks 15/16),
+timer active, continuous `check_ok` entries, e.g. at task end:
 
-    2026-09-21 12:11:06 EDT check_ok start="Mon 2026-09-21 08:22:40 EDT" pid=249
+    2026-09-21 15:06:13 EDT check_ok start="Mon 2026-09-21 08:22:40 EDT" pid=249
 
-Total `RESTART_DETECTED` count unchanged at 22 across both this task and Task 15;
-the most recent one (`08:22:46 EDT`) still predates both tasks' work windows.
+Total `RESTART_DETECTED` count unchanged at 22 across Tasks 15, 16, and 17; the most
+recent one still predates all three tasks' work windows.
 
-## Data integrity check
+## Data integrity check - IMPORTANT: state changed as a direct result of this task
 
-resources=9, utilization_metrics=80, cost_records=237 - unchanged row counts from
-Task 12 onward. The only data mutation this task made was the `name` backfill UPDATE
-inside the migration itself (9 rows, all pre-existing resources, all now non-null -
-confirmed above), not a change to row counts in any table.
+This task's own scope instructed triggering fresh inventory and utilization syncs
+(item 1) and exercising cost sync (item 3) against the live subscription - doing so
+is what surfaced and reproduced the bug above, and it left real, lasting state
+changes in the live dev database as a result:
+
+- `resources`: **9 -> 10** (the duplicate VM row created by the inventory-sync bug -
+  not cleaned up, per this task's explicit "report, don't fix" scope)
+- `utilization_metrics`: **80 -> 520** (440 new rows from the fresh utilization sync,
+  legitimately real data, but split across both VM rows per item 2's finding)
+- `cost_records`: **237** (unchanged - the cost-sync attempt crashed before writing
+  anything, confirmed no partial/corrupt writes)
+- `cloud_accounts`: **1** (unchanged)
+
+I did not revert, delete, or otherwise clean up the duplicate resource or the
+doubled utilization data - that would be "fixing," which this task's scope
+explicitly excludes. Whoever picks up follow-up item (1) above needs to know the
+live DB is in this state right now, not a hypothetical one they'd need to reproduce
+first.
 
 ## Ambiguity flagged, not guessed on
 
-- **`resource_id` vs `external_resource_id`**: not actually ambiguous once the
-  existing `cost_lookup.py` precedent was checked - see the dedicated section above.
-  Flagging per the task's explicit ask, not because there was real doubt.
-- **New finding, not in scope to fix**: verifying the resource-level "Spend, last 30
-  days" figure against real data surfaced that `SpendPanel`'s `sumTrailingActual`
-  (`frontend/src/components/SpendPanel.tsx`, inherited unchanged from Task 13) sums
-  the last 30 *entries* of the `series` array, not the last 30 *calendar days*. The
-  aggregate series has zero date gaps (91 entries for 91 calendar days, since some
-  resource always has a cost record on every day), so this has been invisible so
-  far. A single resource's series can have real gaps - the VM's cost series has 55
-  entries spanning 83 calendar days (no cost record on 28 of those days) - so its
-  "last 30 entries" actually span from 2026-07-26 to 2026-09-17 (53 calendar days),
-  not a true trailing 30-day window. This is exactly why the VM-scoped "last 30
-  days" figure ($284.58) came out *higher* than the whole-subscription aggregate
-  figure ($48.75) for the same real-time snapshot, which looks backwards at first
-  glance for a subset of the data. Confirmed this is a real characteristic of gappy
-  per-resource data, not a filter bug, by cross-checking both endpoints' raw date
-  ranges directly. Did not fix it - Task 16's scope is the `resource_id` filter +
-  `name` migration + wiring `SpendPanel` to the resource level, not date-window
-  semantics in a Task-13-authored helper; fixing `sumTrailingActual` to align on
-  actual calendar dates (e.g. filtering by `date >= today - 30d` instead of
-  `slice(-30)`) is a real, well-defined follow-up but wasn't part of this task's
-  described scope and wasn't asked for - flagging it here rather than silently
-  fixing a function outside what was scoped, or silently leaving a misleading number
-  in place without saying anything.
-
-## Full diff
-
-```diff
-diff --git a/backend/app/api/cost.py b/backend/app/api/cost.py
-index 4bba916..d0ad4ff 100644
---- a/backend/app/api/cost.py
-+++ b/backend/app/api/cost.py
-@@ -1,3 +1,4 @@
-+import uuid
- from typing import Any
-
- from fastapi import APIRouter, Depends
-@@ -20,6 +21,9 @@ def trigger_sync(db: Session = Depends(get_db)) -> dict[str, int]:
- def get_daily_cost_history(
-     resource_group: str | None = None,
-     resource_type: str | None = None,
-+    resource_id: uuid.UUID | None = None,
-     db: Session = Depends(get_db),
- ) -> dict[str, Any]:
--    return build_daily_cost_history(db, resource_group=resource_group, resource_type=resource_type)
-+    return build_daily_cost_history(
-+        db, resource_group=resource_group, resource_type=resource_type, resource_id=resource_id
-+    )
-diff --git a/backend/app/api/forecast.py b/backend/app/api/forecast.py
-index 330d605..b22d4c9 100644
---- a/backend/app/api/forecast.py
-+++ b/backend/app/api/forecast.py
-@@ -1,3 +1,4 @@
-+import uuid
- from typing import Any
-
- from fastapi import APIRouter, Depends, Query
-@@ -14,6 +15,7 @@ def get_forecast(
-     horizon_days: int = Query(90, ge=1),
-     resource_group: str | None = None,
-     resource_type: str | None = None,
-+    resource_id: uuid.UUID | None = None,
-     db: Session = Depends(get_db),
- ) -> dict[str, Any]:
-     return build_forecast(
-@@ -21,4 +23,5 @@ def get_forecast(
-         horizon_days=horizon_days,
-         resource_group=resource_group,
-         resource_type=resource_type,
-+        resource_id=resource_id,
-     )
-diff --git a/backend/app/models/resource.py b/backend/app/models/resource.py
-index 695166f..7195fcc 100644
---- a/backend/app/models/resource.py
-+++ b/backend/app/models/resource.py
-@@ -18,6 +18,7 @@ class Resource(Base):
-     )
-     provider: Mapped[Provider] = mapped_column(Enum(Provider, name="provider"), nullable=False)
-     external_resource_id: Mapped[str] = mapped_column(String, nullable=False)
-+    name: Mapped[str | None] = mapped_column(String, nullable=True)
-     resource_type: Mapped[str] = mapped_column(String, nullable=False)
-     region: Mapped[str | None] = mapped_column(String, nullable=True)
-     resource_group: Mapped[str | None] = mapped_column(String, nullable=True)
-diff --git a/backend/app/services/azure_inventory.py b/backend/app/services/azure_inventory.py
-index 6706433..e539a57 100644
---- a/backend/app/services/azure_inventory.py
-+++ b/backend/app/services/azure_inventory.py
-@@ -84,6 +84,7 @@ def map_resource(row: dict[str, Any]) -> dict[str, Any]:
-     mapped: dict[str, Any] = {
-         "provider": Provider.AZURE,
-         "external_resource_id": row["id"],
-+        "name": row.get("name"),
-         "resource_type": row.get("type", ""),
-         "region": row.get("location"),
-         "resource_group": row.get("resourceGroup"),
-diff --git a/backend/app/services/forecast.py b/backend/app/services/forecast.py
-index e07e2e2..47c98a7 100644
---- a/backend/app/services/forecast.py
-+++ b/backend/app/services/forecast.py
-@@ -23,6 +23,7 @@ def get_daily_costs(
-     cloud_account_id: uuid.UUID,
-     resource_group: str | None = None,
-     resource_type: str | None = None,
-+    resource_id: uuid.UUID | None = None,
- ) -> list[tuple[date, float]]:
-     query = db.query(CostRecord.date, func.sum(CostRecord.amortized_cost)).filter(
-         CostRecord.cloud_account_id == cloud_account_id
-@@ -37,6 +38,12 @@ def get_daily_costs(
-             query = query.filter(Resource.resource_group == resource_group)
-         if resource_type:
-             query = query.filter(Resource.resource_type == resource_type)
-+    if resource_id:
-+        # resource_id is CostRecord's own FK column (see cost_lookup.py's
-+        # get_resource_daily_costs, the same filter rightsizing.py already
-+        # uses) - no join needed, unlike resource_group/resource_type which
-+        # live on Resource.
-+        query = query.filter(CostRecord.resource_id == resource_id)
-     query = query.group_by(CostRecord.date).order_by(CostRecord.date)
-     return [(row_date, float(total)) for row_date, total in query.all()]
-
-@@ -50,6 +57,7 @@ def build_daily_cost_history(
-     db: Session,
-     resource_group: str | None = None,
-     resource_type: str | None = None,
-+    resource_id: uuid.UUID | None = None,
-     cloud_account_id: uuid.UUID | None = None,
- ) -> dict[str, Any]:
-     """Actual (already-synced) daily cost history - the historical counterpart
-@@ -63,7 +71,9 @@ def build_daily_cost_history(
-     if cloud_account_id is None:
-         cloud_account_id = get_or_create_cloud_account(db, settings.azure_subscription_id).id
-
--    daily_costs = get_daily_costs(db, cloud_account_id, resource_group=resource_group, resource_type=resource_type)
-+    daily_costs = get_daily_costs(
-+        db, cloud_account_id, resource_group=resource_group, resource_type=resource_type, resource_id=resource_id
-+    )
-     return {
-         "series": [{"date": day.isoformat(), "actual_cost": cost} for day, cost in daily_costs],
-     }
-@@ -74,6 +84,7 @@ def build_forecast(
-     horizon_days: int,
-     resource_group: str | None = None,
-     resource_type: str | None = None,
-+    resource_id: uuid.UUID | None = None,
-     cloud_account_id: uuid.UUID | None = None,
-     model: ForecastModel | None = None,
- ) -> dict[str, Any]:
-@@ -85,7 +96,9 @@ def build_forecast(
-         # this keeps the seam explicit rather than leaving it unscoped.
-         cloud_account_id = get_or_create_cloud_account(db, settings.azure_subscription_id).id
-
--    daily_costs = get_daily_costs(db, cloud_account_id, resource_group=resource_group, resource_type=resource_type)
-+    daily_costs = get_daily_costs(
-+        db, cloud_account_id, resource_group=resource_group, resource_type=resource_type, resource_id=resource_id
-+    )
-     result = model.forecast(daily_costs, horizon_days)
-
-     if result.insufficient_data:
-diff --git a/backend/app/services/inventory_listing.py b/backend/app/services/inventory_listing.py
-index 9f8cf15..c6580b6 100644
---- a/backend/app/services/inventory_listing.py
-+++ b/backend/app/services/inventory_listing.py
-@@ -33,9 +33,7 @@ def build_resource_list(
-             {
-                 "resource_id": str(resource.id),
-                 "external_resource_id": resource.external_resource_id,
--                # Not a dedicated column - only captured in raw_metadata (see
--                # RESOURCE_GRAPH_QUERY's `project ... name ...` in azure_inventory.py).
--                "name": resource.raw_metadata.get("name") if isinstance(resource.raw_metadata, dict) else None,
-+                "name": resource.name,
-                 "resource_group": resource.resource_group,
-                 "resource_type": resource.resource_type,
-                 "region": resource.region,
-diff --git a/backend/tests/test_azure_inventory.py b/backend/tests/test_azure_inventory.py
-index 341d798..97df340 100644
---- a/backend/tests/test_azure_inventory.py
-+++ b/backend/tests/test_azure_inventory.py
-@@ -13,6 +13,7 @@ def test_map_resource_vm():
-
-     assert mapped["provider"] == Provider.AZURE
-     assert mapped["external_resource_id"] == VM_ROW["id"]
-+    assert mapped["name"] == "vm-web-01"
-     assert mapped["resource_type"] == "microsoft.compute/virtualmachines"
-     assert mapped["region"] == "eastus"
-     assert mapped["resource_group"] == "rg-prod"
-@@ -45,6 +46,7 @@ def test_map_resource_missing_created_at_and_sku():
-     mapped = map_resource(row)
-
-     assert mapped["sku"] is None
-+    assert mapped["name"] is None
-     assert "created_at" not in mapped
-     assert mapped["tags"] == {}
-
-diff --git a/backend/tests/test_cost_history.py b/backend/tests/test_cost_history.py
-index 6688dcc..53f7a7f 100644
---- a/backend/tests/test_cost_history.py
-+++ b/backend/tests/test_cost_history.py
-@@ -76,6 +76,39 @@ def test_build_daily_cost_history_resource_group_filter_excludes_other_groups(db
-     assert result["series"] == [{"date": "2026-09-01", "actual_cost": 5.0}]
-
-
-+def test_build_daily_cost_history_resource_id_filter_excludes_other_resources(db_session):
-+    account = _seed_account(db_session, "test-sub-cost-history-resource-id")
-+    vm_a = Resource(
-+        cloud_account_id=account.id,
-+        provider=Provider.AZURE,
-+        external_resource_id="vm-a",
-+        resource_type="microsoft.compute/virtualmachines",
-+        resource_group="rg-a",
-+        tags={},
-+        raw_metadata={},
-+    )
-+    vm_b = Resource(
-+        cloud_account_id=account.id,
-+        provider=Provider.AZURE,
-+        external_resource_id="vm-b",
-+        resource_type="microsoft.compute/virtualmachines",
-+        resource_group="rg-a",
-+        tags={},
-+        raw_metadata={},
-+    )
-+    db_session.add_all([vm_a, vm_b])
-+    db_session.flush()
-+
-+    base = date(2026, 9, 1)
-+    _add_cost(db_session, account, vm_a, base, 5.0)
-+    _add_cost(db_session, account, vm_b, base, 100.0)
-+    db_session.commit()
-+
-+    result = build_daily_cost_history(db_session, resource_id=vm_a.id, cloud_account_id=account.id)
-+
-+    assert result["series"] == [{"date": "2026-09-01", "actual_cost": 5.0}]
-+
-+
- def test_build_daily_cost_history_no_data_returns_empty_series(db_session):
-     account = _seed_account(db_session, "test-sub-cost-history-empty")
-     db_session.commit()
-@@ -109,3 +142,19 @@ def test_cost_history_endpoint_resource_type_filter(client):
-     assert response.status_code == 200
-     body = response.json()
-     assert isinstance(body["series"], list)
-+
-+
-+def test_cost_history_endpoint_resource_id_filter(client):
-+    resources = client.get("/api/v1/inventory", params={"resource_group": "nise-rg"}).json()["resources"]
-+    vm = next(r for r in resources if r["resource_type"] == "microsoft.compute/virtualmachines")
-+
-+    response = client.get("/api/v1/cost", params={"resource_id": vm["resource_id"]})
-+
-+    assert response.status_code == 200
-+    body = response.json()
-+    assert len(body["series"]) > 0
-+    total_for_vm = sum(point["actual_cost"] for point in body["series"])
-+
-+    aggregate = client.get("/api/v1/cost").json()
-+    total_aggregate = sum(point["actual_cost"] for point in aggregate["series"])
-+    assert total_for_vm <= total_aggregate
-diff --git a/backend/tests/test_forecast.py b/backend/tests/test_forecast.py
-index 9d491d1..59247c6 100644
---- a/backend/tests/test_forecast.py
-+++ b/backend/tests/test_forecast.py
-@@ -96,6 +96,39 @@ def test_build_forecast_resource_group_filter_excludes_other_groups(db_session):
-     assert result["daily_rate"] == 5.0
-
-
-+def test_build_forecast_resource_id_filter_excludes_other_resources(db_session):
-+    account = _seed_account(db_session, "test-sub-forecast-resource-id")
-+    vm_a = Resource(
-+        cloud_account_id=account.id,
-+        provider=Provider.AZURE,
-+        external_resource_id="vm-a",
-+        resource_type="microsoft.compute/virtualmachines",
-+        resource_group="rg-a",
-+        tags={},
-+        raw_metadata={},
-+    )
-+    vm_b = Resource(
-+        cloud_account_id=account.id,
-+        provider=Provider.AZURE,
-+        external_resource_id="vm-b",
-+        resource_type="microsoft.compute/virtualmachines",
-+        resource_group="rg-a",  # same group as vm_a - resource_id must narrow further than resource_group alone
-+        tags={},
-+        raw_metadata={},
-+    )
-+    db_session.add_all([vm_a, vm_b])
-+    db_session.flush()
-+
-+    base = date(2026, 9, 1)
-+    _add_cost(db_session, account, vm_a, base, 5.0)
-+    _add_cost(db_session, account, vm_b, base, 100.0)
-+    db_session.commit()
-+
-+    result = build_forecast(db_session, horizon_days=1, resource_id=vm_a.id, cloud_account_id=account.id)
-+
-+    assert result["daily_rate"] == 5.0
-+
-+
- def test_build_forecast_rollups_cap_to_horizon_and_include_horizon_itself(db_session):
-     account = _seed_account(db_session, "test-sub-forecast-rollups")
-     base = date(2026, 9, 1)
-@@ -164,3 +197,37 @@ def test_forecast_endpoint_resource_type_filter(client):
-     body = response.json()
-     assert body["insufficient_data"] is False
-     assert body["daily_rate"] > 0
-+
-+
-+def test_forecast_endpoint_resource_id_filter(client):
-+    # nise-rg's VM (nise-dev) is a real resource with real cost history in the
-+    # live subscription (Task 15's own findings) - use its actual resource_id
-+    # from the inventory endpoint rather than hardcoding one.
-+    resources = client.get("/api/v1/inventory", params={"resource_group": "nise-rg"}).json()["resources"]
-+    vm = next(r for r in resources if r["resource_type"] == "microsoft.compute/virtualmachines")
-+
-+    response = client.get(
-+        "/api/v1/forecast",
-+        params={"horizon_days": 7, "resource_id": vm["resource_id"]},
-+    )
-+
-+    assert response.status_code == 200
-+    body = response.json()
-+    assert body["insufficient_data"] is False
-+    assert body["daily_rate"] > 0
-+
-+    # A resource_id filter must narrow strictly further than an unfiltered
-+    # forecast - the VM alone shouldn't out-earn the whole subscription's rate.
-+    aggregate = client.get("/api/v1/forecast", params={"horizon_days": 7}).json()
-+    assert body["daily_rate"] <= aggregate["daily_rate"]
-+
-+
-+def test_forecast_endpoint_unknown_resource_id_returns_insufficient_data(client):
-+    response = client.get(
-+        "/api/v1/forecast",
-+        params={"horizon_days": 7, "resource_id": "00000000-0000-0000-0000-000000000000"},
-+    )
-+
-+    assert response.status_code == 200
-+    body = response.json()
-+    assert body["insufficient_data"] is True
-diff --git a/backend/tests/test_inventory_listing.py b/backend/tests/test_inventory_listing.py
-index b01e606..30dbaaa 100644
---- a/backend/tests/test_inventory_listing.py
-+++ b/backend/tests/test_inventory_listing.py
-@@ -16,6 +16,7 @@ def _add_resource(db_session, account, external_id, resource_group, resource_typ
-         cloud_account_id=account.id,
-         provider=Provider.AZURE,
-         external_resource_id=external_id,
-+        name=name,
-         resource_type=resource_type,
-         region=region,
-         resource_group=resource_group,
-@@ -62,12 +63,13 @@ def test_build_resource_list_no_resources_returns_empty_list(db_session):
-     assert result["resources"] == []
-
-
--def test_build_resource_list_missing_name_in_raw_metadata_returns_none(db_session):
-+def test_build_resource_list_missing_name_returns_none(db_session):
-     account = _seed_account(db_session, "test-sub-inventory-listing-noname")
-     resource = Resource(
-         cloud_account_id=account.id,
-         provider=Provider.AZURE,
-         external_resource_id="vm-noname",
-+        name=None,
-         resource_type="microsoft.compute/virtualmachines",
-         region="eastus",
-         resource_group="rg-a",
-diff --git a/frontend/src/api/client.ts b/frontend/src/api/client.ts
-index bdae098..3c33d03 100644
---- a/frontend/src/api/client.ts
-+++ b/frontend/src/api/client.ts
-@@ -18,29 +18,29 @@ async function getJson<T>(path: string): Promise<T> {
-   return response.json();
- }
-
--/** Drill-down scope shared by the cost/forecast/inventory endpoints. */
-+/** Drill-down scope shared by the cost/forecast endpoints (inventory only uses resourceGroup). */
- export interface DrillScope {
-   resourceGroup?: string;
-+  resourceId?: string;
- }
-
--function scopeParams({ resourceGroup }: DrillScope = {}): string {
--  const params = new URLSearchParams();
-+function scopeParams({ resourceGroup, resourceId }: DrillScope = {}, extra?: Record<string, string>): string {
-+  const params = new URLSearchParams(extra);
-   if (resourceGroup) params.set("resource_group", resourceGroup);
-+  if (resourceId) params.set("resource_id", resourceId);
-   const qs = params.toString();
-   return qs ? `?${qs}` : "";
- }
-
- export function getForecast(horizonDays: number, scope?: DrillScope): Promise<ForecastResponse> {
--  const params = new URLSearchParams({ horizon_days: String(horizonDays) });
--  if (scope?.resourceGroup) params.set("resource_group", scope.resourceGroup);
--  return getJson(`/api/v1/forecast?${params.toString()}`);
-+  return getJson(`/api/v1/forecast${scopeParams(scope, { horizon_days: String(horizonDays) })}`);
- }
-
- export function getCostHistory(scope?: DrillScope): Promise<CostHistoryResponse> {
-   return getJson(`/api/v1/cost${scopeParams(scope)}`);
- }
-
--export function getResources(scope?: DrillScope): Promise<InventoryResponse> {
-+export function getResources(scope?: Pick<DrillScope, "resourceGroup">): Promise<InventoryResponse> {
-   return getJson(`/api/v1/inventory${scopeParams(scope)}`);
- }
-
-diff --git a/frontend/src/components/SpendPanel.tsx b/frontend/src/components/SpendPanel.tsx
-index 22d95b1..c1934bf 100644
---- a/frontend/src/components/SpendPanel.tsx
-+++ b/frontend/src/components/SpendPanel.tsx
-@@ -22,20 +22,23 @@ function sumTrailingActual(history: CostHistoryResponse, days: number): number {
- interface SpendPanelProps {
-   /** Scopes the underlying /cost and /forecast calls to one resource group. Omit for the aggregate view. */
-   resourceGroup?: string;
-+  /** Scopes to a single resource (takes precedence over resourceGroup if both are given). */
-+  resourceId?: string;
-   emptyStateDescription?: string;
- }
-
- /**
-  * Current-spend figure + spend/forecast chart, extracted from Task 13's
-- * Overview page so Task 15's drill-down levels (subscription, resource group)
-- * can reuse the exact same pattern scoped to whatever's selected.
-+ * Overview page so the drill-down levels (subscription, resource group,
-+ * resource - Tasks 15/16) can reuse the exact same pattern scoped to
-+ * whatever's selected.
-  */
--export function SpendPanel({ resourceGroup, emptyStateDescription }: SpendPanelProps) {
-+export function SpendPanel({ resourceGroup, resourceId, emptyStateDescription }: SpendPanelProps) {
-   const [state, setState] = useState<LoadState>({ status: "loading" });
-
-   useEffect(() => {
-     setState({ status: "loading" });
--    const scope = resourceGroup ? { resourceGroup } : undefined;
-+    const scope = resourceId ? { resourceId } : resourceGroup ? { resourceGroup } : undefined;
-
-     Promise.all([getCostHistory(scope), getForecast(FORECAST_HORIZON_DAYS, scope)])
-       .then(([history, forecast]) => {
-@@ -49,7 +52,7 @@ export function SpendPanel({ resourceGroup, emptyStateDescription }: SpendPanelP
-         setState({ status: "ready", history, forecast });
-       })
-       .catch(() => setState({ status: "error" }));
--  }, [resourceGroup]);
-+  }, [resourceGroup, resourceId]);
-
-   if (state.status === "loading") {
-     return <p className="text-stone-500">Loading spend data…</p>;
-diff --git a/frontend/src/pages/Overview.test.tsx b/frontend/src/pages/Overview.test.tsx
-index e6ab9ad..ebaf041 100644
---- a/frontend/src/pages/Overview.test.tsx
-+++ b/frontend/src/pages/Overview.test.tsx
-@@ -107,11 +107,24 @@ describe("Overview", () => {
-     expect(screen.getByText("1 resource")).toBeInTheDocument();
-   });
-
--  it("drills from subscription -> resource group -> resource with working breadcrumb navigation", async () => {
-+  it("drills from subscription -> resource group -> resource with working breadcrumb navigation, showing real scoped spend at every level", async () => {
-     const user = userEvent.setup();
-+    const VM_COST = { series: [{ date: "2026-09-01", actual_cost: 42 }] };
-+    const VM_FORECAST = {
-+      insufficient_data: false,
-+      daily_rate: 42,
-+      horizon_days: 90,
-+      rollups: { "7": 294, "90": 3780 },
-+      series: [{ date: "2026-09-02", projected_cost: 42 }],
-+    };
-+
-     mockFetchResponses({
--      [COST_FRAGMENT]: EMPTY_COST,
--      [FORECAST_FRAGMENT]: EMPTY_FORECAST,
-+      // Aggregate/resource-group level stay "insufficient data"; the
-+      // resource-scoped request (resource_id=res-1) returns real data, so
-+      // the test can confirm SpendPanel is actually switching scope, not
-+      // just re-rendering the same response.
-+      [COST_FRAGMENT]: (url: string) => (url.includes("resource_id=res-1") ? VM_COST : EMPTY_COST),
-+      [FORECAST_FRAGMENT]: (url: string) => (url.includes("resource_id=res-1") ? VM_FORECAST : EMPTY_FORECAST),
-       // The real /api/v1/inventory endpoint filters by resource_group server-side
-       // (see backend/app/services/inventory_listing.py) - mirror that here so the
-       // resource-group-level fetch only returns rg-a's own resources.
-@@ -131,10 +144,12 @@ describe("Overview", () => {
-
-     await user.click(screen.getByText("vm-web-01"));
-
--    // Resource level: identity detail + explicit gap note, no fabricated scoped chart.
-+    // Resource level: identity detail + a real spend figure/chart scoped to
-+    // just this resource (Task 16 closes the gap Task 15 flagged here).
-     await waitFor(() => expect(screen.getByText("microsoft.compute/virtualmachines")).toBeInTheDocument());
--    expect(screen.getByText(/per-resource spend and forecast aren't wired up yet/i)).toBeInTheDocument();
--    expect(screen.queryByText(/spend trend/i)).not.toBeInTheDocument();
-+    await waitFor(() => expect(screen.getByText("$42.00")).toBeInTheDocument());
-+    expect(screen.getByText(/spend trend/i)).toBeInTheDocument();
-+    expect(screen.queryByText(/wired up yet/i)).not.toBeInTheDocument();
-
-     // Breadcrumb back-navigation: rg-a -> Overview.
-     await user.click(screen.getByRole("button", { name: "rg-a" }));
-@@ -160,4 +175,23 @@ describe("Overview", () => {
-
-     await waitFor(() => expect(screen.getByText(/resource group "rg-a" hasn't synced/i)).toBeInTheDocument());
-   });
-+
-+  it("shows a scoped empty state when a resource has no cost history", async () => {
-+    const user = userEvent.setup();
-+    mockFetchResponses({
-+      [COST_FRAGMENT]: EMPTY_COST,
-+      [FORECAST_FRAGMENT]: EMPTY_FORECAST,
-+      [INVENTORY_FRAGMENT]: (url: string) =>
-+        url.includes("resource_group=rg-a") ? { resources: [RG_A_VM] } : { resources: [RG_A_VM] },
-+    });
-+
-+    render(<Overview />);
-+
-+    await waitFor(() => expect(screen.getByText("rg-a")).toBeInTheDocument());
-+    await user.click(screen.getByText("rg-a"));
-+    await waitFor(() => expect(screen.getByText("vm-web-01")).toBeInTheDocument());
-+    await user.click(screen.getByText("vm-web-01"));
-+
-+    await waitFor(() => expect(screen.getByText(/vm-web-01 hasn't synced/i)).toBeInTheDocument());
-+  });
- });
-diff --git a/frontend/src/pages/Overview.tsx b/frontend/src/pages/Overview.tsx
-index 35e5945..473834a 100644
---- a/frontend/src/pages/Overview.tsx
-+++ b/frontend/src/pages/Overview.tsx
-@@ -55,19 +55,35 @@ export function Overview() {
-       <h1 className="mb-2 text-2xl font-semibold">Overview</h1>
-       <Breadcrumb segments={breadcrumbSegments} />
-
--      {path.level !== "resource" && (
--        <div className="mb-6">
--          <SpendPanel
--            resourceGroup={resourceGroupFilter}
--            emptyStateDescription={
--              path.level === "resource-group"
--                ? `Resource group "${path.resourceGroup}" hasn't synced enough days of cost data to show a spend trend or forecast yet.`
--                : undefined
--            }
--          />
-+      {path.level === "resource" && (
-+        <div className="mb-6 rounded-xl bg-white p-6 shadow-sm">
-+          <p className="text-sm text-stone-500">Resource</p>
-+          <p className="mt-1 text-lg font-semibold text-brand-dark">{resourceLabel(path.resource)}</p>
-+          <dl className="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
-+            <dt className="text-stone-400">Type</dt>
-+            <dd className="text-stone-700">{path.resource.resource_type}</dd>
-+            <dt className="text-stone-400">Region</dt>
-+            <dd className="text-stone-700">{path.resource.region ?? "—"}</dd>
-+            <dt className="text-stone-400">Resource group</dt>
-+            <dd className="text-stone-700">{path.resource.resource_group ?? "—"}</dd>
-+          </dl>
-         </div>
-       )}
-
-+      <div className="mb-6">
-+        <SpendPanel
-+          resourceGroup={path.level === "resource-group" ? path.resourceGroup : undefined}
-+          resourceId={path.level === "resource" ? path.resource.resource_id : undefined}
-+          emptyStateDescription={
-+            path.level === "resource-group"
-+              ? `Resource group "${path.resourceGroup}" hasn't synced enough days of cost data to show a spend trend or forecast yet.`
-+              : path.level === "resource"
-+                ? `${resourceLabel(path.resource)} hasn't synced enough days of cost data to show a spend trend or forecast yet.`
-+                : undefined
-+          }
-+        />
-+      </div>
-+
-       {path.level === "subscription" && (
-         <>
-           {resourceList.status === "loading" && <p className="text-stone-500">Loading resource groups…</p>}
-@@ -113,29 +129,6 @@ export function Overview() {
-           )}
-         </>
-       )}
--
--      {path.level === "resource" && (
--        <div className="space-y-6">
--          <div className="rounded-xl bg-white p-6 shadow-sm">
--            <p className="text-sm text-stone-500">Resource</p>
--            <p className="mt-1 text-lg font-semibold text-brand-dark">{resourceLabel(path.resource)}</p>
--            <dl className="mt-4 grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
--              <dt className="text-stone-400">Type</dt>
--              <dd className="text-stone-700">{path.resource.resource_type}</dd>
--              <dt className="text-stone-400">Region</dt>
--              <dd className="text-stone-700">{path.resource.region ?? "—"}</dd>
--              <dt className="text-stone-400">Resource group</dt>
--              <dd className="text-stone-700">{path.resource.resource_group ?? "—"}</dd>
--            </dl>
--          </div>
--
--          <div className="rounded-xl bg-amber-bg px-6 py-5 text-sm text-amber-text">
--            Per-resource spend and forecast aren't wired up yet — /api/v1/cost and
--            /api/v1/forecast currently filter by resource group or resource type, not by a
--            single resource. See this task's results.txt for the full writeup.
--          </div>
--        </div>
--      )}
-     </div>
-   );
- }
-=== NEW FILE: backend/alembic/versions/0a3c0e882688_resources_name_column.py ===
-"""resources name column, backfilled from raw_metadata
-
-Revision ID: 0a3c0e882688
-Revises: d7e2b5f91a44
-Create Date: 2026-09-21 12:00:00.000000
-
-"""
-from typing import Sequence, Union
-
-import sqlalchemy as sa
-from alembic import op
-
-revision: str = '0a3c0e882688'
-down_revision: Union[str, None] = 'd7e2b5f91a44'
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
-
-
-def upgrade() -> None:
-    # Task 2's Resource Graph query already captures `name`, but
-    # azure_inventory.map_resource only ever wrote it into the raw_metadata
-    # JSONB blob, not a real column (flagged in Task 15). Nullable, matching
-    # the other optional resource attributes (region, resource_group, sku) -
-    # a resource without a usable name in raw_metadata should stay null
-    # rather than fail the sync.
-    op.add_column('resources', sa.Column('name', sa.String(), nullable=True))
-
-    # Backfill already-synced rows from their own raw_metadata rather than
-    # leaving them null until the next sync - raw_metadata->>'name' mirrors
-    # exactly what map_resource now writes directly for new/updated rows.
-    op.execute(
-        """
-        UPDATE resources
-        SET name = raw_metadata ->> 'name'
-        WHERE raw_metadata ? 'name'
-        """
-    )
-
-
-def downgrade() -> None:
-    op.drop_column('resources', 'name')
-```
+- Whether to clean up the duplicate resource row I discovered (and inadvertently
+  caused, by following this task's own "trigger a fresh sync" instruction) was the
+  one real judgment call this task raised. Per the task's own explicit "Explicitly
+  out of scope: Fixing anything found here" and CLAUDE.md's human-decision-boundary
+  rule, I left it as-is and documented it thoroughly instead of touching it - this
+  felt like exactly the kind of "not my call" situation those rules describe, even
+  though it's tempting to "just delete the one bad row." A follow-up task should
+  make that call deliberately, as part of a real fix to the upsert-key logic, not as
+  a one-off manual cleanup with no code change behind it (which would just recur on
+  the next sync anyway).
+- No other genuine ambiguity - the rest of this task's scope was mechanical
+  verification against live data, which I could resolve directly with evidence
+  rather than needing to guess or ask.
