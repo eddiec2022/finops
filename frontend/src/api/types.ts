@@ -148,6 +148,11 @@ export interface ReservedInstanceRecommendation {
 
 export interface ReservedInstancesResponse {
   source: string;
-  field_mapping_note: string;
+  // Task 21: a plain string covers both providers' caveats when only one
+  // contributed recommendations (e.g. AWS unconfigured) - the pre-existing
+  // shape, unchanged for that case. Becomes {azure, aws} once both providers
+  // are configured, so neither provider's own mapping caveat is silently
+  // dropped once their recommendations are merged into one list.
+  field_mapping_note: string | { azure: string; aws: string };
   recommendations: ReservedInstanceRecommendation[];
 }

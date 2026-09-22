@@ -226,4 +226,18 @@ describe("normalizeReservedInstances", () => {
     expect(item.reason).toBe("$0.05/hr commitment, ONE_YEAR term");
     expect(item.estimatedMonthlyImpact).toBe(18);
   });
+
+  it("Task 21: gives each item its own provider's note when field_mapping_note is merged ({azure, aws})", () => {
+    const items = normalizeReservedInstances({
+      source: "merged",
+      field_mapping_note: { azure: "Azure caveat text.", aws: "AWS caveat text." },
+      recommendations: [
+        { provider: "azure", id: "azure-1", sku: "Standard_D2s_v3", location: "eastus" },
+        { provider: "aws", recommendation_type: "reserved_instance", instance_type: "m5.large", location: "us-east-1" },
+      ],
+    });
+
+    expect(items[0].impactNote).toBe("Azure caveat text.");
+    expect(items[1].impactNote).toBe("AWS caveat text.");
+  });
 });

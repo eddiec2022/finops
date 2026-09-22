@@ -55,5 +55,19 @@ def get_reservation_recommendations() -> dict[str, Any]:
     # dependency the way the other three recommendation endpoints do.
     result = build_reservation_recommendations()
     if settings.aws_configured:
-        result["recommendations"] = result["recommendations"] + build_aws_reservation_recommendations()["recommendations"]
+        aws_result = build_aws_reservation_recommendations()
+        result["recommendations"] = result["recommendations"] + aws_result["recommendations"]
+        # Task 21 fix: each provider's field_mapping_note is its own caveat
+        # about its own field-name mapping - Azure's alone silently stood in
+        # for both once AWS's recommendations were merged in above, discarding
+        # AWS's own note entirely. Triggered on aws_configured (same condition
+        # every other dispatch in this file already uses), not on whether this
+        # particular call happened to find any AWS items - the caveat is about
+        # mapping trustworthiness in general, not this one response. Stays a
+        # plain string (the pre-existing shape) whenever AWS isn't configured,
+        # so this is not a breaking change for every current Azure-only caller.
+        result["field_mapping_note"] = {
+            "azure": result["field_mapping_note"],
+            "aws": aws_result["field_mapping_note"],
+        }
     return result

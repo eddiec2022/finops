@@ -3,6 +3,7 @@ import { getCostHistory, getForecast } from "../api/client";
 import type { CostHistoryResponse, ForecastResponse } from "../api/types";
 import { combineSpendSeries } from "../lib/combineSpendSeries";
 import { formatCurrency } from "../lib/formatCurrency";
+import { sumTrailingActual } from "../lib/sumTrailingActual";
 import { EmptyState } from "./EmptyState";
 import { SpendChart } from "./SpendChart";
 
@@ -14,10 +15,6 @@ type LoadState =
   | { status: "error" }
   | { status: "empty" }
   | { status: "ready"; history: CostHistoryResponse; forecast: ForecastResponse };
-
-function sumTrailingActual(history: CostHistoryResponse, days: number): number {
-  return history.series.slice(-days).reduce((total, point) => total + point.actual_cost, 0);
-}
 
 interface SpendPanelProps {
   /** Scopes the underlying /cost and /forecast calls to one resource group. Omit for the aggregate view. */
@@ -70,14 +67,14 @@ export function SpendPanel({ resourceGroup, resourceId, emptyStateDescription }:
     return <EmptyState description={emptyStateDescription} />;
   }
 
+  const trailing = sumTrailingActual(state.history, TRAILING_SPEND_DAYS);
+
   return (
     <div className="space-y-6">
       <div className="rounded-xl bg-white p-6 shadow-sm">
-        <p className="text-sm text-stone-500">
-          Spend, last {Math.min(TRAILING_SPEND_DAYS, state.history.series.length)} days
-        </p>
+        <p className="text-sm text-stone-500">Spend, last {trailing.windowDays} days</p>
         <p className="mt-1 font-mono text-4xl font-semibold tabular-nums text-brand-dark">
-          {formatCurrency(sumTrailingActual(state.history, TRAILING_SPEND_DAYS))}
+          {formatCurrency(trailing.total)}
         </p>
       </div>
 

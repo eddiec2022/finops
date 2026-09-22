@@ -135,12 +135,19 @@ function normalizeReservedInstanceItem(r: ReservedInstanceRecommendation, index:
   };
 }
 
+// field_mapping_note is a plain string when only one provider contributed
+// recommendations (the pre-existing shape), or {azure, aws} once both did
+// (Task 21) - each item gets its own provider's note in the merged case,
+// rather than one note (or a stringified object) applied to every item
+// regardless of which provider it actually came from.
+function impactNoteFor(r: ReservedInstanceRecommendation, note: ReservedInstancesResponse["field_mapping_note"]): string {
+  if (typeof note === "string") return note;
+  return r.provider === "aws" ? note.aws : note.azure;
+}
+
 export function normalizeReservedInstances(response: ReservedInstancesResponse): RecommendationItem[] {
   return response.recommendations.map((r, index) => ({
     ...normalizeReservedInstanceItem(r, index),
-    // field_mapping_note is response-level (shared across every item, from
-    // whichever provider's build_*_reservation_recommendations produced it) -
-    // applied here rather than per-item, same as the original single-provider version.
-    impactNote: response.field_mapping_note,
+    impactNote: impactNoteFor(r, response.field_mapping_note),
   }));
 }
