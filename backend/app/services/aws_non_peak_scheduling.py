@@ -6,10 +6,16 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.resource import Resource
 from app.models.utilization_metric import UtilizationMetric
-from app.services.azure_inventory import get_or_create_cloud_account
+from app.services.aws_cpu_metrics import AWS_CPU_METRIC_BY_RESOURCE_TYPE
+from app.services.aws_inventory import get_or_create_aws_cloud_account
 from app.services.cost_lookup import get_resource_daily_costs
-from app.services.cpu_metrics import CPU_METRIC_BY_RESOURCE_TYPE
 from app.services.forecasting.linear_burn_rate import LinearBurnRateModel
+
+# Reused directly, not reimplemented - neither module has any Azure-specific
+# assumption baked in (non_prod_heuristics reads plain tags/name strings;
+# peak_usage_evaluation reads a plain (timestamp, value) series against a
+# fixed UTC business-hours window), confirmed by reading both before deciding,
+# per the task's own "reuse what isn't Azure-specific, flag what is" instruction.
 from app.services.non_prod_heuristics import detect_non_prod_by_name, detect_non_prod_by_tag
 from app.services.peak_usage_evaluation import (
     BUSINESS_DAYS,
@@ -48,35 +54,27 @@ def estimate_monthly_schedule_savings(avg_daily_cost: float | None) -> tuple[flo
     return round(savings, 2), note
 
 
-def _resource_name(resource: Resource) -> str | None:
-    raw_metadata = resource.raw_metadata or {}
-    return raw_metadata.get("name")
-
-
-def build_non_peak_scheduling_recommendations(
+def build_aws_non_peak_scheduling_recommendations(
     db: Session, cloud_account_id: uuid.UUID | None = None
 ) -> dict[str, Any]:
     if cloud_account_id is None:
-        # Phase 1 is single-subscription, same convention as the other recommendation endpoints.
-        cloud_account_id = get_or_create_cloud_account(db, settings.azure_subscription_id).id
+        cloud_account_id = get_or_create_aws_cloud_account(db, settings.aws_account_id).id
 
     cost_model = LinearBurnRateModel(trailing_window_days=settings.idle_lookback_days)
 
-    # Same resource types as rightsizing - VMs and App Services are the two
-    # types a start/stop schedule actually applies to.
     resources = (
         db.query(Resource)
         .filter(Resource.cloud_account_id == cloud_account_id)
-        .filter(Resource.resource_type.in_(CPU_METRIC_BY_RESOURCE_TYPE.keys()))
+        .filter(Resource.resource_type.in_(AWS_CPU_METRIC_BY_RESOURCE_TYPE.keys()))
         .all()
     )
 
     recommendations = []
     for resource in resources:
         tag_result = detect_non_prod_by_tag(resource.tags)
-        name_result = detect_non_prod_by_name(_resource_name(resource))
+        name_result = detect_non_prod_by_name(resource.name)
 
-        metric_name = CPU_METRIC_BY_RESOURCE_TYPE[resource.resource_type]
+        metric_name = AWS_CPU_METRIC_BY_RESOURCE_TYPE[resource.resource_type]
         readings = (
             db.query(UtilizationMetric.timestamp, UtilizationMetric.value)
             .filter_by(resource_id=resource.id, metric_name=metric_name)
@@ -88,8 +86,6 @@ def build_non_peak_scheduling_recommendations(
             off_peak_ratio_threshold=settings.off_peak_usage_ratio_threshold,
         )
 
-        # Per GOV-001: tag OR name OR usage pattern - any one signal is
-        # sufficient, not all required to agree.
         if not (tag_result.matched or name_result.matched or usage_result.is_flagged):
             continue
 
@@ -100,8 +96,7 @@ def build_non_peak_scheduling_recommendations(
 
         recommendations.append(
             {
-                # Added for Task 20 - see rightsizing.py's identical comment.
-                "provider": "azure",
+                "provider": "aws",
                 "resource_id": str(resource.id),
                 "external_resource_id": resource.external_resource_id,
                 "resource_type": resource.resource_type,

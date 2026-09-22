@@ -103,6 +103,8 @@ def build_reservation_recommendations(
     subscription_id = settings.azure_subscription_id
     raw_items = fetch(subscription_id)
     return {
+        # Added for Task 20 - see rightsizing.py's identical comment.
+        "provider": "azure",
         "source": "Azure Microsoft.Consumption reservationRecommendations API (live call, not computed locally)",
         "field_mapping_note": FIELD_MAPPING_NOTE,
         "recommendations": [map_recommendation(item) for item in raw_items],

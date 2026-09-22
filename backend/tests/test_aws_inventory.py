@@ -8,6 +8,7 @@ from app.models.cloud_account import CloudAccount
 from app.models.provider import Provider
 from app.models.resource import Resource
 from app.services.aws_inventory import (
+    _enrich_elastic_ips,
     fetch_resources,
     get_or_create_aws_cloud_account,
     map_resource,
@@ -189,12 +190,48 @@ def test_fetch_resources_moto_ec2_instance_discovered_and_enriched(monkeypatch):
     assert instance_rows[0]["resource_type"] == "instance"
     assert instance_rows[0]["tags"]["Name"] == "moto-web-01"
     assert instance_rows[0]["instance_type"] == "t3.micro"
+    assert instance_rows[0]["state"] == "running"
     assert "created_at" in instance_rows[0]
 
     volume_rows = [r for r in rows if r["resource_id"] == volume["VolumeId"]]
     assert len(volume_rows) == 1
     assert volume_rows[0]["volume_type"] == "gp3"
+    assert volume_rows[0]["state"] == "available"
     assert volume_rows[0]["tags"] == {"env": "test"}
+
+
+@mock_aws
+def test_enrich_elastic_ips_against_real_describe_addresses(monkeypatch):
+    """Real API-shape finding: moto's Tagging API (get_resources) does not
+    discover Elastic IPs at all, even tagged ones (confirmed: get_resources()
+    returns an empty list for an allocated+tagged EIP, while describe_addresses
+    correctly shows the tag) - a moto-specific gap, not real AWS behavior (AWS's
+    real Tagging API does return Elastic IPs). So the full
+    fetch_resources()-discovers-an-EIP-via-tagging path can't be exercised
+    end-to-end against moto - this test instead calls _enrich_elastic_ips
+    directly against a real describe_addresses call, which IS moto-supported,
+    to at least confirm that half of the pipeline. Flagged for Task 21's live
+    pass to specifically verify EIP discovery via the Tagging API works against
+    the real account."""
+    monkeypatch.setattr(settings, "aws_access_key_id", "testing")
+    monkeypatch.setattr(settings, "aws_secret_access_key", "testing")
+
+    ec2 = boto3.client("ec2", region_name="us-east-1", aws_access_key_id="testing", aws_secret_access_key="testing")
+    unassociated = ec2.allocate_address(Domain="vpc")
+    associated_alloc = ec2.allocate_address(Domain="vpc")
+    reservation = ec2.run_instances(ImageId="ami-12345678", MinCount=1, MaxCount=1)
+    instance_id = reservation["Instances"][0]["InstanceId"]
+    ec2.associate_address(AllocationId=associated_alloc["AllocationId"], InstanceId=instance_id)
+
+    rows = [
+        {"service": "ec2", "resource_type": "elastic-ip", "resource_id": unassociated["AllocationId"], "tags": {}},
+        {"service": "ec2", "resource_type": "elastic-ip", "resource_id": associated_alloc["AllocationId"], "tags": {}},
+    ]
+    _enrich_elastic_ips(ec2, rows)
+
+    by_id = {row["resource_id"]: row for row in rows}
+    assert by_id[unassociated["AllocationId"]]["associated"] is False
+    assert by_id[associated_alloc["AllocationId"]]["associated"] is True
 
 
 @mock_aws

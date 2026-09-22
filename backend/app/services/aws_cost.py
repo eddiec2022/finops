@@ -30,6 +30,21 @@ AWS_RESOURCE_LEVEL_MAX_LOOKBACK_DAYS = 14
 
 RESOURCE_ID_KEY = "RESOURCE_ID"
 RECORD_TYPE_KEY = "RECORD_TYPE"
+LINKED_ACCOUNT_KEY = "LINKED_ACCOUNT"
+
+# Bug found during Task 20's investigation (via botocore's own parameter schema
+# validation - moto doesn't implement this operation at the server level at
+# all, see results.txt): unlike GetCostAndUsage, GetCostAndUsageWithResources
+# has a REQUIRED Filter parameter - Task 19's original call omitted it
+# entirely, which would have failed against the real API with a
+# ParamValidationError the first time Task 21 tried to sync AWS cost data, not
+# just against moto. Filtering by the configured account's own LINKED_ACCOUNT
+# is a broad, non-restrictive filter for the standalone (non-Organizations)
+# account GOV-002 2.1 describes - effectively "don't actually filter anything
+# out" while satisfying the requirement. Flagged for Task 21 to re-verify: if
+# the real account turns out to be an AWS Organizations member account (GOV-002
+# 2.1's own noted edge case for Cost Explorer generally), this filter's
+# semantics may need revisiting.
 
 
 @dataclass
@@ -60,6 +75,7 @@ def fetch_cost_rows(account_id: str, lookback_days: int) -> Any:
             {"Type": "DIMENSION", "Key": RESOURCE_ID_KEY},
             {"Type": "DIMENSION", "Key": RECORD_TYPE_KEY},
         ],
+        Filter={"Dimensions": {"Key": LINKED_ACCOUNT_KEY, "Values": [account_id]}},
     )
 
 

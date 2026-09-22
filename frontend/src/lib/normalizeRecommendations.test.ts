@@ -13,6 +13,7 @@ describe("normalizeRightsizing", () => {
       idle_lookback_days: 14,
       recommendations: [
         {
+          provider: "azure",
           resource_id: "r1",
           external_resource_id: "/subscriptions/.../vm-1",
           resource_type: "microsoft.compute/virtualmachines",
@@ -40,6 +41,7 @@ describe("normalizeRightsizing", () => {
       idle_lookback_days: 14,
       recommendations: [
         {
+          provider: "azure",
           resource_id: "r2",
           external_resource_id: null,
           resource_type: "microsoft.web/sites",
@@ -68,6 +70,7 @@ describe("normalizeIdleResources", () => {
       idle_lookback_days: 14,
       recommendations: [
         {
+          provider: "azure",
           resource_id: "r3",
           external_resource_id: "/subscriptions/.../disk-1",
           resource_type: "microsoft.compute/disks",
@@ -94,6 +97,7 @@ describe("normalizeNonPeakScheduling", () => {
       business_hours_definition: "Fixed weekday 09:00-17:00 UTC window.",
       recommendations: [
         {
+          provider: "azure",
           resource_id: "r4",
           external_resource_id: "/subscriptions/.../vm-dev",
           resource_type: "microsoft.compute/virtualmachines",
@@ -128,6 +132,7 @@ describe("normalizeReservedInstances", () => {
       field_mapping_note: "Unverified against real populated data.",
       recommendations: [
         {
+          provider: "azure",
           id: "/subscriptions/.../reservationRecommendations/abc123",
           sku: "Standard_D2s_v3",
           location: "eastus",
@@ -156,6 +161,7 @@ describe("normalizeReservedInstances", () => {
       field_mapping_note: "Unverified against real populated data.",
       recommendations: [
         {
+          provider: "azure",
           id: null,
           sku: null,
           location: null,
@@ -175,5 +181,49 @@ describe("normalizeReservedInstances", () => {
     expect(item.id).toBe("reserved-instance-0");
     expect(item.title).toBe("Reservation recommendation");
     expect(item.reason).toBe("");
+  });
+
+  it("builds a title/reason for an AWS reserved-instance item, a genuinely different shape than Azure's", () => {
+    const [item] = normalizeReservedInstances({
+      source: "AWS Cost Explorer APIs",
+      field_mapping_note: "Not verified against real populated data.",
+      recommendations: [
+        {
+          provider: "aws",
+          recommendation_type: "reserved_instance",
+          instance_type: "m5.large",
+          location: "us-east-1",
+          recommended_quantity: "2",
+          term: "ONE_YEAR",
+          estimated_monthly_savings: "30.00",
+        },
+      ],
+    });
+
+    expect(item.title).toBe("m5.large · us-east-1");
+    expect(item.reason).toBe("Reserve 2 instance(s), ONE_YEAR term");
+    expect(item.estimatedMonthlyImpact).toBe(30);
+  });
+
+  it("builds a title/reason for an AWS savings-plan item", () => {
+    const [item] = normalizeReservedInstances({
+      source: "AWS Cost Explorer APIs",
+      field_mapping_note: "Not verified against real populated data.",
+      recommendations: [
+        {
+          provider: "aws",
+          recommendation_type: "savings_plan",
+          instance_family: "m5",
+          location: "us-east-1",
+          hourly_commitment: "0.05",
+          term: "ONE_YEAR",
+          estimated_monthly_savings: "18.00",
+        },
+      ],
+    });
+
+    expect(item.title).toBe("m5 · us-east-1");
+    expect(item.reason).toBe("$0.05/hr commitment, ONE_YEAR term");
+    expect(item.estimatedMonthlyImpact).toBe(18);
   });
 });

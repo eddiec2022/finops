@@ -6,73 +6,68 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.resource import Resource
 from app.models.utilization_metric import UtilizationMetric
-from app.services.azure_inventory import get_or_create_cloud_account
+from app.services.aws_cpu_metrics import AWS_CPU_METRIC_BY_RESOURCE_TYPE
+from app.services.aws_inventory import get_or_create_aws_cloud_account
+from app.services.aws_sku_heuristics import suggest_ec2_instance_type
 from app.services.cost_lookup import get_resource_daily_costs
-from app.services.cpu_metrics import CPU_METRIC_BY_RESOURCE_TYPE
 from app.services.forecasting.linear_burn_rate import LinearBurnRateModel
-from app.services.sku_heuristics import SkuSuggestion, suggest_app_service_tier, suggest_vm_sku
 from app.services.utilization_evaluation import evaluate_cpu_utilization
 
 
 def estimate_monthly_savings(
-    avg_daily_cost: float | None, cores_reduction_fraction: float | None
+    avg_daily_cost: float | None, size_reduction_fraction: float | None
 ) -> tuple[float | None, str]:
     if avg_daily_cost is None:
         return None, "No cost data found for this resource in the lookback window; savings can't be estimated."
-    if cores_reduction_fraction is None:
+    if size_reduction_fraction is None:
         return None, "No specific suggested size to compare against; savings can't be estimated."
 
-    savings = avg_daily_cost * cores_reduction_fraction * 30
+    savings = avg_daily_cost * size_reduction_fraction * 30
     note = (
-        "Approximate: current average daily cost over the lookback window x 30, scaled by the "
-        "suggested SKU's core reduction, assuming cost scales linearly with core count within "
-        "the same series. Not a billing quote."
+        "Approximate: current average daily cost over the lookback window x 30, scaled by the suggested "
+        "instance type's approximate resource reduction (AWS's size-ladder convention, ~50% per step down), "
+        "assuming cost scales linearly with instance size within the same family. Not a billing quote."
     )
     return round(savings, 2), note
 
 
-def _suggest_sku(resource: Resource) -> SkuSuggestion:
-    if resource.resource_type == "microsoft.compute/virtualmachines":
-        return suggest_vm_sku(resource.sku)
-    return suggest_app_service_tier(resource.sku)
-
-
-def build_rightsizing_recommendations(
+def build_aws_rightsizing_recommendations(
     db: Session, cloud_account_id: uuid.UUID | None = None
 ) -> dict[str, Any]:
     if cloud_account_id is None:
-        # Phase 1 is single-subscription, same convention as forecast.py.
-        cloud_account_id = get_or_create_cloud_account(db, settings.azure_subscription_id).id
+        cloud_account_id = get_or_create_aws_cloud_account(db, settings.aws_account_id).id
 
     cost_model = LinearBurnRateModel(trailing_window_days=settings.idle_lookback_days)
 
     resources = (
         db.query(Resource)
         .filter(Resource.cloud_account_id == cloud_account_id)
-        .filter(Resource.resource_type.in_(CPU_METRIC_BY_RESOURCE_TYPE.keys()))
+        .filter(Resource.resource_type.in_(AWS_CPU_METRIC_BY_RESOURCE_TYPE.keys()))
         .all()
     )
 
     recommendations = []
     for resource in resources:
-        metric_name = CPU_METRIC_BY_RESOURCE_TYPE[resource.resource_type]
+        metric_name = AWS_CPU_METRIC_BY_RESOURCE_TYPE[resource.resource_type]
         readings = (
             db.query(UtilizationMetric.timestamp, UtilizationMetric.value)
             .filter_by(resource_id=resource.id, metric_name=metric_name)
             .all()
         )
+        # Reused directly, not reimplemented - utilization_evaluation.py has no
+        # Azure-specific assumptions (a plain (timestamp, value) series in,
+        # threshold/lookback params), per the task's own "reuse what isn't
+        # Azure-specific" instruction.
         cpu_result = evaluate_cpu_utilization(
             [(ts, value) for ts, value in readings],
             lookback_days=settings.idle_lookback_days,
             idle_threshold_percent=settings.idle_cpu_threshold_percent,
         )
 
-        # Insufficient history: excluded outright, not flagged on a partial
-        # average. Not idle: not a rightsizing candidate, so also excluded.
         if cpu_result.insufficient_data or not cpu_result.is_idle:
             continue
 
-        sku_suggestion = _suggest_sku(resource)
+        sku_suggestion = suggest_ec2_instance_type(resource.sku)
 
         daily_costs = get_resource_daily_costs(db, resource.id)
         cost_result = cost_model.forecast(daily_costs, horizon_days=1)
@@ -83,10 +78,7 @@ def build_rightsizing_recommendations(
 
         recommendations.append(
             {
-                # Added for Task 20 - lets the frontend tell an Azure
-                # recommendation from an AWS one once /recommendations/*
-                # merges both providers' results into one list.
-                "provider": "azure",
+                "provider": "aws",
                 "resource_id": str(resource.id),
                 "external_resource_id": resource.external_resource_id,
                 "resource_type": resource.resource_type,

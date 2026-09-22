@@ -2,6 +2,7 @@ import type {
   IdleResourcesResponse,
   NonPeakSchedulingRecommendation,
   NonPeakSchedulingResponse,
+  ReservedInstanceRecommendation,
   ReservedInstancesResponse,
   RightsizingResponse,
 } from "../api/types";
@@ -85,8 +86,40 @@ export function normalizeNonPeakScheduling(response: NonPeakSchedulingResponse):
   }));
 }
 
-export function normalizeReservedInstances(response: ReservedInstancesResponse): RecommendationItem[] {
-  return response.recommendations.map((r, index) => ({
+// AWS's two recommendation kinds (Reserved Instances, Savings Plans) use
+// different field names than Azure's single API, not just different values -
+// see the ReservedInstanceRecommendation type's own comment. Branches on
+// `provider`/`recommendation_type` rather than assuming one shape fits both.
+function normalizeReservedInstanceItem(r: ReservedInstanceRecommendation, index: number): RecommendationItem {
+  const savings = r.estimated_monthly_savings;
+  const estimatedMonthlyImpact = typeof savings === "string" ? Number(savings) : savings ?? null;
+
+  if (r.provider === "aws") {
+    const isSavingsPlan = r.recommendation_type === "savings_plan";
+    const title = isSavingsPlan
+      ? [r.instance_family, r.location].filter(Boolean).join(" · ") || "Savings Plan recommendation"
+      : [r.instance_type, r.location].filter(Boolean).join(" · ") || "Reserved Instance recommendation";
+    const reason = isSavingsPlan
+      ? [r.hourly_commitment ? `$${r.hourly_commitment}/hr commitment` : null, r.term ? `${r.term} term` : null]
+          .filter((part): part is string => part !== null)
+          .join(", ")
+      : [
+          r.recommended_quantity != null ? `Reserve ${r.recommended_quantity} instance(s)` : null,
+          r.term ? `${r.term} term` : null,
+        ]
+          .filter((part): part is string => part !== null)
+          .join(", ");
+    return {
+      id: `${r.recommendation_type ?? "aws-reservation"}-${index}`,
+      category: "reserved-instances",
+      title,
+      reason,
+      estimatedMonthlyImpact: Number.isFinite(estimatedMonthlyImpact) ? (estimatedMonthlyImpact as number) : null,
+      impactNote: "",
+    };
+  }
+
+  return {
     id: r.id ?? `reserved-instance-${index}`,
     category: "reserved-instances",
     title: [r.sku, r.location].filter(Boolean).join(" · ") || "Reservation recommendation",
@@ -97,7 +130,17 @@ export function normalizeReservedInstances(response: ReservedInstancesResponse):
     ]
       .filter((part): part is string => part !== null)
       .join(", "),
-    estimatedMonthlyImpact: r.estimated_monthly_savings,
+    estimatedMonthlyImpact: Number.isFinite(estimatedMonthlyImpact) ? (estimatedMonthlyImpact as number) : null,
+    impactNote: "",
+  };
+}
+
+export function normalizeReservedInstances(response: ReservedInstancesResponse): RecommendationItem[] {
+  return response.recommendations.map((r, index) => ({
+    ...normalizeReservedInstanceItem(r, index),
+    // field_mapping_note is response-level (shared across every item, from
+    // whichever provider's build_*_reservation_recommendations produced it) -
+    // applied here rather than per-item, same as the original single-provider version.
     impactNote: response.field_mapping_note,
   }));
 }

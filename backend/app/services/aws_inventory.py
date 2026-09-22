@@ -20,6 +20,7 @@ from app.models.resource import Resource
 # without SKU/creation-date.
 _EC2_INSTANCE = ("ec2", "instance")
 _EC2_VOLUME = ("ec2", "volume")
+_EC2_ELASTIC_IP = ("ec2", "elastic-ip")
 
 # GOV-002 Section 3's resolved "human-readable resource type" convention for
 # resource_group - not exhaustive (deliberately, per the task's "don't try to
@@ -111,6 +112,11 @@ def _enrich_ec2_instances(ec2_client: Any, rows: list[dict[str, Any]]) -> None:
             if row is None:
                 continue
             row["instance_type"] = instance.get("InstanceType")
+            # Task 20: idle-resource detection needs to tell "stopped" from
+            # "running"/"terminated" - stored in raw_metadata the same
+            # already-synced-data-only way Azure's power-state check reads
+            # from raw_metadata, not a live call at recommendation time.
+            row["state"] = (instance.get("State") or {}).get("Name")
             if instance.get("LaunchTime"):
                 # ISO string, not the raw datetime boto3 returns - raw_metadata
                 # stores this whole row as-is into a JSONB column, and a bare
@@ -130,8 +136,31 @@ def _enrich_ebs_volumes(ec2_client: Any, rows: list[dict[str, Any]]) -> None:
         if row is None:
             continue
         row["volume_type"] = volume.get("VolumeType")
+        # Task 20: "available" means unattached - EBS's own explicit
+        # attachment-state field, direct analogue of Azure's diskState check.
+        row["state"] = volume.get("State")
         if volume.get("CreateTime"):
             row["created_at"] = volume["CreateTime"].isoformat()
+
+
+def _enrich_elastic_ips(ec2_client: Any, rows: list[dict[str, Any]]) -> None:
+    """Task 20: idle-resource detection needs to know whether an Elastic IP is
+    associated with anything - not fetched at all in Task 19 (out of that
+    task's two-type enrichment scope), so this is new."""
+    targets = {row["resource_id"]: row for row in rows if (row["service"], row["resource_type"]) == _EC2_ELASTIC_IP}
+    if not targets:
+        return
+    # Unlike describe_instances/describe_volumes, an empty AllocationIds list
+    # here *does* mean "describe none" (confirmed against boto3's own
+    # documented behavior) - no load-bearing guard needed the way the other
+    # two enrichments have, but kept for the same "skip a pointless call"
+    # reason.
+    response = ec2_client.describe_addresses(AllocationIds=list(targets.keys()))
+    for address in response.get("Addresses", []):
+        row = targets.get(address.get("AllocationId"))
+        if row is None:
+            continue
+        row["associated"] = bool(address.get("InstanceId") or address.get("NetworkInterfaceId"))
 
 
 def fetch_resources(region: str) -> list[dict[str, Any]]:
@@ -159,6 +188,7 @@ def fetch_resources(region: str) -> list[dict[str, Any]]:
 
     _enrich_ec2_instances(ec2_client, rows)
     _enrich_ebs_volumes(ec2_client, rows)
+    _enrich_elastic_ips(ec2_client, rows)
 
     return rows
 

@@ -20,6 +20,7 @@ EC2_INSTANCE_ROW = {
     "resource_id": "i-0123456789abcdef0",
     "tags": {"Name": "web-01", "env": "prod"},
     "instance_type": "t3.micro",
+    "state": "running",
     "created_at": datetime(2026, 1, 15, 12, 0, 0, tzinfo=timezone.utc).isoformat(),
 }
 
@@ -32,8 +33,26 @@ EBS_VOLUME_ROW = {
     "resource_id": "vol-0123456789abcdef0",
     "tags": {"env": "prod"},
     "volume_type": "gp3",
+    "state": "in-use",
     "created_at": datetime(2026, 1, 15, 11, 0, 0, tzinfo=timezone.utc).isoformat(),
 }
+
+# Task 20 fixtures - the idle/orphaned states each detector should flag.
+STOPPED_EC2_INSTANCE_ROW = {**EC2_INSTANCE_ROW, "resource_id": "i-0stoppedinstance0", "state": "stopped"}
+UNATTACHED_EBS_VOLUME_ROW = {**EBS_VOLUME_ROW, "resource_id": "vol-0unattachedvolume0", "state": "available"}
+
+ELASTIC_IP_ROW = {
+    "arn": "arn:aws:ec2:us-east-1:123456789012:elastic-ip/eipalloc-0123456789abcdef0",
+    "service": "ec2",
+    "region": "us-east-1",
+    "account_id": "123456789012",
+    "resource_type": "elastic-ip",
+    "resource_id": "eipalloc-0123456789abcdef0",
+    "tags": {},
+    "associated": True,
+}
+
+UNASSOCIATED_ELASTIC_IP_ROW = {**ELASTIC_IP_ROW, "resource_id": "eipalloc-0unassociated0", "associated": False}
 
 # S3 bucket ARNs have no region/account-id segment at all (parse_arn's real
 # API-shape finding), and this bucket has no describe_*-equivalent enrichment

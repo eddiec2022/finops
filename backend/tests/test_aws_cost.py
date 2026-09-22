@@ -1,12 +1,13 @@
 from datetime import date
 
 import pytest
+from moto import mock_aws
 
 from app.core.config import settings
 from app.models.cost_record import CostRecord
 from app.models.provider import Provider
 from app.models.resource import Resource
-from app.services.aws_cost import map_cost_response, sync_aws_cost
+from app.services.aws_cost import fetch_cost_rows, map_cost_response, sync_aws_cost
 from app.services.aws_inventory import get_or_create_aws_cloud_account
 from app.services.forecast import build_forecast
 from tests.fixtures.aws_cost import INSTANCE_ARN, RESPONSE_MIXED, make_response
@@ -136,3 +137,29 @@ def test_aws_cost_records_flow_into_existing_forecast_interface_unchanged(db_ses
 
     assert result["insufficient_data"] is False
     assert result["daily_rate"] == pytest.approx(12.3456 + 5.00 + 1.25)
+
+
+@mock_aws
+def test_fetch_cost_rows_call_is_well_formed(monkeypatch):
+    """Regression test for a real bug this task's investigation found:
+    GetCostAndUsageWithResources has a REQUIRED Filter parameter that Task 19's
+    original call omitted entirely - would have failed the first time Task 21
+    tried this against a real account, not just against moto. moto does not
+    implement this operation at the server level at all (confirmed - it raises
+    NotImplementedError, not a validation error, once parameters are well-
+    formed), so this can only confirm the call passes botocore's own parameter
+    schema validation (which mirrors the real API's required-parameter
+    contract) - it cannot confirm a real successful response. That's the
+    genuine limit of what's verifiable before Task 21 has a live account."""
+    monkeypatch.setattr(settings, "aws_access_key_id", "testing")
+    monkeypatch.setattr(settings, "aws_secret_access_key", "testing")
+    monkeypatch.setattr(settings, "aws_region", "us-east-1")
+
+    try:
+        fetch_cost_rows("123456789012", 14)
+    except Exception as e:
+        # NotImplementedError (moto's own "not implemented" for this specific
+        # operation) is the expected, acceptable outcome - anything else
+        # (in particular botocore.exceptions.ParamValidationError) means the
+        # call itself is malformed against the real API's schema.
+        assert type(e).__name__ == "NotImplementedError", f"unexpected error type: {type(e).__name__}: {e}"

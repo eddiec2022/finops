@@ -36,6 +36,8 @@ export interface InventoryResponse {
 }
 
 export interface RightsizingRecommendation {
+  /** "azure" | "aws" - which provider this recommendation came from, once /recommendations/* merges both. */
+  provider: string;
   resource_id: string;
   external_resource_id: string | null;
   resource_type: string;
@@ -57,6 +59,7 @@ export interface RightsizingResponse {
 }
 
 export interface IdleResourceRecommendation {
+  provider: string;
   resource_id: string;
   external_resource_id: string | null;
   resource_type: string;
@@ -84,6 +87,7 @@ export interface NonPeakUsageSignal extends NonPeakSignal {
 }
 
 export interface NonPeakSchedulingRecommendation {
+  provider: string;
   resource_id: string;
   external_resource_id: string | null;
   resource_type: string;
@@ -106,19 +110,40 @@ export interface NonPeakSchedulingResponse {
   recommendations: NonPeakSchedulingRecommendation[];
 }
 
+// AWS's two recommendation APIs (Reserved Instances, Savings Plans) map to a
+// genuinely different field shape than Azure's single reservationRecommendations
+// API - not just different values, different fields (e.g. AWS's "instance_type"/
+// "hourly_commitment" have no Azure equivalent key, and vice versa for "sku"/
+// "scope"). Every field is optional here for exactly that reason - a given item
+// only ever has the subset that its own provider/recommendation_type populates
+// (see normalizeReservedInstances, which branches on `provider` to build the
+// right title/reason per shape rather than assuming one shape fits both).
 export interface ReservedInstanceRecommendation {
-  id: string | null;
-  sku: string | null;
-  location: string | null;
-  resource_type: string | null;
-  scope: string | null;
-  term: string | null;
-  look_back_period: string | null;
-  recommended_quantity: number | null;
-  cost_with_no_reserved_instances: number | null;
-  total_cost_with_reserved_instances: number | null;
-  estimated_monthly_savings: number | null;
-  currency: string | null;
+  /** "azure" | "aws". */
+  provider: string;
+  id?: string | null;
+  sku?: string | null;
+  location?: string | null;
+  resource_type?: string | null;
+  scope?: string | null;
+  term?: string | null;
+  look_back_period?: string | null;
+  recommended_quantity?: number | string | null;
+  cost_with_no_reserved_instances?: number | null;
+  total_cost_with_reserved_instances?: number | null;
+  currency?: string | null;
+  // AWS-only fields:
+  /** "reserved_instance" | "savings_plan" - AWS's own two recommendation kinds merged into one list. */
+  recommendation_type?: string;
+  instance_type?: string | null;
+  instance_family?: string | null;
+  hourly_commitment?: string | null;
+  estimated_monthly_savings_percentage?: string | null;
+  estimated_savings_percentage?: string | null;
+  payment_option?: string;
+  // Shared, but AWS returns these as numeric-looking strings (Cost Explorer's
+  // own convention), unlike Azure's real numbers - typed loosely to cover both.
+  estimated_monthly_savings?: number | string | null;
 }
 
 export interface ReservedInstancesResponse {
